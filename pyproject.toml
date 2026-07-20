@@ -21,6 +21,13 @@ trl = [
     "peft>=0.17.0,<1.0.0", # supports LoRA for most MoE model including LLama4 family
     "trl>=0.28.0,<1.0.0"
 ]
+# MARSHAL-style self-play RL (playpen/marshal). Adds vLLM on top of the trl extra,
+# because custom rollout_func generation is only honored when use_vllm=True.
+marshal = [
+    "peft>=0.17.0,<1.0.0",
+    "trl>=0.28.0,<1.0.0",
+    "vllm"
+]
 
 [project.scripts]
 playpen = "playpen.cli:main"

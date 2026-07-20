@@ -114,5 +114,41 @@
       "video": false
     }
   }
+},
+{
+  "model_name": "Qwen3.5-0.8B",
+  "backend": "huggingface_local",
+  "huggingface_id": "Qwen/Qwen3.5-0.8B",
+  "open_weight": true,
+  "parameters": "0.8B",
+  "languages": ["en", "de", "fr", "it", "pt", "hi", "es", "th"],
+  "context_size": "262,144",
+  "license": {
+    "name": "Apache license 2.0 ",
+    "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/LICENSE"
+  },
+  "model_config": {
+    "premade_chat_template": true,
+    "enable_thinking": false,
+    "eos_to_cull": "<\\|im_end\\|>"
+  }
+},
+{
+  "model_name": "Qwen3.5-4B",
+  "backend": "huggingface_local",
+  "huggingface_id": "Qwen/Qwen3.5-4B",
+  "open_weight": true,
+  "parameters": "4B",
+  "languages": ["en", "de", "fr", "it", "pt", "hi", "es", "th"],
+  "context_size": "262,144",
+  "license": {
+    "name": "Apache license 2.0 ",
+    "url": "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/LICENSE"
+  },
+  "model_config": {
+    "premade_chat_template": true,
+    "enable_thinking": false,
+    "eos_to_cull": "<\\|im_end\\|>"
+  }
 }
 ]

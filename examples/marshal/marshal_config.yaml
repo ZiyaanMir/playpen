@@ -1,0 +1,60 @@
+# MARSHAL self-play behavior toggle. This is the single, obvious switch to flip
+# BEFORE starting a training run. It maps 1:1 onto playpen.marshal.MarshalConfig.
+#
+# Quick off switch without editing this file: pass --no-marshal on the CLI.
+
+# Master on/off switch. False => plain TRL GRPO (one scalar terminal reward per
+# rollout, TRL's own group-relative normalization). None of the fields below have
+# any effect when this is False.
+enabled: true
+
+# Pool/normalize advantages per self-play seat (player_0 rows separately from
+# player_1 rows) -- MARSHAL's headline "agent-specific advantage normalization".
+# Set False to keep turn-level credit but pool batch-wide (ablation).
+agent_specific_normalization: true
+
+# Keep rewards at each turn boundary and turn them into per-token returns via a
+# backward cumulative sum (turn-level advantage estimator). False => sum a seat's
+# turn rewards into a single terminal scalar (MARSHAL use_turn_scores=False).
+turn_level_rewards: false
+
+# "mean" mean-centers each pool; "mean_std" z-scores it.
+advantage_norm_mode: mean
+
+# Discount for the backward return. MARSHAL uses 1.0.
+gamma: 1.0
+
+# "paper_correct" (default): the algorithm the MARSHAL paper describes.
+# "marshal_exact": bit-comparable reproduction of MARSHAL's shipped code,
+#   including its two documented departures from its own paper (a biasing pre-sum
+#   reward normalization, and distinct-value pooling that equal-weights rare and
+#   common outcomes). Use only for comparison against MARSHAL's own numbers.
+fidelity_mode: marshal_exact
+
+# Z-score the token-level reward field over all model-token positions (batch-wide,
+# both seats pooled) BEFORE the backward cumulative sum. Mirrors ROLL's
+# `whiten_rewards: true`, which every shipped MARSHAL *_selfplay.yaml enables --
+# a framework flag, not part of the paper's algorithm. NOTE: with sparse terminal
+# rewards this densifies the signal (every model token picks up -mean/std), adding
+# a response-length-dependent component to the returns.
+whiten_rewards: true
+
+# Z-score the final advantages over all model-token positions (batch-wide) AFTER
+# the per-seat normalization. Mirrors ROLL's `whiten_advantages: true` (also set
+# in every shipped selfplay YAML). Standard PPO-style scale stabilization.
+whiten_advantages: true
+
+# Dr. GRPO (arXiv:2503.20783): run with TRL's unbiased-GRPO loss/scaling recipe --
+# loss_type='dr_grpo' (loss normalized by the constant max_completion_length instead of
+# realized length => removes the response-length bias) + scale_rewards='none' (advantages
+# not divided by a std => removes the difficulty bias). Quick CLI override: --dr-grpo /
+# --no-dr-grpo. Unlike the fields above, this takes effect regardless of `enabled` (it
+# configures the shared TRL recipe used by both the MARSHAL path and the --no-marshal
+# baseline) and is applied by the launch script, NOT by the advantage math.
+#
+# Composes with MARSHAL: MARSHAL already avoids std division by default
+# (advantage_norm_mode: mean), so turning this on keeps all MARSHAL features (turn-level
+# credit, per-seat pooling, gamma, whitening). Only if you had set
+# advantage_norm_mode: mean_std does dr_grpo align it back to `mean` (dropping the per-seat
+# std divisor but keeping per-seat pooling), with a printed notice.
+dr_grpo: false
