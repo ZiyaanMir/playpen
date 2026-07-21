@@ -66,14 +66,24 @@ esac
 # We do NOT reassign the GPU here -- we translate the same allocated device into
 # the integer ordinal vLLM demands, asking CUDA itself for the mapping so it is
 # correct whether or not cgroups have already narrowed what is visible.
+# _resolve_gpu.py probes candidate values in subprocesses and returns only one it has
+# verified exposes the allocated GPU, so a wrong guess cannot silently hide it. If it
+# cannot find one we WARN and leave the UUID in place rather than aborting: torch works
+# with the UUID, so the job still reaches the (known, documented) vLLM error instead of
+# dying earlier and more confusingly.
 if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* || "${CUDA_VISIBLE_DEVICES:-}" == MIG-* ]]; then
     _uuid="$CUDA_VISIBLE_DEVICES"
-    if _ordinal="$(env -u CUDA_VISIBLE_DEVICES python "$REPO/slurm_eddie/_resolve_gpu.py" "$_uuid")"; then
-        export CUDA_VISIBLE_DEVICES="$_ordinal"
-        echo "[gpu] remapped CUDA_VISIBLE_DEVICES: $_uuid -> $_ordinal (same physical GPU)"
+    if _ordinal="$(python "$REPO/slurm_eddie/_resolve_gpu.py" "$_uuid")"; then
+        if [ -z "$_ordinal" ]; then
+            unset CUDA_VISIBLE_DEVICES
+            echo "[gpu] unset CUDA_VISIBLE_DEVICES (verified: exposes only $_uuid)"
+        else
+            export CUDA_VISIBLE_DEVICES="$_ordinal"
+            echo "[gpu] remapped CUDA_VISIBLE_DEVICES: $_uuid -> $_ordinal (verified same GPU)"
+        fi
     else
-        echo "ERROR: could not map $_uuid to a CUDA ordinal — see guide §6." >&2
-        exit 1
+        echo "WARNING: could not map $_uuid to a CUDA ordinal; leaving it as-is." >&2
+        echo "         torch will work, vLLM will likely fail — see guide §6." >&2
     fi
     unset _uuid _ordinal
 fi
