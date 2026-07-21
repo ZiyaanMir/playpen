@@ -4,7 +4,7 @@
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --time=20:00:00        # stay under the 24 h cap with margin
+#SBATCH --time=20:00:00        # stay under the exit24 h cap with margin
 #SBATCH --no-requeue           # a requeue restarts from step 0 — don't silently redo 20 h
 
 set -euo pipefail
