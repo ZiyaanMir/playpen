@@ -55,12 +55,35 @@ case "$ACTUAL_PY" in
        exit 1 ;;
 esac
 
+# --- Eddie GPU UUID -> CUDA ordinal ------------------------------------------
+# Grid Engine sets CUDA_VISIBLE_DEVICES to a GPU *UUID* (GPU-beccd30f-...) for its
+# cgroup-based isolation. torch copes; vLLM 0.12.0 does not -- it runs
+# int(device_ids[device_id]) (vllm/platforms/interface.py:211) and dies with
+#   ValueError: invalid literal for int() with base 10: 'GPU-...'
+# which surfaces as the misleading "Error in inspecting model architecture
+# 'Qwen3ForCausalLM'" because vLLM introspects in a subprocess.
+#
+# We do NOT reassign the GPU here -- we translate the same allocated device into
+# the integer ordinal vLLM demands, asking CUDA itself for the mapping so it is
+# correct whether or not cgroups have already narrowed what is visible.
+if [[ "${CUDA_VISIBLE_DEVICES:-}" == GPU-* || "${CUDA_VISIBLE_DEVICES:-}" == MIG-* ]]; then
+    _uuid="$CUDA_VISIBLE_DEVICES"
+    if _ordinal="$(env -u CUDA_VISIBLE_DEVICES python "$REPO/slurm_eddie/_resolve_gpu.py" "$_uuid")"; then
+        export CUDA_VISIBLE_DEVICES="$_ordinal"
+        echo "[gpu] remapped CUDA_VISIBLE_DEVICES: $_uuid -> $_ordinal (same physical GPU)"
+    else
+        echo "ERROR: could not map $_uuid to a CUDA ordinal — see guide §6." >&2
+        exit 1
+    fi
+    unset _uuid _ordinal
+fi
+
 # --- runtime knobs -----------------------------------------------------------
 export TRL_EXPERIMENTAL_SILENCE=1
 export TOKENIZERS_PARALLELISM=false
 # Compute nodes may have no outbound internet; run offline once weights are cached.
 # Flip to 1 only after the model has been pre-downloaded (guide §2.5).
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 
 # Where run outputs go. Scratch, not home — checkpoints are GBs.
 export MARSHAL_RUNS="${MARSHAL_RUNS:-$SCRATCH/marshal-runs}"
