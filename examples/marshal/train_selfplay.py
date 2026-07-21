@@ -116,7 +116,15 @@ def parse_args() -> argparse.Namespace:
                         "registry doesn't know yet (e.g. Qwen3.5 -> Qwen3_5ForConditionalGeneration); "
                         "vLLM then runs it via its Transformers fallback. Slower than native 'vllm'.")
 
-    p.add_argument("--output-dir", default=None)
+    # Output
+    p.add_argument("--save-steps", type=int, default=500,
+                   help="Save a checkpoint every N optimizer steps (e.g. 20). Default 500 (TRL/HF's "
+                        "own default, i.e. unchanged behavior). A final checkpoint is always written "
+                        "when training ends, regardless of this value.")
+    p.add_argument("--output-dir", default=None,
+                   help="Base output directory. A timestamped run subfolder is always created inside "
+                        "it, so successive runs never overwrite each other. "
+                        "Default base: models/marshal/{game}/{model_basename}.")
     return p.parse_args()
 
 
@@ -168,8 +176,12 @@ def main() -> None:
     print(f"[data] {len(dataset)} rows ({env.num_players} seats x game instances)")
 
     # 3. GRPO config + LoRA (LoRA is always on, independent of the MARSHAL switch).
-    timestamp = datetime.now().strftime("%b%d_%H-%M-%S")
-    output_dir = args.output_dir or f"models/marshal/{args.game}/{os.path.basename(args.model)}"
+    # Every run writes into its own timestamped subfolder, so a rerun can never overwrite
+    # a previous run's checkpoints (HF writes checkpoints as <output_dir>/checkpoint-<step>,
+    # which collide across runs otherwise). Mirrors MARSHAL's runs/<experiment>/<timestamp>/.
+    run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
+    base_dir = args.output_dir or f"models/marshal/{args.game}/{os.path.basename(args.model)}"
+    output_dir = os.path.join(base_dir, run_id)
     grpo_config = trl.GRPOConfig(
         use_vllm=True,
         vllm_mode=args.vllm_mode,
@@ -190,8 +202,11 @@ def main() -> None:
         # starve vLLM of VRAM in colocate mode.
         model_init_kwargs={"dtype": "bfloat16"} if args.bf16 else None,
         output_dir=output_dir,
+        # Checkpoint every N steps. save_strategy is TRL/HF's default "steps", so this
+        # alone controls the cadence; the last step always saves as well.
+        save_steps=args.save_steps,
         report_to=args.report_to,
-        logging_dir=(f"{output_dir}/tb/{timestamp}" if args.report_to == "tensorboard" else None),
+        logging_dir=(f"{output_dir}/tb" if args.report_to == "tensorboard" else None),
         log_completions=True,
         # Dr. GRPO recipe (loss_type + scale_rewards) when enabled; empty dict = no
         # change, so with dr_grpo off this call is identical to before the flag existed.
@@ -213,6 +228,8 @@ def main() -> None:
 
     print(f"[mem] bf16={args.bf16} grad_ckpt={args.gradient_checkpointing} "
           f"modules_to_save={modules_to_save} vllm_util={args.vllm_gpu_memory_utilization}")
+    print(f"[out] run dir={output_dir} (checkpoint every {args.save_steps} steps, "
+          f"plus a final one at step {args.max_steps})")
 
     trainer = MarshalGRPOTrainer(
         model=args.model,
@@ -235,7 +252,7 @@ def main() -> None:
         pass
 
     trainer.train()
-    print(f"[done] adapters saved under {output_dir}")
+    print(f"[done] LoRA adapters saved under {output_dir}/checkpoint-<step>/")
 
 
 if __name__ == "__main__":

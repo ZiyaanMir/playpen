@@ -113,11 +113,36 @@ python examples/marshal/train_selfplay.py --game taboo --dr-grpo --max-steps 10
 
 # Plain Dr. GRPO baseline (no MARSHAL)
 python examples/marshal/train_selfplay.py --game taboo --no-marshal --dr-grpo --max-steps 10
+
+# Longer run keeping an intermediate checkpoint every 20 steps
+python examples/marshal/train_selfplay.py --game taboo --max-steps 100 --save-steps 20
 ```
 
 Monitor: `tensorboard --logdir models/marshal/`. When MARSHAL is enabled the run
 logs `marshal/seat_{0,1}/adv_mean` and `.../rows` so you can confirm the per-seat
 split is live and the two seats' advantage distributions differ.
+
+## Output & checkpoints
+
+Every run writes into its own timestamped folder, so reruns never overwrite each
+other. HF `Trainer` puts each checkpoint in a `checkpoint-<step>` subfolder:
+
+```
+models/marshal/{game}/{model}/20260721-142233/
+├── checkpoint-20/ ... checkpoint-100/   # --save-steps N, plus always a final one
+│   ├── adapter_config.json + adapter_model.safetensors   # LoRA only, no base weights
+│   └── optimizer.pt, scheduler.pt, trainer_state.json, tokenizer files
+├── completions/completions_*.parquet
+└── tb/                                   # only with --report-to tensorboard
+```
+
+- `--save-steps N` sets the cadence (default `500`, TRL/HF's own default). The final
+  step always saves regardless.
+- `--output-dir` sets only the *base*; the timestamped run folder is appended to it.
+- The adapter lives **only** inside `checkpoint-<step>/` — the script does not call
+  `trainer.save_model()`, so load a checkpoint dir directly with PEFT.
+- Every checkpoint is kept (no `save_total_limit`), and each carries optimizer state
+  (~2x the adapter size), so a small `--save-steps` on a long run costs disk.
 
 ## Notes & caveats
 
