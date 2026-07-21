@@ -18,6 +18,5 @@ game_registry.json
 models
 key.json
 model_registry.json
-trainer*.py
 CLAUDE.md
 .aider*
