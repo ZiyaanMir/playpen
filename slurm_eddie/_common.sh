@@ -30,6 +30,20 @@ SCRATCH="${SCRATCH:-/exports/eddie/scratch/$USER}"
 cd "$REPO"
 mkdir -p logs
 
+# An empty $SCRATCH would make every path below absolute from the filesystem root
+# ("$SCRATCH/marshal-runs" -> "/marshal-runs"), which fails deep inside training as
+# PermissionError [Errno 13] rather than here. Refuse that up front.
+case "$SCRATCH" in
+    /*) ;;
+    *)  echo "ERROR: \$SCRATCH must be an absolute path, got '$SCRATCH'." >&2; exit 1 ;;
+esac
+[ -d "$SCRATCH" ] || {
+    echo "ERROR: \$SCRATCH does not exist: $SCRATCH" >&2
+    echo "       On Eddie this should be /exports/eddie/scratch/\$USER." >&2
+    exit 1
+}
+[ -w "$SCRATCH" ] || { echo "ERROR: \$SCRATCH is not writable: $SCRATCH" >&2; exit 1; }
+
 # --- modules -----------------------------------------------------------------
 # The login shell is not sourced for batch jobs, so `module` must be enabled by hand.
 . /etc/profile.d/modules.sh
