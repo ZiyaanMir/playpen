@@ -33,7 +33,7 @@ mkdir -p logs
 # --- modules -----------------------------------------------------------------
 # The login shell is not sourced for batch jobs, so `module` must be enabled by hand.
 . /etc/profile.d/modules.sh
-module load cuda/12.4          # match whatever `module avail cuda` offers
+module load cuda/12.9.1        # match whatever `module avail cuda` offers
 
 # --- caches off the 10 GB home quota ----------------------------------------
 export HF_HOME="$SCRATCH/home_cache/huggingface"
