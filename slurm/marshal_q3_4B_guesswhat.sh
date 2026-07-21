@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=marshal_taboo
+#SBATCH --job-name=marshal_q3_4B_guesswhat
 #SBATCH --output=logs/train_%j.out
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1
