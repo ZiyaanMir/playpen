@@ -105,6 +105,43 @@ class MarshalConfig:
             keeping per-seat *pooling*), since a per-group std is exactly the bias
             Dr. GRPO removes. Batch-wide ``whiten_advantages`` is left alone -- the
             Dr. GRPO paper explicitly permits batch-level normalization.
+        length_penalty: When ``True`` (and ``enabled``), add MARSHAL's Kimi-1.5-style
+            per-turn length reward to each turn's reward before any normalization --
+            a one-sided linear penalty for generations longer than
+            ``length_penalty_max_len``. Ported from MARSHAL's
+            ``compute_length_penalty`` (``roll/agentic/rollout/env_manager.py:276-294``);
+            see ``advantage.LengthPenaltySpec`` for the formula.
+
+            Default ``False``, and that default is the MARSHAL-faithful setting: MARSHAL
+            applies this penalty *only* to its board-game envs and explicitly skips it
+            for free-text ones (``env_manager.py:470-480`` guards it behind
+            ``not isinstance(env, BaseLanguageBasedEnv)``, commented "No MARSHAL-imposed
+            reward shaping for free-text envs (e.g. Playpen/clembench)"). Turning it on
+            for a clembench game is therefore a deliberate divergence -- useful against a
+            reasoning model that overruns its token budget, but a run using it is not a
+            MARSHAL reproduction and should be reported as such.
+        length_penalty_coef: Scale on the *negative* (too-long) part of the length
+            reward -- MARSHAL's ``lower``. This is the main magnitude knob: at twice
+            ``length_penalty_max_len`` the penalty is about ``-length_penalty_coef``.
+            MARSHAL ships ``0.5``, chosen to be "comparable with the winning rewards"
+            (clembench: SUCCESS ``+1`` / ABORTED ``-1``).
+        length_penalty_bonus: Scale on the *positive* (short-enough) part -- MARSHAL's
+            ``upper``. MARSHAL ships ``0.0``, which zeroes that branch and makes the
+            reward a pure penalty. Raise it only if you want to actively reward brevity,
+            which risks the policy learning to answer with nothing.
+        length_penalty_min_len: Length at which the raw term equals
+            ``length_penalty_offset`` -- MARSHAL's ``min_len`` (ships ``11``, a constant
+            derived from the minimum ``<answer>X(i,j)</answer>`` response in their
+            board games; it only sets the slope's origin, so it is near-irrelevant when
+            ``length_penalty_bonus`` is 0).
+        length_penalty_max_len: Length at which the raw term crosses zero (when
+            ``length_penalty_offset`` is 1) -- MARSHAL's ``max_len``, ships ``2048``.
+            This is the "too long" threshold; set it near your per-turn
+            ``--max-completion-length`` so only genuine overruns are charged.
+        length_penalty_offset: Vertical offset of the raw term -- MARSHAL's ``coef``,
+            ships ``1.0``. With the default ``length_penalty_bonus`` of 0 this just
+            shifts the zero-crossing away from ``length_penalty_max_len``; prefer
+            changing ``length_penalty_max_len`` instead.
     """
 
     enabled: bool = True
@@ -116,6 +153,12 @@ class MarshalConfig:
     whiten_rewards: bool = False
     whiten_advantages: bool = False
     dr_grpo: bool = False
+    length_penalty: bool = False
+    length_penalty_coef: float = 0.5
+    length_penalty_bonus: float = 0.0
+    length_penalty_min_len: int = 11
+    length_penalty_max_len: int = 2048
+    length_penalty_offset: float = 1.0
 
     def __post_init__(self) -> None:
         if self.advantage_norm_mode not in ADVANTAGE_NORM_MODES:
@@ -128,6 +171,35 @@ class MarshalConfig:
                 f"fidelity_mode must be one of {FIDELITY_MODES}, got {self.fidelity_mode!r}"
             )
         self.gamma = float(self.gamma)
+        self.length_penalty_coef = float(self.length_penalty_coef)
+        self.length_penalty_bonus = float(self.length_penalty_bonus)
+        self.length_penalty_min_len = int(self.length_penalty_min_len)
+        self.length_penalty_max_len = int(self.length_penalty_max_len)
+        self.length_penalty_offset = float(self.length_penalty_offset)
+        # A non-positive span makes the penalty a silent no-op (division guard in
+        # LengthPenaltySpec.penalty_for), which would look like the flag doing
+        # nothing. Fail loudly at construction instead.
+        if self.length_penalty and self.length_penalty_max_len <= self.length_penalty_min_len:
+            raise ValueError(
+                "length_penalty_max_len must be greater than length_penalty_min_len, got "
+                f"{self.length_penalty_max_len} <= {self.length_penalty_min_len}"
+            )
+
+    def length_penalty_kwargs(self) -> Dict[str, Any] | None:
+        """Kwargs for ``advantage.LengthPenaltySpec``, or ``None`` when disabled.
+
+        Returned as a plain dict rather than the dataclass itself so this module
+        stays importable without ``torch`` (``advantage.py`` imports it).
+        """
+        if not self.length_penalty:
+            return None
+        return {
+            "coef": self.length_penalty_coef,
+            "bonus": self.length_penalty_bonus,
+            "min_len": self.length_penalty_min_len,
+            "max_len": self.length_penalty_max_len,
+            "offset": self.length_penalty_offset,
+        }
 
     @property
     def marshal_exact(self) -> bool:

@@ -90,6 +90,73 @@ def _strip_reasoning_by_tokens(completion_ids: Sequence[int], tokenizer) -> Opti
     return tokenizer.decode(ids[last + 1:], skip_special_tokens=True).strip()
 
 
+NO_THINK_TAG = "/no_think"
+EMPTY_THINK_PREFILL = "<think>\n\n</think>\n\n"
+
+
+def _with_no_think(messages) -> List[dict]:
+    """Copy of ``messages`` with ``/no_think`` appended to the final user message.
+
+    Qwen3's soft switch. Returns a *copy* -- the caller's list holds the live
+    observation dict that clemcore also keeps in the player's memory, so mutating it
+    would append ``/no_think`` into the recorded conversation and compound it every
+    turn. Idempotent: never appends the tag twice.
+    """
+    msgs = [dict(m) for m in messages]
+    for msg in reversed(msgs):
+        if msg.get("role") == "user":
+            content = str(msg.get("content", ""))
+            if NO_THINK_TAG not in content:
+                msg["content"] = f"{content}\n\n{NO_THINK_TAG}"
+            break
+    return msgs
+
+
+def render_prompt(tokenizer, messages) -> str:
+    """Render the chat prompt with reasoning suppressed three ways over, every turn.
+
+    Clembench games want one short, strictly-formatted line per turn (``QUESTION: ``,
+    ``[Proposal: ...]``). Reasoning models spend the whole per-turn budget inside
+    ``<think>`` instead: observed on Qwen3-4B/dond, every turn hit
+    ``max_completion_length`` mid-thought, never closed the block, and so never
+    emitted an action -- every episode aborted, which is an all-equal advantage pool
+    and zero gradient. Disabling thinking is also what MARSHAL itself settled on for
+    clembench envs (``SESSION_2026-07-11_playpen_reward_bypass.md``).
+
+    ``enable_thinking=False`` alone was NOT sufficient in practice, so all three of
+    Qwen3's documented switches are applied together:
+
+    1. ``enable_thinking=False`` -- the template kwarg. Templates that don't define
+       it ignore the extra render variable; the ``TypeError`` fallback covers older
+       tokenizers that reject unknown kwargs, keeping this safe for non-Qwen models.
+    2. ``/no_think`` -- the soft switch, appended to the last user message.
+    3. An empty ``<think></think>`` block **prefilled onto the end of the prompt**, so
+       generation resumes *after* an already-closed block and the model cannot open
+       another. This is the hard guarantee; 1 and 2 are hints the model may ignore.
+
+    The prefill is skipped when the template already emitted a think block of its own
+    (newer Qwen3 templates do this under ``enable_thinking=False``), which would
+    otherwise leave two stacked blocks. Only the *tail* is inspected, so a
+    ``</think>`` belonging to an earlier assistant turn in the history is not mistaken
+    for the template's own prefill.
+
+    The prefill lands in the prompt, never in ``completion_ids``, so it costs no
+    trained tokens and does not disturb turn-boundary bookkeeping.
+    """
+    msgs = _with_no_think(messages)
+    try:
+        text = tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False
+        )
+    except TypeError:
+        text = tokenizer.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False
+        )
+    if THINK_CLOSE not in text[-64:]:
+        text = f"{text}{EMPTY_THINK_PREFILL}"
+    return text
+
+
 def response_for_game(text: str, completion_ids: Sequence[int], tokenizer) -> str:
     """The utterance the game/history should see: the answer without the reasoning.
 
@@ -226,9 +293,7 @@ def play_selfplay_episode(
 
         # Build this seat's full clemcore perspective (user + prior assistant turns).
         perspective = player.perceive_context(obs, log_event=False)
-        prompt_text = tokenizer.apply_chat_template(
-            perspective, add_generation_prompt=True, tokenize=False
-        )
+        prompt_text = render_prompt(tokenizer, perspective)
 
         if builder.first_turn:
             builder.set_prompt(tokenizer.encode(prompt_text, add_special_tokens=False))

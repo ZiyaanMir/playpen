@@ -31,6 +31,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
 from datetime import datetime
 
@@ -63,6 +64,35 @@ def parse_args() -> argparse.Namespace:
                         help="Force Dr. GRPO ON (overrides the YAML 'dr_grpo').")
     drgrpo.add_argument("--no-dr-grpo", dest="dr_grpo", action="store_false",
                         help="Force Dr. GRPO OFF (TRL default loss/scaling).")
+
+    # Length penalty (MARSHAL's compute_length_penalty; overrides the YAML fields).
+    # Off by default, which is also the MARSHAL-faithful setting: MARSHAL applies this
+    # only to its board-game envs and explicitly skips it for free-text ones like
+    # clembench (env_manager.py:470-480). Turn it on to discipline a reasoning model
+    # that overruns its per-turn budget -- and say so when reporting the run.
+    lenpen = p.add_mutually_exclusive_group()
+    lenpen.add_argument("--length-penalty", dest="length_penalty", action="store_true", default=None,
+                        help="Force the per-turn length penalty ON (overrides the YAML 'length_penalty').")
+    lenpen.add_argument("--no-length-penalty", dest="length_penalty", action="store_false",
+                        help="Force the per-turn length penalty OFF.")
+    p.add_argument("--length-penalty-coef", type=float, default=None,
+                   help="Penalty magnitude (MARSHAL's 'lower', ships 0.5): at twice the "
+                        "threshold the turn reward is docked by about this much. clembench "
+                        "outcomes are +1/0/-1, so 0.5 is already a strong signal.")
+    p.add_argument("--length-penalty-max-len", type=int, default=None,
+                   help="Per-turn token count above which a generation is penalized "
+                        "(MARSHAL's 'max_len', ships 2048). Set near --max-completion-length "
+                        "so only genuine overruns are charged.")
+    p.add_argument("--length-penalty-bonus", type=float, default=None,
+                   help="Scale on the positive branch (MARSHAL's 'upper', ships 0.0 = no "
+                        "reward for brevity). Nonzero pays the policy to be short, which "
+                        "with a strict clembench parser can degenerate into empty answers.")
+    p.add_argument("--length-penalty-min-len", type=int, default=None,
+                   help="Origin of the penalty slope (MARSHAL's 'min_len', ships 11). "
+                        "Near-irrelevant while --length-penalty-bonus is 0.")
+    p.add_argument("--length-penalty-offset", type=float, default=None,
+                   help="Vertical offset of the raw term (MARSHAL's 'coef', ships 1.0). "
+                        "Prefer changing --length-penalty-max-len instead.")
 
     # LoRA (always applied)
     p.add_argument("--lora-r", type=int, default=16)
@@ -152,6 +182,23 @@ def main() -> None:
     # pooling; drops only the std divisor Dr. GRPO removes). No-op when dr_grpo is off.
     if args.dr_grpo is not None:
         marshal_config.dr_grpo = args.dr_grpo
+    # Length penalty (YAML source of truth; CLI overrides any field that was passed).
+    # Re-run __post_init__ via dataclasses.replace so the max_len > min_len check
+    # applies to the merged values, not just the ones that came from the YAML.
+    lp_overrides = {
+        name: getattr(args, name)
+        for name in (
+            "length_penalty",
+            "length_penalty_coef",
+            "length_penalty_bonus",
+            "length_penalty_min_len",
+            "length_penalty_max_len",
+            "length_penalty_offset",
+        )
+        if getattr(args, name) is not None
+    }
+    if lp_overrides:
+        marshal_config = dataclasses.replace(marshal_config, **lp_overrides)
     for notice in marshal_config.reconcile_for_dr_grpo():
         print(f"[dr_grpo] {notice}")
     print(f"[marshal] enabled={marshal_config.enabled} "
@@ -161,6 +208,25 @@ def main() -> None:
           f"fidelity={marshal_config.fidelity_mode} "
           f"whiten_rewards={marshal_config.whiten_rewards} "
           f"whiten_advantages={marshal_config.whiten_advantages}")
+    if marshal_config.length_penalty:
+        from playpen.marshal.advantage import LengthPenaltySpec
+
+        _spec = LengthPenaltySpec(**marshal_config.length_penalty_kwargs())
+        _probe = marshal_config.length_penalty_max_len * 2
+        print(f"[length_penalty] ON coef={marshal_config.length_penalty_coef} "
+              f"max_len={marshal_config.length_penalty_max_len} "
+              f"bonus={marshal_config.length_penalty_bonus} "
+              f"min_len={marshal_config.length_penalty_min_len} "
+              f"offset={marshal_config.length_penalty_offset} "
+              f"-> a {_probe}-token turn scores {_spec.penalty_for(_probe):+.3f}")
+        if not marshal_config.enabled:
+            print("[length_penalty] WARNING: --no-marshal is set, so the MARSHAL advantage "
+                  "path is off and the length penalty has NO effect (it is applied inside "
+                  "compute_marshal_advantages).")
+        print("[length_penalty] NOTE: MARSHAL skips this penalty for free-text envs like "
+              "clembench (env_manager.py:470-480); this run is a deliberate divergence.")
+    else:
+        print("[length_penalty] off (MARSHAL-faithful default for clembench games)")
     print(f"[kl] beta={args.kl_beta}" + (" (disabled)" if args.kl_beta == 0.0 else ""))
     _dr_overrides = marshal_config.trl_grpo_overrides()
     print(f"[dr_grpo] enabled={marshal_config.dr_grpo}"

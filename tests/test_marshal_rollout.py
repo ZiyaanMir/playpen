@@ -237,6 +237,104 @@ class TestInstanceIndexing(unittest.TestCase):
             env.reset(len(self.rows))
 
 
+class TestRenderPromptDisablesThinking(unittest.TestCase):
+    """Reasoning is disabled at the source, for every model and game."""
+
+    def test_passes_enable_thinking_false(self):
+        from playpen.marshal.selfplay_agent import render_prompt
+
+        seen = {}
+
+        class _Tok:
+            def apply_chat_template(self, messages, **kwargs):
+                seen.update(kwargs)
+                return "PROMPT"
+
+        out = render_prompt(_Tok(), [{"role": "user", "content": "hi"}])
+        self.assertTrue(out.startswith("PROMPT"))  # + the empty-think prefill
+        self.assertIs(seen["enable_thinking"], False)
+        self.assertIs(seen["add_generation_prompt"], True)
+
+    def test_falls_back_when_template_rejects_the_kwarg(self):
+        # Older tokenizers raise on unknown kwargs; there is simply nothing to
+        # disable there, so the render must still succeed.
+        from playpen.marshal.selfplay_agent import render_prompt
+
+        calls = []
+
+        class _StrictTok:
+            def apply_chat_template(self, messages, **kwargs):
+                calls.append(kwargs)
+                if "enable_thinking" in kwargs:
+                    raise TypeError("unexpected keyword argument 'enable_thinking'")
+                return "PROMPT"
+
+        out = render_prompt(_StrictTok(), [])
+        self.assertTrue(out.startswith("PROMPT"))
+        self.assertEqual(len(calls), 2)  # tried with, then without
+        self.assertNotIn("enable_thinking", calls[1])
+
+    def test_no_think_tag_appended_to_last_user_message(self):
+        from playpen.marshal.selfplay_agent import NO_THINK_TAG, render_prompt
+
+        seen = {}
+
+        class _Tok:
+            def apply_chat_template(self, messages, **kwargs):
+                seen["messages"] = messages
+                return "PROMPT"
+
+        original = [{"role": "user", "content": "your move"}]
+        render_prompt(_Tok(), original)
+        self.assertTrue(seen["messages"][-1]["content"].endswith(NO_THINK_TAG))
+        # The caller's list/dicts must not be mutated: clemcore keeps that same
+        # observation dict, so mutation would compound the tag every turn.
+        self.assertEqual(original[0]["content"], "your move")
+
+    def test_no_think_tag_not_duplicated(self):
+        from playpen.marshal.selfplay_agent import NO_THINK_TAG, render_prompt
+
+        seen = {}
+
+        class _Tok:
+            def apply_chat_template(self, messages, **kwargs):
+                seen["messages"] = messages
+                return "PROMPT"
+
+        render_prompt(_Tok(), [{"role": "user", "content": f"already there {NO_THINK_TAG}"}])
+        self.assertEqual(seen["messages"][-1]["content"].count(NO_THINK_TAG), 1)
+
+    def test_empty_think_block_prefilled(self):
+        from playpen.marshal.selfplay_agent import EMPTY_THINK_PREFILL, render_prompt
+
+        class _Tok:
+            def apply_chat_template(self, messages, **kwargs):
+                return "PROMPT<|im_start|>assistant\n"
+
+        self.assertTrue(render_prompt(_Tok(), []).endswith(EMPTY_THINK_PREFILL))
+
+    def test_prefill_not_doubled_when_template_already_closed_a_block(self):
+        # Newer Qwen3 templates emit their own empty block under enable_thinking=False.
+        from playpen.marshal.selfplay_agent import render_prompt
+
+        class _Tok:
+            def apply_chat_template(self, messages, **kwargs):
+                return "PROMPT<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+        self.assertEqual(render_prompt(_Tok(), []).count("<think>"), 1)
+
+    def test_close_tag_in_history_does_not_suppress_the_prefill(self):
+        # A </think> from an earlier assistant turn is far from the tail and must
+        # not be mistaken for the template's own prefill.
+        from playpen.marshal.selfplay_agent import EMPTY_THINK_PREFILL, render_prompt
+
+        class _Tok:
+            def apply_chat_template(self, messages, **kwargs):
+                return "old turn</think>" + "x" * 200 + "<|im_start|>assistant\n"
+
+        self.assertTrue(render_prompt(_Tok(), []).endswith(EMPTY_THINK_PREFILL))
+
+
 class TestStripReasoning(unittest.TestCase):
     """Text-level <think> stripping (the fallback path)."""
 

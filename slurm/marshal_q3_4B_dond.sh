@@ -50,33 +50,32 @@ echo "host=$(hostname) job=$SLURM_JOB_ID start=$(date --iso-8601=seconds)"
 # --max-turns 30 is a safety ceiling only: dond self-limits at 5 rounds
 # (~10-12 env turns), so it never binds; it just caps a runaway episode.
 
-# UPDATED 2026-07-22 for thinking models. Qwen3 spends most of a turn inside a
-# <think> block, so the per-turn budget is 1536 (not the 512/768 quoted above) and
-# vllm-max-model-len is 16384 to fit the grown prompt. Paid for by halving the
-# forward batch to 2 and doubling grad-accum, so the generation batch — and hence
-# the MARSHAL per-seat advantage pool — is UNCHANGED. Any batch/turn-length figure
-# in the paragraphs above refers to the pre-thinking sizing and is superseded.
-#
-# CAVEAT: budget alone is not enough. guesswhat aborts unless the utterance STARTS
-# WITH "QUESTION:"/"GUESS:" (clembench guesswhat/master.py:161), and the port sends
-# the raw response — <think> and all — straight to env.step(). Until the think block
-# is suppressed or stripped, guesswhat aborts every turn regardless of this budget.
+# UPDATED 2026-07-22: reasoning is now DISABLED at the source. render_prompt() in
+# playpen/marshal/selfplay_agent.py applies the chat template with
+# enable_thinking=False for every model and game, because Qwen3 was spending the
+# whole per-turn budget inside <think>, never closing the block, and so never
+# emitting an action -- every episode aborted (all-equal pool, zero gradient).
+# Turns are therefore short again: the per-turn budget is back down, and
+# vllm-max-model-len returns to 8192 now that think blocks no longer inflate the
+# prompt. Any batch/turn-length figure in the paragraphs above refers to the
+# pre-thinking sizing and still applies. The <think> stripping stays in place as a
+# safety net for models that emit a block regardless; it is a no-op when they don't.
 python -m examples.marshal.train_selfplay \
     --model Qwen/Qwen3-4B \
     --game dond \
     --marshal-config examples/marshal/marshal_config.yaml \
     --num-generations 8 \
     --per-device-batch-size 2 \
-    --grad-accum 16 \
+    --grad-accum 8 \
     --max-steps 200 \
     --save-steps 50 \
     --learning-rate 1e-5 \
     --kl-beta 0.2 \
-    --max-completion-length 1536 \
+    --max-completion-length 768 \
     --max-turns 30 \
     --gradient-checkpointing \
     --vllm-gpu-memory-utilization 0.30 \
-    --vllm-max-model-len 16384 \
+    --vllm-max-model-len 8192 \
     --output-dir "$PROJECTDIR/$USER/marshal-runs/dond"
 
 echo "end=$(date --iso-8601=seconds)"

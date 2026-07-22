@@ -28,7 +28,12 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import trl
 
-from playpen.marshal.advantage import RowRollout, compute_marshal_advantages
+from playpen.marshal.advantage import (
+    LengthPenaltySpec,
+    RowRollout,
+    compute_marshal_advantages,
+    turn_token_lengths,
+)
 from playpen.marshal.config import MarshalConfig
 from playpen.marshal.selfplay_agent import play_selfplay_episode
 from playpen.marshal.selfplay_env import SelfPlayEnv, list_instance_indices
@@ -243,6 +248,9 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
                 )
             )
 
+        lp_kwargs = cfg.length_penalty_kwargs()
+        length_penalty = LengthPenaltySpec(**lp_kwargs) if lp_kwargs is not None else None
+
         advantages = compute_marshal_advantages(
             rows,
             seq_len,
@@ -253,6 +261,7 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
             norm_mode=cfg.advantage_norm_mode,
             whiten_rewards=cfg.whiten_rewards,
             whiten_advantages=cfg.whiten_advantages,
+            length_penalty=length_penalty,
             device=device,
             dtype=base_adv.dtype,
         )
@@ -260,7 +269,43 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         # Log per-seat pool stats so a run can confirm the seat split is live and
         # the two seats' advantage distributions actually differ.
         self._log_seat_stats(rows, advantages)
+        if length_penalty is not None:
+            self._log_length_penalty_stats(rows, length_penalty)
         return advantages
+
+    def _log_length_penalty_stats(
+        self, rows: List[RowRollout], spec: LengthPenaltySpec
+    ) -> None:
+        """Log turn lengths and the penalty they incur.
+
+        Worth having because the penalty is silent when it does nothing: with
+        MARSHAL's defaults every turn shorter than ``max_len`` scores exactly 0, so
+        ``penalty/mean == 0`` and ``over_rate == 0`` is the signature of a threshold
+        set too high to bite, which is otherwise indistinguishable from the flag
+        not being wired up.
+        """
+        try:
+            lengths: List[int] = []
+            penalties: List[float] = []
+            for row in rows:
+                for length in turn_token_lengths(row.owner_mask, row.turn_end_positions):
+                    if length <= 0:
+                        continue  # a turn that generated nothing is not a data point
+                    lengths.append(length)
+                    penalties.append(spec.penalty_for(length))
+            if not lengths:
+                return
+            mode = "train"
+            metrics = self._metrics[mode]
+            metrics["marshal/length_penalty/mean"].append(sum(penalties) / len(penalties))
+            metrics["marshal/length_penalty/min"].append(min(penalties))
+            metrics["marshal/turn_tokens/mean"].append(sum(lengths) / len(lengths))
+            metrics["marshal/turn_tokens/max"].append(max(lengths))
+            over = sum(1 for length in lengths if length > spec.max_len)
+            metrics["marshal/length_penalty/over_rate"].append(over / len(lengths))
+        except Exception:
+            # Metrics logging must never break training.
+            pass
 
     def _log_seat_stats(self, rows: List[RowRollout], advantages: torch.Tensor) -> None:
         try:

@@ -28,7 +28,7 @@ completion position ``j`` maps to column ``j``).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -61,6 +61,121 @@ class RowRollout:
     owner_mask: Sequence[int]
     turn_end_positions: Sequence[int]
     turn_rewards: Sequence[float]
+
+
+@dataclass(frozen=True)
+class LengthPenaltySpec:
+    """MARSHAL's Kimi-1.5-style per-turn length reward, as a parameter bundle.
+
+    Ported from ``MARSHAL/roll/agentic/rollout/env_manager.py:276-294``
+    (``compute_length_penalty``), whose shipped scale is
+    ``{upper: 0.0, lower: 0.5, min_len: 11, max_len: 2048, coef: 1}``
+    (``env_manager.py:212-218``). Field names here are spelled out; the mapping is:
+
+    ==================  ==================  ===================================
+    this class          MARSHAL key         meaning
+    ==================  ==================  ===================================
+    ``coef``            ``lower``           scale applied to the *negative* part
+    ``bonus``           ``upper``           scale applied to the *positive* part
+    ``min_len``         ``min_len``         length at which the raw term is
+                                            ``offset``
+    ``max_len``         ``max_len``         length at which the raw term hits 0
+                                            (when ``offset == 1``)
+    ``offset``          ``coef``            vertical offset of the raw term
+    ==================  ==================  ===================================
+
+    With MARSHAL's defaults ``bonus == 0`` zeroes the positive branch, so the net
+    effect is a **one-sided linear penalty for generations longer than
+    ``max_len``**, scaled by ``coef`` -- about ``-0.5`` at twice ``max_len``,
+    deliberately "comparable with the winning rewards" (their comment), i.e. on the
+    same scale as clembench's SUCCESS ``+1`` / ABORTED ``-1``.
+
+    IMPORTANT -- this is a deliberate divergence from MARSHAL's shipped behavior for
+    this class of environment. MARSHAL applies the penalty only to its board-game
+    envs: ``env_manager.py:470-480`` guards the call behind
+    ``if not isinstance(env, BaseLanguageBasedEnv)`` with the comment "No
+    MARSHAL-imposed reward shaping for free-text envs (e.g. Playpen/clembench)".
+    Enabling it here shapes a reward MARSHAL leaves unshaped, so a run using it is
+    not a MARSHAL reproduction and should say so.
+    """
+
+    coef: float = 0.5
+    bonus: float = 0.0
+    min_len: int = 11
+    max_len: int = 2048
+    offset: float = 1.0
+
+    def penalty_for(self, token_length: int) -> float:
+        """The length reward for a single turn of ``token_length`` generated tokens.
+
+        Returns 0.0 for a turn that generated nothing -- there is no response to
+        penalize, and with a nonzero ``bonus`` the raw term would otherwise hand a
+        *reward* to a turn that never happened.
+        """
+        if token_length <= 0:
+            return 0.0
+        span = float(self.max_len - self.min_len)
+        if span <= 0.0:
+            return 0.0
+        reward = self.offset - (token_length - self.min_len) / span
+        # Two independent `if`s, mirroring MARSHAL's own structure (the branches are
+        # mutually exclusive, so this is the same as if/elif).
+        if reward > 0:
+            reward *= self.bonus
+        if reward < 0:
+            reward *= self.coef
+        return float(reward)
+
+
+def turn_token_lengths(
+    owner_mask: Sequence[int], turn_end_positions: Sequence[int]
+) -> List[int]:
+    """Model-generated token count for each turn, derived from the owner mask.
+
+    A turn's generation is the maximal run of ``owner_mask == 1`` ending at that
+    turn's end position: ``_SeatBuilder.add_model_tokens`` appends each turn's
+    tokens as one contiguous block of 1s and records the end position at the last
+    of them, and consecutive turns are always separated by at least one
+    environment token from ``add_env_tokens`` (``selfplay_agent.py:154-166``). So
+    the run is exactly that turn's completion, and no extra plumbing through TRL's
+    rollout contract is needed to recover it.
+
+    Out-of-range end positions yield 0 -- notably the ``-1`` that an empty
+    generation records, which has no tokens to charge for.
+    """
+    lengths: List[int] = []
+    for pos in turn_end_positions:
+        if not 0 <= pos < len(owner_mask):
+            lengths.append(0)
+            continue
+        count = 0
+        idx = pos
+        while idx >= 0 and owner_mask[idx] == 1:
+            count += 1
+            idx -= 1
+        lengths.append(count)
+    return lengths
+
+
+def apply_length_penalty(
+    turn_rewards: Sequence[float],
+    owner_mask: Sequence[int],
+    turn_end_positions: Sequence[int],
+    spec: LengthPenaltySpec,
+) -> List[float]:
+    """Add the per-turn length reward to each of a row's turn rewards.
+
+    Mirrors MARSHAL's ``num_actions_info['reward'] += format_reward +
+    length_penalty`` (``env_manager.py:770-771``): the penalty is folded into the
+    *raw* turn reward, so everything downstream (the ``marshal_exact`` pre-sum
+    normalization, ``whiten_rewards``, the backward cumulative sum and the per-seat
+    pooling) sees it, exactly as in MARSHAL.
+    """
+    lengths = turn_token_lengths(owner_mask, turn_end_positions)
+    return [
+        float(reward) + spec.penalty_for(length)
+        for reward, length in zip(turn_rewards, lengths)
+    ]
 
 
 def build_reward_tensor(
@@ -289,16 +404,22 @@ def compute_marshal_advantages(
     norm_mode: str = "mean",
     whiten_rewards: bool = False,
     whiten_advantages: bool = False,
+    length_penalty: Optional[LengthPenaltySpec] = None,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """End-to-end: rows -> ``(B, T)`` MARSHAL advantages tensor.
 
-    Steps, per row: build the sparse turn reward vector, (optionally, in
-    ``marshal_exact`` mode) apply a biasing pre-sum reward normalization,
-    (optionally) whiten the reward field, take the backward cumulative return.
-    Then normalize the ``(B, T)`` returns per seat and (optionally) whiten the
-    result.
+    Steps, per row: (optionally) add the per-turn length penalty to the turn
+    rewards, build the sparse turn reward vector, (optionally, in ``marshal_exact``
+    mode) apply a biasing pre-sum reward normalization, (optionally) whiten the
+    reward field, take the backward cumulative return. Then normalize the ``(B, T)``
+    returns per seat and (optionally) whiten the result.
+
+    ``length_penalty`` (``None`` = off, the default) is a :class:`LengthPenaltySpec`
+    applied to each turn's reward before anything else, matching where MARSHAL adds
+    it (``env_manager.py:770-771``). See that class for the formula and for why
+    enabling it on a clembench game is a deliberate divergence from MARSHAL.
 
     ``whiten_rewards`` / ``whiten_advantages`` mirror the same-named ROLL flags
     that every shipped MARSHAL ``*_selfplay.yaml`` sets to true (they are framework
@@ -329,9 +450,14 @@ def compute_marshal_advantages(
     seats = torch.zeros(batch, dtype=torch.long, device=device)
 
     for i, row in enumerate(rows):
+        turn_rewards = list(row.turn_rewards)
+        if length_penalty is not None:
+            turn_rewards = apply_length_penalty(
+                turn_rewards, row.owner_mask, row.turn_end_positions, length_penalty
+            )
         reward_rows[i] = build_reward_tensor(
             row.turn_end_positions,
-            row.turn_rewards,
+            turn_rewards,
             seq_len,
             turn_level=turn_level,
             device=device,

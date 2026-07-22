@@ -16,7 +16,7 @@ agent_specific_normalization: true
 # Keep rewards at each turn boundary and turn them into per-token returns via a
 # backward cumulative sum (turn-level advantage estimator). False => sum a seat's
 # turn rewards into a single terminal scalar (MARSHAL use_turn_scores=False).
-turn_level_rewards: false
+turn_level_rewards: true
 
 # "mean" mean-centers each pool; "mean_std" z-scores it.
 advantage_norm_mode: mean
@@ -58,3 +58,55 @@ whiten_advantages: true
 # advantage_norm_mode: mean_std does dr_grpo align it back to `mean` (dropping the per-seat
 # std divisor but keeping per-seat pooling), with a printed notice.
 dr_grpo: false
+
+# ---------------------------------------------------------------------------
+# Per-turn length penalty (MARSHAL's Kimi-1.5-style compute_length_penalty,
+# roll/agentic/rollout/env_manager.py:276-294). Added to each turn's reward
+# BEFORE any normalization, so the pre-sum pass, whitening, the backward
+# cumulative sum and the per-seat pooling all see it -- the same place MARSHAL
+# adds it (env_manager.py:770-771).
+#
+#   raw   = offset - (turn_tokens - min_len) / (max_len - min_len)
+#   score = raw * bonus   if raw > 0      (bonus 0.0 => no reward for brevity)
+#           raw * coef    if raw < 0      (the penalty)
+#
+# With the shipped defaults this is a ONE-SIDED penalty: exactly 0 for any turn
+# at or under max_len, then linear beyond it (~ -coef at 2x max_len).
+#
+# IMPORTANT: `false` is the MARSHAL-FAITHFUL setting. MARSHAL applies this only
+# to its board-game envs and explicitly skips it for free-text ones --
+# env_manager.py:470-480 guards it behind `not isinstance(env,
+# BaseLanguageBasedEnv)`, commented "No MARSHAL-imposed reward shaping for
+# free-text envs (e.g. Playpen/clembench)". Turning it on is a deliberate
+# divergence, worth making against a reasoning model that overruns its budget,
+# but a run using it is NOT a MARSHAL reproduction and should be reported as such.
+#
+# Only has an effect when `enabled: true` (it lives inside the MARSHAL advantage
+# path). CLI overrides: --length-penalty / --no-length-penalty,
+# --length-penalty-coef, --length-penalty-max-len, ...
+# Watch marshal/length_penalty/over_rate: 0 means the threshold never binds.
+length_penalty: true
+
+# Penalty magnitude -- MARSHAL's `lower`. The main knob. clembench outcomes are
+# SUCCESS +1 / FAILURE 0 / ABORTED -1, so 0.5 is already a strong counterweight.
+length_penalty_coef: 0.1
+
+# Turn-token count above which a generation is penalized -- MARSHAL's `max_len`.
+# Set this near your per-turn --max-completion-length (e.g. 1536 for the Qwen3
+# thinking runs) so only genuine overruns are charged, not ordinary reasoning.
+length_penalty_max_len: 2048
+
+# Scale on the positive branch -- MARSHAL's `upper`. 0.0 (shipped) means short
+# turns score exactly 0 rather than earning a bonus. Raising it PAYS the policy
+# to be brief, which against a strict clembench parser can degenerate into empty
+# answers that abort the turn; prefer leaving it at 0.
+length_penalty_bonus: 0.0
+
+# Origin of the penalty slope -- MARSHAL's `min_len` (11 comes from the shortest
+# `<answer>X(i,j)</answer>` in their board games). Near-irrelevant while
+# length_penalty_bonus is 0.
+length_penalty_min_len: 11
+
+# Vertical offset of the raw term -- MARSHAL's `coef`. Prefer changing
+# length_penalty_max_len instead; this just moves the zero-crossing.
+length_penalty_offset: 1.0

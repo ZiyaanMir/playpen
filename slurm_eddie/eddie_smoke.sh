@@ -49,16 +49,21 @@ print('  CUDA_VISIBLE_DEVICES =', __import__('os').environ.get('CUDA_VISIBLE_DEV
 echo "--- 5. one real training step end-to-end (vLLM + LoRA + MARSHAL advantages)"
 python -m examples.marshal.train_selfplay \
     --model Qwen/Qwen3-0.6B \
-    --game taboo \
+    --game guesswhat \
     --marshal-config examples/marshal/marshal_config.yaml \
-    --num-generations 2 \
-    --per-device-batch-size 4 \
-    --max-steps 1 \
-    --save-steps 1 \
-    --max-completion-length 512 \
-    --vllm-gpu-memory-utilization 0.45 \
-    --vllm-max-model-len 4096 \
-    --output-dir "$MARSHAL_RUNS/smoke"
+    --num-generations 8 \
+    --per-device-batch-size 2 \
+    --grad-accum 8 \
+    --max-steps 2 \
+    --save-steps 2 \
+    --learning-rate 1e-5 \
+    --kl-beta 0.2 \
+    --max-completion-length 1536 \
+    --max-turns 30 \
+    --gradient-checkpointing \
+    --vllm-gpu-memory-utilization 0.30 \
+    --vllm-max-model-len 16384 \
+    --output-dir "$MARSHAL_RUNS/guesswhat"
 
 echo "end=$(date --iso-8601=seconds)"
 echo "If step 5 printed a checkpoint path and no traceback, the pipeline is live."
