@@ -85,6 +85,19 @@ export UV_CACHE_DIR="$SCRATCH/home_cache/uv"
 export TMPDIR="${TMPDIR:-$SCRATCH/tmp}"
 mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$TMPDIR"
 
+# --- Isambard compatibility shim ---------------------------------------------
+# The sibling ../slurm/*.sh scripts are for Isambard and end with
+#     --output-dir "$PROJECTDIR/$USER/marshal-runs/<game>"
+# $PROJECTDIR comes from BriCS's `module load brics/userenv` and does NOT exist on
+# Eddie, so copy-pasting one of those command tails here silently produces
+# "/<user>/marshal-runs/..." — an absolute path at the filesystem root — and dies
+# ~90 s later inside Trainer.__init__ with:
+#     PermissionError: [Errno 13] Permission denied: '/s2874947'
+# Defining it as the PARENT of $SCRATCH makes "$PROJECTDIR/$USER/..." resolve to
+# exactly "$SCRATCH/...", so an Isambard-style command lands in the right place on
+# Eddie instead of crashing. Prefer "$MARSHAL_RUNS/<game>" in new commands.
+export PROJECTDIR="${PROJECTDIR:-$(dirname "$SCRATCH")}"
+
 # --- compile caches: PER JOB, never shared -----------------------------------
 # vLLM's torch.compile cache defaults to ~/.cache/vllm (vllm/envs.py:33) and is
 # SHARED by every concurrently running job. The cached artifacts embed absolute
