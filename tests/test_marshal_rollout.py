@@ -38,6 +38,7 @@ class _FakeEnv:
         self._turn = 0
         self._players = {0: _FakePlayer(), 1: _FakePlayer()}
         self.finalized = False
+        self.seen = []  # every utterance handed to the game, in order
 
     def reset(self, instance_idx, *, seed=0):
         self._turn = 0
@@ -55,6 +56,7 @@ class _FakeEnv:
         return {"role": "user", "content": f"observation number {self._turn}"}
 
     def step(self, response):
+        self.seen.append(response)
         self._turn += 1
 
     @property
@@ -233,6 +235,144 @@ class TestInstanceIndexing(unittest.TestCase):
         env = SelfPlayEnv("taboo")
         with self.assertRaises(IndexError):
             env.reset(len(self.rows))
+
+
+class TestStripReasoning(unittest.TestCase):
+    """Text-level <think> stripping (the fallback path)."""
+
+    def test_complete_block_removed(self):
+        from playpen.marshal.selfplay_agent import strip_reasoning
+
+        self.assertEqual(
+            strip_reasoning("<think>hmm, vowels?</think>QUESTION: is it a noun?"),
+            "QUESTION: is it a noun?",
+        )
+
+    def test_dangling_close_tag(self):
+        # Templates that pre-fill "<think>" into the prompt: the completion starts
+        # already inside the block, so only the closing tag appears.
+        from playpen.marshal.selfplay_agent import strip_reasoning
+
+        self.assertEqual(
+            strip_reasoning("reasoning with no open tag</think>\n\nGUESS: apple"),
+            "GUESS: apple",
+        )
+
+    def test_unterminated_block_yields_empty(self):
+        # Budget ran out mid-thought: there is no answer, and saying so honestly
+        # (empty -> the game aborts this turn) beats leaking reasoning to the parser.
+        from playpen.marshal.selfplay_agent import strip_reasoning
+
+        self.assertEqual(strip_reasoning("<think>still thinking and then cut o"), "")
+
+    def test_multiple_blocks(self):
+        from playpen.marshal.selfplay_agent import strip_reasoning
+
+        self.assertEqual(
+            strip_reasoning("<think>a</think>QUESTION: x?<think>b</think>"),
+            "QUESTION: x?",
+        )
+
+    def test_no_reasoning_is_passthrough(self):
+        from playpen.marshal.selfplay_agent import strip_reasoning
+
+        self.assertEqual(strip_reasoning("QUESTION: is it red?"), "QUESTION: is it red?")
+
+    def test_guesswhat_prefix_contract_is_restored(self):
+        # The actual bug: clembench guesswhat aborts unless the utterance STARTS WITH
+        # the tag (guesswhat/master.py:161).
+        from playpen.marshal.selfplay_agent import strip_reasoning
+
+        raw = "<think>The word has five letters.</think>\n\nQUESTION: does it fly?"
+        self.assertFalse(raw.startswith("QUESTION:"))
+        self.assertTrue(strip_reasoning(raw).startswith("QUESTION:"))
+
+
+class _ThinkTokenizer(_FakeTokenizer):
+    """Tokenizer that knows </think> as a token id, exercising the token-level path."""
+
+    CLOSE_ID = 999
+
+    def convert_tokens_to_ids(self, token):
+        return self.CLOSE_ID if token == "</think>" else None
+
+    def decode(self, ids, skip_special_tokens=True):
+        # Only the ids after the close tag are ever passed here by the token path.
+        return "GUESS: apple" if list(ids) == [7, 8] else "decoded"
+
+
+class TestResponseForGame(unittest.TestCase):
+    """Token-level strip is preferred, because TRL's `text` drops special tokens."""
+
+    def test_token_level_slices_after_close_tag(self):
+        from playpen.marshal.selfplay_agent import response_for_game
+
+        # `text` has already lost its tags (skip_special_tokens=True), so a text-only
+        # strip would leak the reasoning prose. The ids still carry the boundary.
+        text_without_tags = "some reasoning GUESS: apple"
+        ids = [1, 2, _ThinkTokenizer.CLOSE_ID, 7, 8]
+        self.assertEqual(response_for_game(text_without_tags, ids, _ThinkTokenizer()), "GUESS: apple")
+
+    def test_falls_back_to_text_when_no_think_token(self):
+        from playpen.marshal.selfplay_agent import response_for_game
+
+        got = response_for_game("<think>x</think>QUESTION: y?", [1, 2, 3], _FakeTokenizer())
+        self.assertEqual(got, "QUESTION: y?")
+
+
+def _fake_generate_with_thinking():
+    def generate_rollout_completions(trainer, prompts, **kwargs):
+        return [
+            {
+                "prompt_ids": [1, 2, 3],
+                "completion_ids": [10, 11, 12, 13],  # 4 tokens: reasoning + answer
+                "logprobs": [-0.1, -0.2, -0.3, -0.4],
+                "text": "<think>deliberating</think>QUESTION: is it alive?",
+            }
+            for _ in prompts
+        ]
+
+    return generate_rollout_completions
+
+
+class TestThinkingIsTrainedButNotSentToGame(unittest.TestCase):
+    """The whole point of option B: train the reasoning, hide it from the parser."""
+
+    def setUp(self):
+        import trl.experimental.openenv as oe
+
+        self._oe = oe
+        self._orig = oe.generate_rollout_completions
+        oe.generate_rollout_completions = _fake_generate_with_thinking()
+
+    def tearDown(self):
+        self._oe.generate_rollout_completions = self._orig
+
+    def test_game_sees_stripped_history_keeps_stripped_tokens_keep_thinking(self):
+        from playpen.marshal.selfplay_agent import play_selfplay_episode
+
+        env = _FakeEnv(total_turns=2, terminal_reward=1.0)
+        rollouts = play_selfplay_episode(env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0)
+
+        # The game only ever received the answer — no reasoning leaked to the parser.
+        self.assertTrue(env.seen)
+        for utterance in env.seen:
+            self.assertEqual(utterance, "QUESTION: is it alive?")
+            self.assertNotIn("<think>", utterance)
+
+        # ...but every generated token (reasoning included) is still trained.
+        seat0 = rollouts[0]
+        self.assertEqual(seat0.completion_ids, [10, 11, 12, 13])
+        self.assertEqual(sum(seat0.owner_mask), 4)
+
+    def test_strip_think_false_leaks_raw_response(self):
+        from playpen.marshal.selfplay_agent import play_selfplay_episode
+
+        env = _FakeEnv(total_turns=2, terminal_reward=1.0)
+        play_selfplay_episode(
+            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, strip_think=False
+        )
+        self.assertIn("<think>", env.seen[0])
 
 
 if __name__ == "__main__":

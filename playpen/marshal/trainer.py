@@ -109,6 +109,7 @@ def build_selfplay_rollout_func(
     config: MarshalConfig,
     *,
     max_turns: int = 100,
+    strip_think: bool = True,
 ) -> Callable[[List[str], "trl.GRPOTrainer"], Dict[str, list]]:
     """Return a ``rollout_func`` closing over a persistent :class:`SelfPlayEnv`.
 
@@ -142,7 +143,13 @@ def build_selfplay_rollout_func(
         for prompt in prompts:
             instance_idx, seat = parse_prompt(prompt)
             rollouts = play_selfplay_episode(
-                env, trainer, tokenizer, instance_idx, seed=instance_idx, max_turns=max_turns
+                env,
+                trainer,
+                tokenizer,
+                instance_idx,
+                seed=instance_idx,
+                max_turns=max_turns,
+                strip_think=strip_think,
             )
             row = rollouts.get(seat) or _empty_row(seat, pad_id)
             out["prompt_ids"].append(list(row.prompt_ids))

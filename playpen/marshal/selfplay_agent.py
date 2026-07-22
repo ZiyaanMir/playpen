@@ -9,6 +9,10 @@ The per-seat conversation is built from clemcore's own ``Player.perceive_context
 / ``perceive_response``, i.e. the exact message list clemcore uses at inference
 time, so there is no train/eval prompt-format drift.
 
+Reasoning ("thinking") models get one extra step: the ``<think>`` block is stripped
+from what the *game* and the *conversation history* see, while staying in the
+trained token sequence. See :func:`strip_reasoning`.
+
 ``trl`` is imported lazily (inside :func:`play_selfplay_episode`) so this module is
 importable without the training stack; ``transformers`` tokenizers are fine to
 type against but are only used at call time.
@@ -16,10 +20,87 @@ type against but are only used at call time.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Sequence
+from typing import Dict, List, Optional, Sequence
 
 from playpen.marshal.selfplay_env import SelfPlayEnv
+
+THINK_OPEN = "<think>"
+THINK_CLOSE = "</think>"
+_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_reasoning(text: str) -> str:
+    """Remove a reasoning-model ``<think>`` block from a response, text-level.
+
+    Clembench parsers are strict about the *start* of an utterance -- guesswhat
+    aborts the episode unless it begins with ``QUESTION:``/``GUESS:``
+    (``clembench/guesswhat/master.py:161``) -- so a leaked ``<think>`` prefix aborts
+    every turn. Only the game and the conversation history are fed the stripped
+    text; the think tokens stay in ``completion_ids`` and therefore keep receiving
+    gradient, which is the point of training a reasoning policy.
+
+    Handles the three shapes that actually occur:
+
+    * a complete ``<think>...</think>`` block (possibly several);
+    * a *dangling close tag* -- chat templates that pre-fill ``<think>`` into the
+      generation prompt make the completion start already inside the block, so only
+      ``</think>`` appears in the output;
+    * an *unterminated* block -- the token budget ran out mid-thought, so there is
+      no answer at all and the correct result is an empty string (the game will
+      then abort this turn, which is the truthful outcome).
+    """
+    if not text:
+        return text
+    out = _THINK_BLOCK_RE.sub("", text)
+    if THINK_CLOSE in out:  # dangling close tag: keep only what follows the last one
+        out = out.rsplit(THINK_CLOSE, 1)[1]
+    if THINK_OPEN in out:  # unterminated block: nothing after it is a real answer
+        out = out.split(THINK_OPEN, 1)[0]
+    return out.strip()
+
+
+def _strip_reasoning_by_tokens(completion_ids: Sequence[int], tokenizer) -> Optional[str]:
+    """Token-level strip: decode only what follows the last ``</think>`` token.
+
+    Preferred over :func:`strip_reasoning` because TRL builds its ``text`` field with
+    ``skip_special_tokens=True`` (``trl/experimental/openenv/utils.py``). If a
+    tokenizer registers ``</think>`` as a *special* token, the tag is already gone
+    from that string and text-level stripping would silently leave the raw reasoning
+    prose in place. Slicing the ids sidesteps the question entirely.
+
+    Returns ``None`` when the tokenizer has no ``</think>`` token or the completion
+    contains none, so the caller can fall back to the text-level path.
+    """
+    convert = getattr(tokenizer, "convert_tokens_to_ids", None)
+    if convert is None:
+        return None
+    try:
+        close_id = convert(THINK_CLOSE)
+    except Exception:
+        return None
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    if close_id is None or close_id == unk_id or not isinstance(close_id, int):
+        return None
+    ids = list(completion_ids)
+    if close_id not in ids:
+        return None
+    last = len(ids) - 1 - ids[::-1].index(close_id)
+    return tokenizer.decode(ids[last + 1:], skip_special_tokens=True).strip()
+
+
+def response_for_game(text: str, completion_ids: Sequence[int], tokenizer) -> str:
+    """The utterance the game/history should see: the answer without the reasoning.
+
+    Tries the robust token-level slice first, then the text-level regex. A response
+    with no reasoning at all is returned unchanged (modulo surrounding whitespace),
+    so this is a no-op for non-thinking models.
+    """
+    by_tokens = _strip_reasoning_by_tokens(completion_ids, tokenizer)
+    if by_tokens is not None:
+        return by_tokens
+    return strip_reasoning(text)
 
 
 @dataclass
@@ -113,6 +194,7 @@ def play_selfplay_episode(
     *,
     seed: int = 0,
     max_turns: int = 100,
+    strip_think: bool = True,
 ) -> Dict[int, SeatRollout]:
     """Play one full self-play episode and return each seat's rollout.
 
@@ -121,6 +203,11 @@ def play_selfplay_episode(
     learner policy (via TRL generation). The returned dict maps seat index ->
     :class:`SeatRollout`; seats that never got a turn (or produced no model
     tokens) are omitted.
+
+    ``strip_think`` (default on, and a no-op for non-reasoning models) removes the
+    ``<think>`` block from the utterance handed to the game and to clemcore's
+    conversation memory, while leaving those tokens in ``completion_ids`` so they
+    are still trained. Turn it off only to reproduce the un-stripped behavior.
     """
     from trl.experimental.openenv import generate_rollout_completions
 
@@ -156,12 +243,26 @@ def play_selfplay_episode(
         response = outputs.get("text") or tokenizer.decode(
             outputs["completion_ids"], skip_special_tokens=True
         )
+        # The FULL generation (reasoning included) is what we train on: add_model_tokens
+        # gets the untouched completion_ids, so <think> tokens stay under the loss mask
+        # and inside this turn's advantage span.
         builder.add_model_tokens(outputs["completion_ids"], outputs["logprobs"])
 
-        # Record the assistant turn into the seat's clemcore memory for its next turn.
-        player.perceive_response(response, log_event=False)
+        # The game and the conversation history, by contrast, must see only the answer:
+        # clembench parsers match on the start of the utterance, so a leaked <think>
+        # prefix aborts the episode. Stripping before perceive_response also keeps the
+        # think blocks out of later turns' prompts (matching Qwen3's own multi-turn
+        # convention) instead of compounding them into the context.
+        game_response = (
+            response_for_game(response, outputs["completion_ids"], tokenizer)
+            if strip_think
+            else response
+        )
 
-        env.step(response)
+        # Record the assistant turn into the seat's clemcore memory for its next turn.
+        player.perceive_response(game_response, log_event=False)
+
+        env.step(game_response)
 
         # Reward increment attributable to this seat's just-finished turn.
         cum = env.cumulative_rewards
