@@ -66,7 +66,7 @@ python -m examples.marshal.train_selfplay \
     --per-device-batch-size 2 \
     --grad-accum 8 \
     --max-steps 200 \
-    --save-steps 50 \
+    --save-steps 20 \
     --learning-rate 1e-5 \
     --kl-beta 0.2 \
     --max-completion-length 512 \
