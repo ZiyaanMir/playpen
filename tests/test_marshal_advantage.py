@@ -11,12 +11,15 @@ import unittest
 import torch
 
 from playpen.marshal.advantage import (
+    LengthPenaltySpec,
     RowRollout,
     _marshal_pre_sum_normalize,
+    apply_length_penalty,
     build_reward_tensor,
     compute_marshal_advantages,
     masked_whiten,
     reinforce_returns,
+    turn_token_lengths,
 )
 from playpen.marshal.config import MarshalConfig
 
@@ -441,6 +444,208 @@ class TestWhitening(unittest.TestCase):
         self.assertTrue(torch.isfinite(adv).all())
         # Placeholder row carries no advantage in any mode.
         self.assertTrue(torch.all(adv[2] == 0.0))
+
+
+def _multi_turn_row(seat, turn_lengths, turn_rewards):
+    """A row with `len(turn_lengths)` turns, one env token between consecutive turns."""
+    owner_mask = []
+    turn_end_positions = []
+    for i, n in enumerate(turn_lengths):
+        if i:
+            owner_mask.append(0)  # env feedback separates turns
+        owner_mask.extend([1] * n)
+        turn_end_positions.append(len(owner_mask) - 1)
+    return RowRollout(
+        seat=seat,
+        completion_len=len(owner_mask),
+        owner_mask=owner_mask,
+        turn_end_positions=turn_end_positions,
+        turn_rewards=list(turn_rewards),
+    )
+
+
+class TestTurnTokenLengths(unittest.TestCase):
+    """Per-turn generation length is recoverable from the owner mask alone."""
+
+    def test_recovers_each_turns_generation_length(self):
+        row = _multi_turn_row(0, [3, 5, 2], [0.0, 0.0, 1.0])
+        self.assertEqual(
+            turn_token_lengths(row.owner_mask, row.turn_end_positions), [3, 5, 2]
+        )
+
+    def test_single_turn(self):
+        row = _sparse_row(0, 1.0, model_tokens=7)
+        self.assertEqual(turn_token_lengths(row.owner_mask, row.turn_end_positions), [7])
+
+    def test_empty_generation_position_is_zero(self):
+        # An empty generation records turn_end_position -1 (selfplay_agent bookkeeping);
+        # there are no tokens to charge for.
+        self.assertEqual(turn_token_lengths([1, 1], [-1]), [0])
+
+    def test_out_of_range_position_is_zero(self):
+        self.assertEqual(turn_token_lengths([1, 1], [9]), [0])
+
+
+class TestLengthPenaltySpec(unittest.TestCase):
+    """MARSHAL's compute_length_penalty (env_manager.py:276-294), shipped defaults."""
+
+    def test_matches_marshal_formula_on_overlong_turn(self):
+        spec = LengthPenaltySpec()  # upper=0, lower=0.5, min_len=11, max_len=2048, coef=1
+        # raw = 1 - (4096-11)/(2048-11) = -2.00540...; negative branch scales by 0.5.
+        expected = (1.0 - (4096 - 11) / (2048 - 11)) * 0.5
+        self.assertAlmostEqual(spec.penalty_for(4096), expected, places=9)
+        self.assertAlmostEqual(spec.penalty_for(4096), -0.50270, places=4)
+
+    def test_default_bonus_zeroes_the_positive_branch(self):
+        spec = LengthPenaltySpec()
+        # Anything at or under max_len earns exactly 0, not a bonus.
+        for length in (1, 11, 500, 2047):
+            self.assertEqual(spec.penalty_for(length), 0.0)
+
+    def test_penalty_only_past_the_threshold(self):
+        spec = LengthPenaltySpec(max_len=1000)
+        self.assertEqual(spec.penalty_for(999), 0.0)
+        self.assertLess(spec.penalty_for(1500), 0.0)
+
+    def test_monotonically_more_negative_with_length(self):
+        spec = LengthPenaltySpec(max_len=100)
+        values = [spec.penalty_for(n) for n in (200, 400, 800)]
+        self.assertTrue(all(a > b for a, b in zip(values, values[1:])))
+
+    def test_coef_scales_the_penalty(self):
+        weak = LengthPenaltySpec(coef=0.5, max_len=100).penalty_for(500)
+        strong = LengthPenaltySpec(coef=1.0, max_len=100).penalty_for(500)
+        self.assertAlmostEqual(strong, 2 * weak, places=9)
+
+    def test_bonus_enables_the_positive_branch(self):
+        spec = LengthPenaltySpec(bonus=1.0, max_len=100)
+        self.assertGreater(spec.penalty_for(50), 0.0)
+
+    def test_zero_length_turn_scores_nothing(self):
+        # Even with a bonus, a turn that generated nothing must not be rewarded.
+        self.assertEqual(LengthPenaltySpec(bonus=1.0).penalty_for(0), 0.0)
+        self.assertEqual(LengthPenaltySpec().penalty_for(0), 0.0)
+
+    def test_degenerate_span_is_a_noop(self):
+        self.assertEqual(LengthPenaltySpec(min_len=100, max_len=100).penalty_for(500), 0.0)
+
+
+class TestApplyLengthPenalty(unittest.TestCase):
+    def test_added_per_turn(self):
+        spec = LengthPenaltySpec(min_len=1, max_len=4)
+        row = _multi_turn_row(0, [2, 10], [0.0, 1.0])
+        got = apply_length_penalty(
+            row.turn_rewards, row.owner_mask, row.turn_end_positions, spec
+        )
+        self.assertEqual(got[0], 0.0)          # 2 tokens: under threshold, untouched
+        self.assertLess(got[1], 1.0)           # 10 tokens: terminal reward docked
+        self.assertAlmostEqual(got[1], 1.0 + spec.penalty_for(10), places=9)
+
+
+class TestLengthPenaltyEndToEnd(unittest.TestCase):
+    """The flag must change advantages, and only through the reward it adds."""
+
+    def test_off_by_default(self):
+        rows = [_multi_turn_row(0, [3, 9000], [0.0, 1.0]), _sparse_row(1, 0.0)]
+        base = compute_marshal_advantages(list(rows), seq_len=9010)
+        with_none = compute_marshal_advantages(
+            list(rows), seq_len=9010, length_penalty=None
+        )
+        self.assertTrue(torch.allclose(base, with_none))
+
+    def test_penalises_the_overlong_seat(self):
+        # Two seats, same +1 outcome; seat 0 rambles, seat 1 is concise. Per-seat
+        # pooling means the penalty has to show up as a seat-0 vs seat-1 difference.
+        rows = [
+            _multi_turn_row(0, [10, 6000], [0.0, 1.0]),
+            _multi_turn_row(0, [10, 20], [0.0, 1.0]),
+            _multi_turn_row(1, [10, 20], [0.0, 1.0]),
+            _multi_turn_row(1, [10, 20], [0.0, 1.0]),
+        ]
+        seq_len = 6100
+        spec = LengthPenaltySpec(max_len=1024)
+        adv = compute_marshal_advantages(
+            list(rows), seq_len=seq_len, length_penalty=spec, norm_mode="mean"
+        )
+        # Seat 0's rambling row must end up below its concise sibling.
+        self.assertLess(adv[0, 0].item(), adv[1, 0].item())
+        # Seat 1 rows are identical to each other, so mean-centering zeroes them.
+        self.assertAlmostEqual(adv[2, 0].item(), 0.0, places=5)
+
+    def test_no_effect_when_every_turn_is_short(self):
+        rows = [_multi_turn_row(0, [5, 5], [0.0, 1.0]), _multi_turn_row(1, [5, 5], [0.0, -1.0])]
+        plain = compute_marshal_advantages(list(rows), seq_len=12)
+        penalised = compute_marshal_advantages(
+            list(rows), seq_len=12, length_penalty=LengthPenaltySpec(max_len=1024)
+        )
+        self.assertTrue(torch.allclose(plain, penalised))
+
+    def test_advantages_stay_masked_to_model_tokens(self):
+        rows = [_multi_turn_row(0, [2, 3000], [0.0, 1.0]), _sparse_row(1, -1.0)]
+        adv = compute_marshal_advantages(
+            list(rows), seq_len=3010, length_penalty=LengthPenaltySpec(max_len=64)
+        )
+        env_position = 2  # the separator token between turn 0 and turn 1
+        self.assertEqual(rows[0].owner_mask[env_position], 0)
+        self.assertEqual(adv[0, env_position].item(), 0.0)
+        self.assertTrue(torch.isfinite(adv).all())
+
+    def test_composes_with_marshal_exact_and_whitening(self):
+        rows = [
+            _multi_turn_row(0, [10, 5000], [0.0, 1.0]),
+            _multi_turn_row(0, [10, 30], [0.0, 0.0]),
+            _multi_turn_row(1, [10, 30], [0.0, 1.0]),
+            _multi_turn_row(1, [10, 30], [0.0, -1.0]),
+        ]
+        adv = compute_marshal_advantages(
+            list(rows), seq_len=5100, marshal_exact=True,
+            whiten_rewards=True, whiten_advantages=True,
+            length_penalty=LengthPenaltySpec(max_len=512),
+        )
+        self.assertTrue(torch.isfinite(adv).all())
+
+
+class TestLengthPenaltyConfig(unittest.TestCase):
+    def test_defaults_are_off_and_marshal_shipped_values(self):
+        cfg = MarshalConfig()
+        self.assertFalse(cfg.length_penalty)
+        self.assertEqual(cfg.length_penalty_coef, 0.5)
+        self.assertEqual(cfg.length_penalty_bonus, 0.0)
+        self.assertEqual(cfg.length_penalty_min_len, 11)
+        self.assertEqual(cfg.length_penalty_max_len, 2048)
+        self.assertEqual(cfg.length_penalty_offset, 1.0)
+
+    def test_kwargs_none_when_disabled(self):
+        self.assertIsNone(MarshalConfig().length_penalty_kwargs())
+
+    def test_kwargs_build_a_spec_when_enabled(self):
+        cfg = MarshalConfig(length_penalty=True, length_penalty_coef=0.25,
+                            length_penalty_max_len=1536)
+        spec = LengthPenaltySpec(**cfg.length_penalty_kwargs())
+        self.assertEqual(spec.coef, 0.25)
+        self.assertEqual(spec.max_len, 1536)
+        self.assertEqual(spec.penalty_for(100), 0.0)
+        self.assertLess(spec.penalty_for(4096), 0.0)
+
+    def test_rejects_non_positive_span_when_enabled(self):
+        with self.assertRaises(ValueError):
+            MarshalConfig(length_penalty=True, length_penalty_min_len=2048,
+                          length_penalty_max_len=2048)
+
+    def test_bad_span_tolerated_while_disabled(self):
+        # Off => the fields are inert, so an odd combination must not block startup.
+        MarshalConfig(length_penalty=False, length_penalty_min_len=99,
+                      length_penalty_max_len=10)
+
+    def test_from_dict_roundtrip(self):
+        cfg = MarshalConfig.from_dict({"length_penalty": True, "length_penalty_coef": 0.75})
+        self.assertTrue(cfg.length_penalty)
+        self.assertEqual(cfg.length_penalty_coef, 0.75)
+        self.assertIn("length_penalty_max_len", cfg.to_dict())
+
+    def test_unknown_length_key_still_rejected(self):
+        with self.assertRaises(ValueError):
+            MarshalConfig.from_dict({"length_penalty_scale": 0.5})
 
 
 if __name__ == "__main__":
