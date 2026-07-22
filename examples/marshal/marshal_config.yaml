@@ -16,7 +16,7 @@ agent_specific_normalization: true
 # Keep rewards at each turn boundary and turn them into per-token returns via a
 # backward cumulative sum (turn-level advantage estimator). False => sum a seat's
 # turn rewards into a single terminal scalar (MARSHAL use_turn_scores=False).
-turn_level_rewards: true
+turn_level_rewards: false
 
 # "mean" mean-centers each pool; "mean_std" z-scores it.
 advantage_norm_mode: mean
@@ -94,7 +94,7 @@ length_penalty_coef: 0.1
 # Turn-token count above which a generation is penalized -- MARSHAL's `max_len`.
 # Set this near your per-turn --max-completion-length (e.g. 1536 for the Qwen3
 # thinking runs) so only genuine overruns are charged, not ordinary reasoning.
-length_penalty_max_len: 400
+length_penalty_max_len: 500
 
 # Scale on the positive branch -- MARSHAL's `upper`. 0.0 (shipped) means short
 # turns score exactly 0 rather than earning a bonus. Raising it PAYS the policy
