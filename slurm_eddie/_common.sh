@@ -53,9 +53,27 @@ module load cuda/12.9.1        # match whatever `module avail cuda` offers
 export HF_HOME="$SCRATCH/home_cache/huggingface"
 export PIP_CACHE_DIR="$SCRATCH/home_cache/pip"
 export UV_CACHE_DIR="$SCRATCH/home_cache/uv"
-export TRITON_CACHE_DIR="$SCRATCH/home_cache/triton"
 export TMPDIR="${TMPDIR:-$SCRATCH/tmp}"
-mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$TRITON_CACHE_DIR" "$TMPDIR"
+mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$TMPDIR"
+
+# --- compile caches: PER JOB, never shared -----------------------------------
+# vLLM's torch.compile cache defaults to ~/.cache/vllm (vllm/envs.py:33) and is
+# SHARED by every concurrently running job. The cached artifacts embed absolute
+# paths from whichever job compiled first, including that job's $TMPDIR
+# (/local/<jobid>.<task>.<queue> on Eddie). A second job then loads the cache and
+# tries to write autotune results back into the *first* job's private tmpdir:
+#
+#   PermissionError: [Errno 13] Permission denied: '/local/56988859.1.gpu'
+#      ...raised in job 56988860
+#
+# A jobid in the path that isn't yours is the signature. Pinning all three compile
+# caches under $TMPDIR makes them per-job and self-cleaning; the cost is a few
+# minutes of recompilation per job, which is noise next to a 24 h run. It also
+# keeps ~/.cache/vllm from silently eating the 10 GB home quota.
+export VLLM_CACHE_ROOT="$TMPDIR/vllm"
+export TORCHINDUCTOR_CACHE_DIR="$TMPDIR/inductor"
+export TRITON_CACHE_DIR="$TMPDIR/triton"
+mkdir -p "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
 
 # --- venv --------------------------------------------------------------------
 # venvs are NOT relocatable: a copied .venv keeps the original absolute VIRTUAL_ENV
