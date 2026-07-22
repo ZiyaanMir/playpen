@@ -89,12 +89,12 @@ length_penalty: true
 
 # Penalty magnitude -- MARSHAL's `lower`. The main knob. clembench outcomes are
 # SUCCESS +1 / FAILURE 0 / ABORTED -1, so 0.5 is already a strong counterweight.
-length_penalty_coef: 0.1
+length_penalty_coef: 0.4
 
 # Turn-token count above which a generation is penalized -- MARSHAL's `max_len`.
 # Set this near your per-turn --max-completion-length (e.g. 1536 for the Qwen3
 # thinking runs) so only genuine overruns are charged, not ordinary reasoning.
-length_penalty_max_len: 500
+length_penalty_max_len: 400
 
 # Scale on the positive branch -- MARSHAL's `upper`. 0.0 (shipped) means short
 # turns score exactly 0 rather than earning a bonus. Raising it PAYS the policy
