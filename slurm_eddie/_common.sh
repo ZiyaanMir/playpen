@@ -14,17 +14,40 @@
 # isolation between users sharing a node — never override it (see the guide's
 # gotchas: on Eddie it holds a GPU *UUID* string, not an integer index).
 
-set -euo pipefail
+# THIS FILE MUST BE SOURCED, NOT EXECUTED:
+#     source slurm_eddie/_common.sh      (or:  . slurm_eddie/_common.sh)
+# `bash slurm_eddie/_common.sh` runs it in a subshell, so every export dies with
+# that subshell and your session is left unchanged. We detect and refuse that.
+(return 0 2>/dev/null) && _SOURCED=1 || _SOURCED=0
+_RET=exit; [ "$_SOURCED" = 1 ] && _RET=return
+
+if [ "$_SOURCED" = 0 ]; then
+    echo "ERROR: source this file, don't execute it:" >&2
+    echo "         source ${0}" >&2
+    echo "       Executing it changes only a subshell, which then exits." >&2
+    exit 1
+fi
+
+# `set -e` is right for a batch job but hostile in an interactive shell: one
+# failing command (a grep that matches nothing) would kill the login session.
+# Job scripts are non-interactive, so they still get the strict behavior.
+case $- in *i*) _INTERACTIVE=1 ;; *) _INTERACTIVE=0 ;; esac
+[ "$_INTERACTIVE" = 1 ] || set -euo pipefail
 
 # --- where things live -------------------------------------------------------
-# REPO defaults to the directory you submitted from (-cwd puts us there already).
-REPO="${REPO:-${SGE_O_WORKDIR:-$PWD}}"
+# Anchor on THIS FILE's location, not the working directory and not
+# $SGE_O_WORKDIR. Both of those lie: $SGE_O_WORKDIR is wherever `qlogin`/`qsub`
+# was invoked (e.g. the logs/ dir you were tailing from), and $PWD is wherever
+# you have since cd'd. BASH_SOURCE is correct in every case, including a
+# Grid-Engine-spooled batch job, because the job script sources us by real path.
+_HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="${REPO:-$(dirname "$_HERE")}"
 SCRATCH="${SCRATCH:-/exports/eddie/scratch/$USER}"
 
 : "${USER:?unset}"
 [ -d "$REPO/playpen/marshal" ] || {
     echo "ERROR: \$REPO=$REPO is not a playpen checkout (no playpen/marshal/)." >&2
-    exit 1
+    $_RET 1
 }
 
 cd "$REPO"
@@ -35,19 +58,25 @@ mkdir -p logs
 # PermissionError [Errno 13] rather than here. Refuse that up front.
 case "$SCRATCH" in
     /*) ;;
-    *)  echo "ERROR: \$SCRATCH must be an absolute path, got '$SCRATCH'." >&2; exit 1 ;;
+    *)  echo "ERROR: \$SCRATCH must be an absolute path, got '$SCRATCH'." >&2; $_RET 1 ;;
 esac
 [ -d "$SCRATCH" ] || {
     echo "ERROR: \$SCRATCH does not exist: $SCRATCH" >&2
     echo "       On Eddie this should be /exports/eddie/scratch/\$USER." >&2
-    exit 1
+    $_RET 1
 }
-[ -w "$SCRATCH" ] || { echo "ERROR: \$SCRATCH is not writable: $SCRATCH" >&2; exit 1; }
+[ -w "$SCRATCH" ] || { echo "ERROR: \$SCRATCH is not writable: $SCRATCH" >&2; $_RET 1; }
 
 # --- modules -----------------------------------------------------------------
 # The login shell is not sourced for batch jobs, so `module` must be enabled by hand.
-. /etc/profile.d/modules.sh
-module load cuda/12.9.1        # match whatever `module avail cuda` offers
+# Guarded so this file can also be sourced somewhere without environment-modules
+# (e.g. a laptop) without dying on a missing /etc/profile.d/modules.sh.
+[ -r /etc/profile.d/modules.sh ] && . /etc/profile.d/modules.sh
+if command -v module >/dev/null 2>&1; then
+    module load cuda/12.9.1    # match whatever `module avail cuda` offers
+else
+    echo "[warn] no 'module' command — skipping 'module load cuda'." >&2
+fi
 
 # --- caches off the 10 GB home quota ----------------------------------------
 export HF_HOME="$SCRATCH/home_cache/huggingface"
@@ -84,7 +113,7 @@ case "$ACTUAL_PY" in
     "$REPO/.venv/bin/python") ;;
     *) echo "ERROR: activated the wrong venv: $ACTUAL_PY (expected $REPO/.venv/bin/python)" >&2
        echo "       This venv was probably copied from another checkout — rebuild it." >&2
-       exit 1 ;;
+       $_RET 1 ;;
 esac
 
 # --- Eddie GPU UUID -> CUDA ordinal ------------------------------------------
