@@ -152,9 +152,14 @@ def parse_args() -> argparse.Namespace:
                         "own default, i.e. unchanged behavior). A final checkpoint is always written "
                         "when training ends, regardless of this value.")
     p.add_argument("--output-dir", default=None,
-                   help="Base output directory. A timestamped run subfolder is always created inside "
-                        "it, so successive runs never overwrite each other. "
+                   help="Base output directory. A timestamped run subfolder is created inside "
+                        "it by default, so successive runs never overwrite each other. "
                         "Default base: models/marshal/{game}/{model_basename}.")
+    p.add_argument("--no-run-subdir", dest="run_subdir", action="store_false", default=True,
+                   help="Write checkpoints directly into --output-dir instead of into a "
+                        "timestamped subfolder. Use ONLY when the caller already guarantees a "
+                        "fresh directory per run (experiments/*/train.sh does); otherwise a "
+                        "rerun overwrites the previous run's checkpoint-<step> dirs.")
     return p.parse_args()
 
 
@@ -247,7 +252,9 @@ def main() -> None:
     # which collide across runs otherwise). Mirrors MARSHAL's runs/<experiment>/<timestamp>/.
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     base_dir = args.output_dir or f"models/marshal/{args.game}/{os.path.basename(args.model)}"
-    output_dir = os.path.join(base_dir, run_id)
+    # --no-run-subdir drops the timestamp layer, so checkpoints land directly in the
+    # caller's directory. Safe only because the caller owns a fresh dir per run.
+    output_dir = os.path.join(base_dir, run_id) if args.run_subdir else base_dir
     grpo_config = trl.GRPOConfig(
         use_vllm=True,
         vllm_mode=args.vllm_mode,

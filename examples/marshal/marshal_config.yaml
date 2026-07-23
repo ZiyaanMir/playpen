@@ -16,7 +16,7 @@ agent_specific_normalization: true
 # Keep rewards at each turn boundary and turn them into per-token returns via a
 # backward cumulative sum (turn-level advantage estimator). False => sum a seat's
 # turn rewards into a single terminal scalar (MARSHAL use_turn_scores=False).
-turn_level_rewards: true
+turn_level_rewards: false
 
 # "mean" mean-centers each pool; "mean_std" z-scores it.
 advantage_norm_mode: mean
@@ -85,7 +85,7 @@ dr_grpo: false
 # path). CLI overrides: --length-penalty / --no-length-penalty,
 # --length-penalty-coef, --length-penalty-max-len, ...
 # Watch marshal/length_penalty/over_rate: 0 means the threshold never binds.
-length_penalty: true
+length_penalty: false
 
 # Penalty magnitude -- MARSHAL's `lower`. The main knob. clembench outcomes are
 # SUCCESS +1 / FAILURE 0 / ABORTED -1, so 0.5 is already a strong counterweight.
