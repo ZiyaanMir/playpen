@@ -150,5 +150,62 @@
     "enable_thinking": false,
     "eos_to_cull": "<\\|im_end\\|>"
   }
+},
+{
+  "model_name": "Qwen3-0.6B",
+  "backend": "huggingface_local",
+  "huggingface_id": "Qwen/Qwen3-0.6B",
+  "release_date": "2025-04-29",
+  "open_weight": true,
+  "parameters": "0.6B",
+  "languages": ["en", "de", "fr", "it", "pt", "hi", "es", "th"],
+  "context_size": "40,960",
+  "license": {
+    "name": "Apache 2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3-0.6B/blob/main/LICENSE"
+  },
+  "model_config": {
+    "premade_chat_template": true,
+    "enable_thinking": false,
+    "eos_to_cull": "<\\|im_end\\|>"
+  }
+},
+{
+  "model_name": "Qwen3-4B",
+  "backend": "huggingface_local",
+  "huggingface_id": "Qwen/Qwen3-4B",
+  "release_date": "2025-04-29",
+  "open_weight": true,
+  "parameters": "4B",
+  "languages": ["en", "de", "fr", "it", "pt", "hi", "es", "th"],
+  "context_size": "40,960",
+  "license": {
+    "name": "Apache 2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3-4B/blob/main/LICENSE"
+  },
+  "model_config": {
+    "premade_chat_template": true,
+    "enable_thinking": false,
+    "eos_to_cull": "<\\|im_end\\|>"
+  }
+},
+{
+  "model_name": "Qwen3-8B",
+  "backend": "huggingface_local",
+  "huggingface_id": "Qwen/Qwen3-8B",
+  "release_date": "2025-04-29",
+  "open_weight": true,
+  "parameters": "8B",
+  "languages": ["en", "de", "fr", "it", "pt", "hi", "es", "th"],
+  "context_size": "40,960",
+  "license": {
+    "name": "Apache 2.0",
+    "url": "https://huggingface.co/Qwen/Qwen3-8B/blob/main/LICENSE"
+  },
+  "model_config": {
+    "premade_chat_template": true,
+    "enable_thinking": false,
+    "eos_to_cull": "<\\|im_end\\|>"
+  }
 }
 ]
