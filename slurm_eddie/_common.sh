@@ -165,12 +165,6 @@ fi
 # --- runtime knobs -----------------------------------------------------------
 export TRL_EXPERIMENTAL_SILENCE=1
 export TOKENIZERS_PARALLELISM=false
-# Let TRL/vLLM pick a FREE torch.distributed port instead of the hard-coded default
-# 29500. A pre-set MASTER_PORT (from the module env or an earlier run) is respected by
-# TRL's ensure_master_addr_port, so a stale/zombie process holding 29500 -- or a
-# co-located job -- makes vLLM init die with EADDRINUSE. "0" forces a free-port lookup.
-export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=0
 # Compute nodes may have no outbound internet; run offline once weights are cached.
 # Flip to 1 only after the model has been pre-downloaded (guide §2.5).
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
