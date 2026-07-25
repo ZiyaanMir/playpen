@@ -4,8 +4,8 @@
 #SBATCH --error=logs/train_%j.err
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --time=20:00:00        # stay under the 24 h cap with margin
-#SBATCH --no-requeue           # a requeue restarts from step 0 — don't silently redo 20 h
+#SBATCH --time=05:00:00        # stay under the 24 h cap with margin
+#SBATCH --no-requeue           # a requeue restarts from step 0 — don't silently redo 5 h
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"

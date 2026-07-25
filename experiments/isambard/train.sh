@@ -5,11 +5,11 @@
 #SBATCH --job-name=marshal_train
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --time=20:00:00
+#SBATCH --time=05:00:00
 #SBATCH --no-requeue
 #
 # --time stays under the 24 h cap with margin, and Slurm reserves credits against
-# it. --no-requeue because a requeue restarts training from step 0: 20 h of GPU
+# it. --no-requeue because a requeue restarts training from step 0: 5 h of GPU
 # silently redone. Override with TRAIN_SBATCH_OPTS='--time=08:00:00' for short runs.
 
 set -euo pipefail
