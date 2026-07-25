@@ -5,9 +5,19 @@ seat's turn-alternating trajectory is accumulated into its own :class:`SeatRollo
 -- the seat-aware, turn-boundary-aware generalization of the single-seat
 ``GrpoEpisodeRollout`` in ``examples/openenv/wordle-trl.ipynb``.
 
-The per-seat conversation is built from clemcore's own ``Player.perceive_context``
-/ ``perceive_response``, i.e. the exact message list clemcore uses at inference
-time, so there is no train/eval prompt-format drift.
+Each turn's observation comes from clemcore's own ``Player.perceive_context`` /
+``perceive_response``, i.e. the exact context clemcore uses at inference time, so
+there is no train/eval prompt-format drift.
+
+The row a seat accumulates must be *the same token sequence the policy generated
+under* -- otherwise the log-probs the loss recomputes describe a context that never
+existed. Under ``row_context_mode="exact"`` (the default) that is guaranteed by
+construction: turn 1 renders the chat template, every later turn appends the template's
+own per-turn scaffolding to the row and generates from *that*, and the environment span
+is read back from the token ids the sampler reports. Re-rendering the message history
+each turn cannot achieve this -- templates render the same assistant message differently
+depending on its position (Qwen3 emits an empty ``<think>`` block only before the last
+one) -- which is why the legacy ``"spliced"`` mode is broken and kept only for replay.
 
 Reasoning ("thinking") models get one extra step: the ``<think>`` block is stripped
 from what the *game* and the *conversation history* see, while staying in the
@@ -20,11 +30,14 @@ type against but are only used at call time.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
 from playpen.marshal.selfplay_env import SelfPlayEnv
+
+logger = logging.getLogger(__name__)
 
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
@@ -157,6 +170,52 @@ def render_prompt(tokenizer, messages) -> str:
     return text
 
 
+# Sentinels for the chat-template probe in :func:`render_turn_scaffold`. Distinctive
+# enough that a collision with real game text is itself worth failing on, which is what
+# the count checks in that function do.
+_PROBE_USER = "<<<marshal-probe-user>>>"
+_PROBE_ASSISTANT = "<<<marshal-probe-assistant>>>"
+
+
+def render_turn_scaffold(tokenizer, obs_content: str) -> str:
+    """The chat-template text that separates one assistant turn from the next generation.
+
+    For a Qwen-style template this is::
+
+        <|im_end|>\\n<|im_start|>user\\n{obs}\\n\\n/no_think<|im_end|>\\n<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n
+
+    It is *derived from the tokenizer's own template* rather than hard-coded: a probe
+    conversation ``[user, assistant, {obs}]`` is rendered through :func:`render_prompt`,
+    and everything after the probe assistant's content is the scaffolding. Going through
+    ``render_prompt`` means all three of Qwen3's reasoning switches land on the new user
+    message exactly as they do on turn 1.
+
+    Exactly ONE render is taken, deliberately. Diffing two renders would be wrong for
+    templates that render the same assistant message differently depending on its
+    position -- Qwen3 is one: it emits an empty ``<think>`` block before the *last*
+    assistant message and omits it for earlier ones. That position-dependence is also
+    why a row can never be reconstructed by re-rendering history, and why ``"exact"``
+    mode extends the row instead.
+
+    Raises:
+        ValueError: if the template mangles or duplicates the probe, so the caller gets
+            a loud failure instead of a silently wrong context.
+    """
+    messages = [
+        {"role": "user", "content": _PROBE_USER},
+        {"role": "assistant", "content": _PROBE_ASSISTANT},
+        {"role": "user", "content": obs_content},
+    ]
+    rendered = render_prompt(tokenizer, messages)
+    if rendered.count(_PROBE_ASSISTANT) != 1 or rendered.count(_PROBE_USER) != 1:
+        raise ValueError(
+            "chat template did not render the scaffold probe exactly once; cannot "
+            "derive per-turn scaffolding for row_context_mode='exact'"
+        )
+    cut = rendered.index(_PROBE_ASSISTANT) + len(_PROBE_ASSISTANT)
+    return rendered[cut:]
+
+
 def response_for_game(text: str, completion_ids: Sequence[int], tokenizer) -> str:
     """The utterance the game/history should see: the answer without the reasoning.
 
@@ -205,6 +264,14 @@ class _SeatBuilder:
         self.turn_end_positions: List[int] = []
         self.turn_rewards: List[float] = []
         self._first_turn = True
+        # Text of `prompt_ids + completion_ids`, kept alongside the ids so the next
+        # turn's generation prompt can be built by *extending the row* instead of
+        # re-rendering history (which would not reproduce the row). "exact" mode only.
+        self.row_text: str = ""
+        # Set when re-tokenization drifted and the owner mask can no longer be proven
+        # correct; such a row is dropped rather than trained on a guess.
+        self.invalid: bool = False
+        self.invalid_logged: bool = False
 
     @property
     def first_turn(self) -> bool:
@@ -217,6 +284,38 @@ class _SeatBuilder:
     def set_prompt(self, ids: Sequence[int]) -> None:
         self.prompt_ids = list(ids)
         self._first_turn = False
+
+    def sync_context(self, ctx_ids: Sequence[int]) -> bool:
+        """Adopt the token ids vLLM actually conditioned on for this turn.
+
+        ``ctx_ids`` is the sampler's own tokenization of the generation prompt, so it
+        is the ground truth for what the policy saw. On the seat's first turn it
+        becomes ``prompt_ids``. Afterwards it must extend the row we already hold; the
+        extension is exactly this turn's environment-feedback span, recorded with
+        ``owner_mask == 0`` so it gets neither gradient nor advantage.
+
+        Returns True when the row matched, False when re-tokenization drifted (the
+        model can emit a non-canonical token sequence, which re-encodes differently).
+        A drifted row is marked invalid and dropped: a mask we cannot prove is a mask
+        that could silently attribute the environment's tokens to the policy.
+        """
+        ctx = list(ctx_ids)
+        if self._first_turn:
+            self.prompt_ids = ctx
+            self._first_turn = False
+            return True
+        row = self.prompt_ids + self.completion_ids
+        if ctx[: len(row)] == row:
+            self.add_env_tokens(ctx[len(row) :])
+            return True
+        # Keep accumulating so the *generation* context stays right for the rest of the
+        # episode (the game still needs this seat to play); only the training row dies.
+        self.invalid = True
+        keep = min(len(self.prompt_ids), len(ctx))
+        self.completion_ids = ctx[keep:]
+        self.logprobs = [0.0] * len(self.completion_ids)
+        self.owner_mask = [0] * len(self.completion_ids)
+        return False
 
     def add_env_tokens(self, ids: Sequence[int]) -> None:
         """Environment-feedback tokens received since this seat's previous turn."""
@@ -262,21 +361,45 @@ def play_selfplay_episode(
     seed: int = 0,
     max_turns: int = 100,
     strip_think: bool = True,
+    row_context_mode: str = "exact",
 ) -> Dict[int, SeatRollout]:
     """Play one full self-play episode and return each seat's rollout.
 
     ``instance_idx`` indexes the game's packaged instance list (see
     ``selfplay_env.list_instance_indices``). All seats are driven by the same
-    learner policy (via TRL generation). The returned dict maps seat index ->
-    :class:`SeatRollout`; seats that never got a turn (or produced no model
-    tokens) are omitted.
+    learner policy (via TRL generation). The returned dict maps **every** seat index to
+    a :class:`SeatRollout`. A seat that never got a turn, generated nothing, or whose
+    row drifted gets a training-inert placeholder (``owner_mask == [0]``: no gradient,
+    and excluded from the advantage pools) that still carries the episode's real
+    terminal reward, so reward statistics stay honest for seats that could not play.
+
+    ``row_context_mode`` (see ``MarshalConfig.row_context_mode``) selects how a row is
+    assembled across turns:
+
+    * ``"exact"`` -- the generation prompt for turn *k* is **the row so far** plus the
+      template's own per-turn scaffolding (:func:`render_turn_scaffold`), and the
+      environment span is read back from the token ids vLLM reports for that prompt
+      (``_SeatBuilder.sync_context``). The row therefore *is* the context, by
+      construction, and the recomputed log-probs the loss uses match the sampler's.
+    * ``"spliced"`` -- legacy: generate from a freshly re-rendered chat template while
+      the row splices in raw environment text. Reproduces pre-fix runs; the trained
+      sequence does not match the generated one from turn 2 onward.
 
     ``strip_think`` (default on, and a no-op for non-reasoning models) removes the
     ``<think>`` block from the utterance handed to the game and to clemcore's
     conversation memory, while leaving those tokens in ``completion_ids`` so they
     are still trained. Turn it off only to reproduce the un-stripped behavior.
+
+    Note the one behavioral consequence of ``"exact"``: later turns are conditioned on
+    the seat's *raw* generations, because the row is the context and the row is what we
+    train on. You cannot train on tokens X while conditioning the next turn on a
+    sanitized X' -- that mismatch is exactly the bug this mode fixes. The game and
+    clemcore's transcript still see the stripped utterance, unchanged.
     """
     from trl.experimental.openenv import generate_rollout_completions
+
+    exact = row_context_mode == "exact"
+    eos_text = getattr(tokenizer, "eos_token", None) or ""
 
     env.reset(instance_idx, seed=seed)
     builders: Dict[int, _SeatBuilder] = {
@@ -292,10 +415,36 @@ def play_selfplay_episode(
         builder = builders[seat]
 
         # Build this seat's full clemcore perspective (user + prior assistant turns).
+        # Always called: clemcore memorizes the context and games/transcripts rely on it.
         perspective = player.perceive_context(obs, log_event=False)
-        prompt_text = render_prompt(tokenizer, perspective)
 
         if builder.first_turn:
+            # Turn 1 is identical in both modes: the rendered chat template *is* the row.
+            prompt_text = render_prompt(tokenizer, perspective)
+        elif exact:
+            # Extend the row instead of re-rendering history, so the context the policy
+            # conditions on and the sequence the loss scores are the same object.
+            scaffold = render_turn_scaffold(tokenizer, obs["content"])
+            # The template closes an assistant turn with the EOS text, and vLLM already
+            # returned that token at the end of the previous generation; don't double it.
+            if eos_text and builder.row_text.endswith(eos_text) and scaffold.startswith(eos_text):
+                scaffold = scaffold[len(eos_text) :]
+            prompt_text = builder.row_text + scaffold
+        else:
+            prompt_text = render_prompt(tokenizer, perspective)
+
+        outputs = generate_rollout_completions(trainer, [prompt_text])[0]
+
+        if exact:
+            if not builder.sync_context(outputs["prompt_ids"]) and not builder.invalid_logged:
+                builder.invalid_logged = True
+                logger.warning(
+                    "seat %d: re-tokenization drift at turn %d; dropping this row from "
+                    "training (its owner mask can no longer be proven correct)",
+                    seat,
+                    turn,
+                )
+        elif builder.first_turn:
             builder.set_prompt(tokenizer.encode(prompt_text, add_special_tokens=False))
         else:
             # Only the *new* context is environment feedback for this seat's stream.
@@ -304,7 +453,6 @@ def play_selfplay_episode(
             )
             builder.add_env_tokens(env_feedback_ids)
 
-        outputs = generate_rollout_completions(trainer, [prompt_text])[0]
         response = outputs.get("text") or tokenizer.decode(
             outputs["completion_ids"], skip_special_tokens=True
         )
@@ -312,6 +460,10 @@ def play_selfplay_episode(
         # gets the untouched completion_ids, so <think> tokens stay under the loss mask
         # and inside this turn's advantage span.
         builder.add_model_tokens(outputs["completion_ids"], outputs["logprobs"])
+        if exact:
+            builder.row_text = prompt_text + tokenizer.decode(
+                outputs["completion_ids"], skip_special_tokens=False
+            )
 
         # The game and the conversation history, by contrast, must see only the answer:
         # clembench parsers match on the start of the utterance, so a leaked <think>
@@ -346,11 +498,34 @@ def play_selfplay_episode(
 
     env.finalize()
 
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    if pad_id is None:
+        pad_id = getattr(tokenizer, "eos_token_id", None) or 0
+
     rollouts: Dict[int, SeatRollout] = {}
     for seat, builder in builders.items():
-        if not builder.has_turns:
-            continue
-        rollout = builder.build(terminal_reward=final_cum[seat])
-        if rollout.has_model_tokens:
+        rollout = None
+        if builder.has_turns and not builder.invalid:
+            rollout = builder.build(terminal_reward=final_cum[seat])
+        if rollout is not None and rollout.has_model_tokens:
             rollouts[seat] = rollout
+        else:
+            # This seat has no trainable trajectory -- it never got a turn (the game
+            # ended first), it generated nothing, or its row drifted. Emit a
+            # training-inert placeholder rather than omitting it, so the seat still
+            # reports the episode's *actual* outcome. Reporting 0.0 here instead would
+            # be a fabricated FAILURE: on codenames, where ~48% of rows are seats that
+            # never moved because the game aborted first, that halved the logged abort
+            # rate (33.7% logged vs 64.3% among rows that actually played) and, on the
+            # plain-GRPO path, fed a fake reward straight into the group baseline.
+            rollouts[seat] = SeatRollout(
+                seat=seat,
+                prompt_ids=[int(pad_id)],
+                completion_ids=[int(pad_id)],
+                logprobs=[0.0],
+                owner_mask=[0],          # no gradient, and excluded from advantage pools
+                turn_end_positions=[],
+                turn_rewards=[],
+                terminal_reward=float(final_cum[seat]),
+            )
     return rollouts

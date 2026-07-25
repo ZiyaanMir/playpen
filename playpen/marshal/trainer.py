@@ -39,9 +39,20 @@ from playpen.marshal.selfplay_agent import play_selfplay_episode
 from playpen.marshal.selfplay_env import SelfPlayEnv, list_instance_indices
 
 
-def parse_prompt(prompt: str) -> tuple[int, int]:
-    """Parse a ``"{instance_idx}::seat{n}"`` dataset prompt into (instance_idx, seat)."""
-    instance_part, _, seat_part = prompt.partition("::seat")
+def parse_prompt(prompt: str) -> tuple[int, Optional[int]]:
+    """Parse a dataset prompt into ``(instance_idx, seat)``.
+
+    Two key shapes are understood, one per ``MarshalConfig.episode_pairing``:
+
+    * ``"{instance_idx}::seat{n}"`` -> ``(idx, n)``. The seat is pinned by the key, so
+      the row must come from its own episode (``episode_pairing="replay"``).
+    * ``"{instance_idx}"`` -> ``(idx, None)``. The seat is not pinned; it is taken from
+      the prompt's position within its run of identical copies, which is what lets one
+      episode serve every seat (``episode_pairing="shared"``).
+    """
+    instance_part, separator, seat_part = prompt.partition("::seat")
+    if not separator:
+        return int(instance_part), None
     return int(instance_part), int(seat_part)
 
 
@@ -52,30 +63,68 @@ def build_selfplay_dataset(
     num_players: Optional[int] = None,
     max_instances: Optional[int] = None,
     instances_filter: Optional[Callable[[dict], bool]] = None,
+    episode_pairing: str = "shared",
 ):
-    """Build a HuggingFace dataset of ``{instance_idx}::seat{n}`` prompts.
+    """Build a HuggingFace dataset of self-play prompts.
 
-    One row per (game instance, seat). Self-contained: instance indices come from
-    the game's packaged ``instances.json`` (the same indices ``SelfPlayEnv.reset``
-    looks up), so there is no dependency on the ``colab-potsdam/playpen-data`` HF
-    hub dataset and no risk of an id mismatch. Indices are used instead of
-    clembench game_ids because game_ids are only unique *within* an experiment
-    (a bare game_id lookup would silently collapse onto the first experiment).
+    Self-contained: instance indices come from the game's packaged ``instances.json``
+    (the same indices ``SelfPlayEnv.reset`` looks up), so there is no dependency on the
+    ``colab-potsdam/playpen-data`` HF hub dataset and no risk of an id mismatch. Indices
+    are used instead of clembench game_ids because game_ids are only unique *within* an
+    experiment (a bare game_id lookup would silently collapse onto the first experiment).
+
+    ``episode_pairing`` selects the key shape, and must match what is passed to
+    :func:`build_selfplay_rollout_func`:
+
+    * ``"shared"`` -- one row per instance, ``"{idx}"``. TRL repeats each row
+      ``num_generations`` times consecutively, and the rollout func serves each run of
+      ``num_players`` copies from a single episode.
+    * ``"replay"`` -- one row per (instance, seat), ``"{idx}::seat{n}"``; every prompt
+      replays its own episode.
+
+    The two shapes differ in length by a factor of ``num_players``, so an "epoch" covers
+    the same instances either way but a different number of rows.
     """
     from datasets import Dataset
 
     from playpen.marshal.selfplay_env import resolve_game_spec
 
-    if seats is None:
-        n = num_players if num_players is not None else int(resolve_game_spec(game_name).players)
-        seats = list(range(n))
-
     instance_indices = list_instance_indices(game_name, instances_filter=instances_filter)
     if max_instances is not None:
         instance_indices = instance_indices[:max_instances]
 
+    if episode_pairing == "shared":
+        # The seat is positional, so it must not be baked into the key.
+        return Dataset.from_dict({"prompt": [f"{idx}" for idx in instance_indices]})
+
+    if seats is None:
+        n = num_players if num_players is not None else int(resolve_game_spec(game_name).players)
+        seats = list(range(n))
+
     prompts = [f"{idx}::seat{seat}" for idx in instance_indices for seat in seats]
     return Dataset.from_dict({"prompt": prompts})
+
+
+def _paired_slot_start(prompts: List[str], index: int, num_players: int) -> Optional[int]:
+    """Start of the run of ``num_players`` identical prompts containing ``index``.
+
+    Returns ``None`` when ``index`` is not part of a complete, aligned run -- the run
+    would overflow the batch, or the entries are not all the same prompt. That happens
+    when ``num_generations`` is not a multiple of ``num_players``, or when a
+    multi-process split lands a prompt's copies on different ranks (TRL slices the
+    global generation batch contiguously, so a run can straddle the boundary). Callers
+    fall back to one-episode-per-prompt for such indices rather than pairing rows that
+    do not belong to the same game.
+    """
+    if num_players < 2:
+        return None
+    base = index - (index % num_players)
+    if base + num_players > len(prompts):
+        return None
+    prompt = prompts[index]
+    if any(prompts[base + offset] != prompt for offset in range(num_players)):
+        return None
+    return base
 
 
 def build_reward_func(config: MarshalConfig) -> Callable[..., List[float]]:
@@ -118,16 +167,30 @@ def build_selfplay_rollout_func(
 ) -> Callable[[List[str], "trl.GRPOTrainer"], Dict[str, list]]:
     """Return a ``rollout_func`` closing over a persistent :class:`SelfPlayEnv`.
 
-    For each incoming prompt ``"{instance_idx}::seat{n}"`` a *fresh, complete*
-    self-play episode is played and only the requested seat's row is kept (the
-    other seat's generation is discarded). This satisfies TRL's 1:1 prompt->row
-    contract with no cross-call state at the cost of ~num_players x generation.
+    Satisfies TRL's 1:1 prompt->row contract. How an episode maps onto rows depends on
+    ``config.episode_pairing``:
+
+    * ``"shared"`` -- prompts are bare ``"{instance_idx}"`` keys, and TRL emits each
+      one's ``num_generations`` copies consecutively (``RepeatSampler``). Each run of
+      ``num_players`` consecutive copies is served by **one** episode, seat *k* taking
+      the *k*-th copy, so both seats of a pair come from the same game and nothing is
+      generated only to be discarded. Runs that cannot be paired (see
+      :func:`_paired_slot_start`) fall back to the replay behavior for those indices.
+    * ``"replay"`` -- prompts are ``"{instance_idx}::seat{n}"``; a fresh, complete
+      episode is played per prompt and only the requested seat is kept, at the cost of
+      ~num_players x generation.
 
     The returned dict carries, in addition to TRL's required keys, the extra fields
     the advantage override needs: ``env_mask`` (consumed by TRL as the gradient
     mask), ``owner_mask`` (a copy that survives into ``inputs`` for our use),
     ``turn_end_positions``, ``turn_rewards``, ``seat`` and the scalar ``rewards``.
+
+    ``config.row_context_mode`` and ``config.episode_pairing`` are both read here (not
+    behind ``config.enabled``) because rollout collection is shared by the MARSHAL path
+    and the plain-GRPO baseline alike.
     """
+    paired = config.episode_pairing == "shared"
+    num_players = int(env.num_players)
 
     def rollout_func(prompts: List[str], trainer: "trl.GRPOTrainer") -> Dict[str, list]:
         tokenizer = trainer.processing_class
@@ -145,9 +208,9 @@ def build_selfplay_rollout_func(
             "seat": [],
             "rewards": [],
         }
-        for prompt in prompts:
-            instance_idx, seat = parse_prompt(prompt)
-            rollouts = play_selfplay_episode(
+
+        def play(instance_idx: int):
+            return play_selfplay_episode(
                 env,
                 trainer,
                 tokenizer,
@@ -155,7 +218,32 @@ def build_selfplay_rollout_func(
                 seed=instance_idx,
                 max_turns=max_turns,
                 strip_think=strip_think,
+                row_context_mode=config.row_context_mode,
             )
+
+        # slot start index -> that slot's episode, held only until its last seat is
+        # consumed so the cache never grows past one episode.
+        episodes: Dict[int, Dict[int, Any]] = {}
+
+        for index, prompt in enumerate(prompts):
+            instance_idx, seat = parse_prompt(prompt)
+            if seat is None:
+                # Bare key: the seat is positional within the run of identical copies.
+                seat = index % num_players
+                slot = _paired_slot_start(prompts, index, num_players) if paired else None
+            else:
+                # Key pins the seat, so this row cannot share a slot with its neighbours.
+                slot = None
+
+            if slot is None:
+                rollouts = play(instance_idx)
+            else:
+                if slot not in episodes:
+                    episodes[slot] = play(instance_idx)
+                rollouts = episodes[slot]
+                if index - slot == num_players - 1:
+                    episodes.pop(slot, None)  # slot fully consumed
+
             row = rollouts.get(seat) or _empty_row(seat, pad_id)
             out["prompt_ids"].append(list(row.prompt_ids))
             out["completion_ids"].append(list(row.completion_ids))
@@ -271,7 +359,38 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         self._log_seat_stats(rows, advantages)
         if length_penalty is not None:
             self._log_length_penalty_stats(rows, length_penalty)
+        self._relog_advantages(advantages)
         return advantages
+
+    def _relog_advantages(self, advantages: torch.Tensor) -> None:
+        """Point the logged ``advantage`` column at the advantages we actually train on.
+
+        The base class snapshots its own scalar group-relative advantages into
+        ``self._logs["advantages"]`` *before* returning, i.e. before this subclass
+        replaces them. Left alone, every ``completions_*.parquet`` would record
+        ``(reward - group_mean) / (group_std + 1e-4)`` -- a number the model never sees
+        -- so offline analysis of a MARSHAL run would be analysing plain GRPO.
+
+        Each row is summarized by the mean advantage over its model tokens (the value is
+        constant across them whenever rewards are terminal-only, and a token-weighted
+        mean otherwise). Skipped under multi-process training, where ``_logs`` holds the
+        gathered advantages of every rank but ``advantages`` is only this rank's slice.
+        """
+        try:
+            if self.accelerator.num_processes != 1:
+                return
+            logged = self._logs["advantages"]
+            rows = advantages.shape[0]
+            if len(logged) < rows:
+                return
+            mask = (advantages != 0).to(advantages.dtype)
+            denom = mask.sum(dim=1).clamp(min=1.0)
+            per_row = ((advantages * mask).sum(dim=1) / denom).tolist()
+            for offset, value in enumerate(per_row):
+                logged[len(logged) - rows + offset] = value
+        except Exception:
+            # Metrics logging must never break training.
+            pass
 
     def _log_length_penalty_stats(
         self, rows: List[RowRollout], spec: LengthPenaltySpec

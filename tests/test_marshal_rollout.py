@@ -105,6 +105,470 @@ def _fake_generate(target_tokens=(10, 11), logprobs=(-0.1, -0.2)):
     return generate_rollout_completions
 
 
+class _ChatTokenizer:
+    """A fake tokenizer that models a real chat template's turn markers.
+
+    ``_FakeTokenizer`` joins message contents with spaces and emits no turn boundaries,
+    which is precisely why it could not distinguish a row that reproduces its generation
+    context from one that does not. This one emits Qwen-style markers and tokenizes one
+    id per character, so concatenation is exact and a prefix check is meaningful.
+    """
+
+    eos_token = "<|im_end|>"
+
+    def apply_chat_template(
+        self, messages, add_generation_prompt=True, tokenize=False, enable_thinking=None
+    ):
+        out = ""
+        for m in messages:
+            out += f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n"
+        if add_generation_prompt:
+            out += "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        return out
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, ids, skip_special_tokens=True):
+        return "".join(chr(i) for i in ids)
+
+
+def _fake_generate_echo(response="MOVE", tokenizer=None):
+    """Generation fake that reports the prompt ids it was actually given.
+
+    That is the whole point: ``sync_context`` reads ``prompt_ids`` back, so a fake that
+    invents them (like ``_fake_generate``) cannot exercise the contract.
+    """
+    tok = tokenizer or _ChatTokenizer()
+
+    def generate_rollout_completions(trainer, prompts, **kwargs):
+        results = []
+        for prompt in prompts:
+            body = response + tok.eos_token
+            ids = tok.encode(body)
+            results.append(
+                {
+                    "prompt_ids": tok.encode(prompt),
+                    "completion_ids": ids,
+                    "logprobs": [-0.5] * len(ids),
+                    "text": response,
+                }
+            )
+        return results
+
+    return generate_rollout_completions
+
+
+class TestExactRowReproducesGenerationContext(unittest.TestCase):
+    """Regression guard for the row/context mismatch.
+
+    Before the fix, a row was `turn-1 prompt ++ gen1 ++ "\\n\\n"+obs2 ++ gen2 ...` while
+    generation used a freshly rendered chat template, so from turn 2 onward the trained
+    sequence was never the generated one. The contract asserted here is the fix: for
+    every turn, the ids vLLM conditioned on are a prefix of the row.
+    """
+
+    def setUp(self):
+        import trl.experimental.openenv as oe
+
+        self._oe = oe
+        self._orig = oe.generate_rollout_completions
+        self.tok = _ChatTokenizer()
+        self.seen = []
+        inner = _fake_generate_echo(tokenizer=self.tok)
+
+        def recording(trainer, prompts, **kwargs):
+            out = inner(trainer, prompts, **kwargs)
+            self.seen.extend(o["prompt_ids"] for o in out)
+            return out
+
+        oe.generate_rollout_completions = recording
+
+    def tearDown(self):
+        self._oe.generate_rollout_completions = self._orig
+
+    def _play(self, mode):
+        from playpen.marshal.selfplay_agent import play_selfplay_episode
+
+        self.seen.clear()
+        env = _FakeEnv(total_turns=6, terminal_reward=1.0)
+        return play_selfplay_episode(
+            env, _FakeTrainer(), self.tok, instance_idx=0, row_context_mode=mode
+        )
+
+    def test_every_generation_context_is_a_prefix_of_the_row(self):
+        rollouts = self._play("exact")
+        # seats alternate, so seat 0 generated on calls 0, 2, 4
+        for seat, rollout in rollouts.items():
+            row = list(rollout.prompt_ids) + list(rollout.completion_ids)
+            for ctx in self.seen[seat::2]:
+                self.assertEqual(
+                    row[: len(ctx)], list(ctx),
+                    f"seat {seat}: a generation context is not a prefix of the trained row",
+                )
+
+    def test_row_ends_exactly_at_last_context_plus_generation(self):
+        rollouts = self._play("exact")
+        for seat, rollout in rollouts.items():
+            row = list(rollout.prompt_ids) + list(rollout.completion_ids)
+            last_ctx = list(self.seen[seat::2][-1])
+            gen_len = len(row) - len(last_ctx)
+            self.assertGreater(gen_len, 0)
+            self.assertEqual(row[: len(last_ctx)], last_ctx)
+            # ...and those trailing tokens are exactly the ones marked model-generated.
+            self.assertTrue(all(m == 1 for m in rollout.owner_mask[-gen_len:]))
+
+    def test_turn_boundaries_and_mask_still_line_up(self):
+        rollouts = self._play("exact")
+        for rollout in rollouts.values():
+            self.assertEqual(len(rollout.owner_mask), len(rollout.completion_ids))
+            self.assertEqual(len(rollout.logprobs), len(rollout.completion_ids))
+            self.assertEqual(len(rollout.turn_end_positions), 3)
+            for pos in rollout.turn_end_positions:
+                self.assertEqual(rollout.owner_mask[pos], 1)
+            # Environment scaffolding is present and carries no gradient.
+            self.assertIn(0, rollout.owner_mask)
+
+    def test_spliced_mode_still_reproduces_the_old_shape(self):
+        rollouts = self._play("spliced")
+        for seat, rollout in rollouts.items():
+            row = list(rollout.prompt_ids) + list(rollout.completion_ids)
+            contexts = self.seen[seat::2]
+            # Turn 1 matches in both modes; the later ones are what used to diverge.
+            self.assertEqual(row[: len(contexts[0])], list(contexts[0]))
+            self.assertNotEqual(row[: len(contexts[-1])], list(contexts[-1]))
+
+
+class TestExactRowDriftIsDropped(unittest.TestCase):
+    """A row whose owner mask cannot be proven correct must not be trained on."""
+
+    def setUp(self):
+        import trl.experimental.openenv as oe
+
+        self._oe = oe
+        self._orig = oe.generate_rollout_completions
+        tok = _ChatTokenizer()
+        inner = _fake_generate_echo(tokenizer=tok)
+        self.calls = 0
+
+        def drifting(trainer, prompts, **kwargs):
+            out = inner(trainer, prompts, **kwargs)
+            self.calls += 1
+            if self.calls == 3:  # seat 0's second turn: pretend re-tokenization merged
+                out[0]["prompt_ids"] = [999] + list(out[0]["prompt_ids"])
+            return out
+
+        oe.generate_rollout_completions = drifting
+        self.tok = tok
+
+    def tearDown(self):
+        self._oe.generate_rollout_completions = self._orig
+
+    def test_drifted_seat_is_inert_but_still_reports_its_outcome(self):
+        from playpen.marshal.selfplay_agent import play_selfplay_episode
+
+        env = _FakeEnv(total_turns=6, terminal_reward=1.0)
+        rollouts = play_selfplay_episode(
+            env, _FakeTrainer(), self.tok, instance_idx=0, row_context_mode="exact"
+        )
+        drifted = rollouts[0]
+        # Not trainable: an owner mask we cannot prove must carry no gradient...
+        self.assertFalse(drifted.has_model_tokens)
+        self.assertEqual(drifted.turn_end_positions, [])
+        self.assertEqual(drifted.turn_rewards, [])
+        # ...but the episode's real outcome is still reported, so reward statistics
+        # (and the plain-GRPO group baseline) do not see a fabricated 0.0.
+        self.assertEqual(drifted.terminal_reward, 1.0)
+        self.assertTrue(rollouts[1].has_model_tokens)  # the other seat is unaffected
+        self.assertTrue(env.finalized)                 # and the game ran to the end
+
+
+class _StubEnv:
+    """Just enough of SelfPlayEnv for build_selfplay_rollout_func to close over."""
+
+    def __init__(self, num_players=2):
+        self.num_players = num_players
+
+
+class TestEpisodePairing(unittest.TestCase):
+    """One episode must serve every seat of a run of identical prompts.
+
+    MARSHAL emits both seats of a game from that one game. The pre-fix port replayed a
+    whole fresh episode per prompt and discarded the other seat, so a "pair" of seat
+    rows came from two different games (and cost 2x the generation).
+    """
+
+    def setUp(self):
+        import playpen.marshal.trainer as tr
+        from playpen.marshal.selfplay_agent import SeatRollout
+
+        self.tr = tr
+        self._orig = tr.play_selfplay_episode
+        self.calls = []
+
+        def fake_play(env, trainer, tokenizer, instance_idx, **kwargs):
+            # Tag each seat's row with the episode that produced it, so a test can tell
+            # whether two rows came from the same play.
+            episode = len(self.calls)
+            self.calls.append(instance_idx)
+            return {
+                seat: SeatRollout(
+                    seat=seat,
+                    prompt_ids=[1],
+                    completion_ids=[2, 3],
+                    logprobs=[-0.1, -0.2],
+                    owner_mask=[1, 1],
+                    turn_end_positions=[1],
+                    turn_rewards=[1.0],
+                    terminal_reward=float(episode),  # episode id, for identification
+                )
+                for seat in (0, 1)
+            }
+
+        tr.play_selfplay_episode = fake_play
+
+    def tearDown(self):
+        self.tr.play_selfplay_episode = self._orig
+
+    def _run(self, prompts, pairing, num_players=2):
+        from playpen.marshal.config import MarshalConfig
+
+        cfg = MarshalConfig(episode_pairing=pairing)
+        fn = self.tr.build_selfplay_rollout_func(_StubEnv(num_players), cfg)
+        out = fn(prompts, _FakeTrainer())
+        self._assert_no_cross_instance_rows(prompts, out)
+        return out
+
+    def _assert_no_cross_instance_rows(self, prompts, out):
+        """No row may be served an episode belonging to a different game instance.
+
+        ``terminal_reward`` carries the episode id and ``self.calls[episode]`` is the
+        instance that episode was played on, so this is checkable directly. It is the
+        one thing pairing could plausibly get wrong, so every case asserts it.
+        """
+        from playpen.marshal.trainer import parse_prompt
+
+        for i, prompt in enumerate(prompts):
+            expected, _ = parse_prompt(prompt)
+            served = self.calls[int(out["rewards"][i])]
+            self.assertEqual(
+                served, expected,
+                f"row {i} (prompt {prompt!r}) was served an episode of instance {served}",
+            )
+
+    def test_shared_serves_a_whole_run_from_one_episode(self):
+        # TRL's RepeatSampler emits num_generations copies consecutively.
+        prompts = ["5"] * 4 + ["7"] * 4
+        out = self._run(prompts, "shared")
+        self.assertEqual(len(self.calls), 4, "expected 8 prompts -> 4 paired episodes")
+        self.assertEqual(self.calls, [5, 5, 7, 7])
+        self.assertEqual(out["seat"], [0, 1, 0, 1, 0, 1, 0, 1])
+        # Rows 0/1 share an episode, 2/3 share the next one, and so on.
+        episodes = out["rewards"]
+        self.assertEqual(episodes[0], episodes[1])
+        self.assertEqual(episodes[2], episodes[3])
+        self.assertNotEqual(episodes[0], episodes[2])
+
+    def test_shared_halves_the_generation_cost(self):
+        self._run(["5"] * 8, "shared")
+        shared_calls = len(self.calls)
+        self.calls.clear()
+        self._run([f"5::seat{i % 2}" for i in range(8)], "replay")
+        self.assertEqual(shared_calls, 4)
+        self.assertEqual(len(self.calls), 8)
+
+    def test_replay_is_unchanged(self):
+        prompts = ["5::seat0"] * 2 + ["5::seat1"] * 2
+        out = self._run(prompts, "replay")
+        self.assertEqual(len(self.calls), 4, "replay plays one episode per prompt")
+        self.assertEqual(out["seat"], [0, 0, 1, 1])
+        # Every row came from its own episode.
+        self.assertEqual(len(set(out["rewards"])), 4)
+
+    def test_seat_pinned_keys_are_never_paired_even_in_shared_mode(self):
+        out = self._run(["5::seat0", "5::seat0"], "shared")
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(out["seat"], [0, 0])
+
+    def test_unpairable_run_falls_back_instead_of_mixing_games(self):
+        # num_generations=3 with 2 players: the runs do not divide evenly, so index 2
+        # would otherwise be paired with index 3 -- a *different* instance.
+        prompts = ["5"] * 3 + ["7"] * 3
+        out = self._run(prompts, "shared")
+        # Indices 0-1 pair (one episode of 5); 2 and 3 straddle the instance boundary so
+        # each replays alone (5 then 7); 4-5 pair (one episode of 7).
+        self.assertEqual(self.calls, [5, 5, 7, 7])
+        self.assertEqual(out["seat"], [0, 1, 0, 1, 0, 1])
+        # The invariant that matters: no row is ever served an episode of a *different*
+        # instance, and the straddling indices do not share one.
+        self.assertNotEqual(out["rewards"][2], out["rewards"][3])
+
+    def test_odd_length_tail_falls_back(self):
+        out = self._run(["5"] * 3, "shared")
+        self.assertEqual(self.calls, [5, 5])  # indices 0,1 pair; index 2 replays
+        self.assertEqual(out["seat"], [0, 1, 0])
+
+    def test_three_player_game_pairs_in_threes(self):
+        out = self._run(["5"] * 6, "shared", num_players=3)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(out["seat"], [0, 1, 2, 0, 1, 2])
+        self.assertEqual(out["rewards"][0], out["rewards"][2])
+        self.assertNotEqual(out["rewards"][2], out["rewards"][3])
+
+    def test_row_payload_is_intact(self):
+        out = self._run(["5"] * 2, "shared")
+        for key in ("prompt_ids", "completion_ids", "logprobs", "env_mask",
+                    "owner_mask", "turn_end_positions", "turn_rewards"):
+            self.assertEqual(len(out[key]), 2, key)
+        self.assertEqual(out["env_mask"], out["owner_mask"])
+        self.assertEqual(out["completion_ids"][0], [2, 3])
+
+
+class TestPairedRolloutEndToEnd(unittest.TestCase):
+    """Pairing and exact-row assembly through the real code path, no mocking of either.
+
+    The unit tests above stub ``play_selfplay_episode`` (pairing) or drive it directly
+    (row assembly). This one runs ``build_selfplay_rollout_func`` -> the real
+    ``play_selfplay_episode`` -> the real ``_SeatBuilder``, so it catches a regression
+    in the seam between them.
+    """
+
+    def setUp(self):
+        import trl.experimental.openenv as oe
+
+        self._oe = oe
+        self._orig = oe.generate_rollout_completions
+        self.tok = _ChatTokenizer()
+        self.contexts = []
+        inner = _fake_generate_echo(tokenizer=self.tok)
+
+        def recording(trainer, prompts, **kwargs):
+            out = inner(trainer, prompts, **kwargs)
+            self.contexts.extend(o["prompt_ids"] for o in out)
+            return out
+
+        oe.generate_rollout_completions = recording
+
+    def tearDown(self):
+        self._oe.generate_rollout_completions = self._orig
+
+    def test_one_episode_two_seats_each_row_matching_its_own_contexts(self):
+        from playpen.marshal.config import MarshalConfig
+        from playpen.marshal.trainer import build_selfplay_rollout_func
+
+        env = _FakeEnv(total_turns=6, terminal_reward=1.0)
+
+        class _T:
+            processing_class = self.tok
+
+        fn = build_selfplay_rollout_func(
+            env, MarshalConfig(episode_pairing="shared", row_context_mode="exact")
+        )
+        out = fn(["5", "5"], _T())
+
+        # ONE episode served both rows: 6 turns played, not 12.
+        self.assertEqual(len(env.seen), 6)
+        self.assertEqual(len(self.contexts), 6)
+        self.assertEqual(out["seat"], [0, 1])
+        # Both rows saw the same game, so they carry the same terminal reward.
+        self.assertEqual(out["rewards"][0], out["rewards"][1])
+
+        # ...and each row is still exactly the context its own seat generated under.
+        for row_index, seat in enumerate(out["seat"]):
+            row = list(out["prompt_ids"][row_index]) + list(out["completion_ids"][row_index])
+            for ctx in self.contexts[seat::2]:  # seats alternate turn by turn
+                self.assertEqual(
+                    row[: len(ctx)], list(ctx),
+                    f"row {row_index} (seat {seat}) diverges from a generation context",
+                )
+            self.assertEqual(len(out["owner_mask"][row_index]),
+                             len(out["completion_ids"][row_index]))
+
+
+class TestSeatThatNeverPlayedReportsTheRealOutcome(unittest.TestCase):
+    """A seat with no trajectory must report the episode's outcome, not a fake 0.0.
+
+    Regression for a reporting bug measured on the codenames run: ~48% of rows were
+    seats that never moved (the game aborted before their turn), every one of them
+    logged reward 0.0, and the logged abort rate came out at 33.7% against 64.3% among
+    rows that actually played. On the plain-GRPO path that fabricated 0.0 also entered
+    the group baseline directly.
+    """
+
+    def setUp(self):
+        import trl.experimental.openenv as oe
+
+        self._oe = oe
+        self._orig = oe.generate_rollout_completions
+        oe.generate_rollout_completions = _fake_generate()
+
+    def tearDown(self):
+        self._oe.generate_rollout_completions = self._orig
+
+    def test_non_acting_seat_carries_the_team_reward(self):
+        from playpen.marshal.selfplay_agent import play_selfplay_episode
+
+        # total_turns=1: seat 0 moves, the game ends, seat 1 never gets a turn.
+        env = _FakeEnv(total_turns=1, terminal_reward=-1.0)
+        rollouts = play_selfplay_episode(
+            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, row_context_mode="spliced"
+        )
+        self.assertIn(1, rollouts, "the non-acting seat must still be reported")
+        idle = rollouts[1]
+        self.assertEqual(idle.terminal_reward, -1.0, "must be the ABORT, not a fake 0.0")
+        self.assertFalse(idle.has_model_tokens, "and it must stay training-inert")
+        self.assertEqual(rollouts[0].terminal_reward, -1.0)
+
+    def test_placeholder_contributes_no_gradient_and_no_pool_statistics(self):
+        import torch
+        from playpen.marshal.advantage import RowRollout, compute_marshal_advantages
+
+        # One real winning row and one placeholder that reports the same outcome.
+        real = RowRollout(seat=0, completion_len=4, owner_mask=[1, 1, 1, 1],
+                          turn_end_positions=[3], turn_rewards=[1.0])
+        idle = RowRollout(seat=1, completion_len=1, owner_mask=[0],
+                          turn_end_positions=[], turn_rewards=[])
+        adv = compute_marshal_advantages([real, idle], 4, agent_specific=True,
+                                         marshal_exact=False, norm_mode="mean")
+        self.assertTrue(torch.equal(adv[1], torch.zeros(4)),
+                        "placeholder row must carry no advantage anywhere")
+
+
+class TestParsePrompt(unittest.TestCase):
+    def test_both_key_shapes(self):
+        from playpen.marshal.trainer import parse_prompt
+
+        self.assertEqual(parse_prompt("12::seat1"), (12, 1))
+        self.assertEqual(parse_prompt("12"), (12, None))
+
+
+class TestDatasetKeyShape(unittest.TestCase):
+    """The dataset key shape must match the pairing mode the rollout func expects."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playpen.marshal.selfplay_env import load_instance_rows
+
+            cls.n = len(load_instance_rows("taboo"))
+        except Exception as e:
+            raise unittest.SkipTest(f"clembench taboo not resolvable: {e}")
+
+    def test_shared_is_one_row_per_instance(self):
+        from playpen.marshal.trainer import build_selfplay_dataset
+
+        ds = build_selfplay_dataset("taboo", num_players=2, episode_pairing="shared")
+        self.assertEqual(len(ds), self.n)
+        self.assertNotIn("::seat", ds["prompt"][0])
+
+    def test_replay_is_one_row_per_instance_and_seat(self):
+        from playpen.marshal.trainer import build_selfplay_dataset
+
+        ds = build_selfplay_dataset("taboo", num_players=2, episode_pairing="replay")
+        self.assertEqual(len(ds), 2 * self.n)
+        self.assertIn("::seat", ds["prompt"][0])
+
+
 class TestRolloutConstruction(unittest.TestCase):
     def setUp(self):
         # Patch the real module attribute so `from trl.experimental.openenv import
@@ -122,7 +586,9 @@ class TestRolloutConstruction(unittest.TestCase):
         from playpen.marshal.selfplay_agent import play_selfplay_episode
 
         env = _FakeEnv(total_turns=4, terminal_reward=1.0)
-        rollouts = play_selfplay_episode(env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0)
+        rollouts = play_selfplay_episode(
+            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, row_context_mode="spliced"
+        )
 
         self.assertEqual(set(rollouts.keys()), {0, 1})
         seat0 = rollouts[0]
@@ -158,7 +624,9 @@ class TestRolloutConstruction(unittest.TestCase):
         from playpen.marshal.selfplay_agent import play_selfplay_episode
 
         env = _FakeEnv(total_turns=4)
-        rollouts = play_selfplay_episode(env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0)
+        rollouts = play_selfplay_episode(
+            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, row_context_mode="spliced"
+        )
         # prompt_ids come from the seat's first observation; non-empty.
         self.assertTrue(len(rollouts[0].prompt_ids) > 0)
 
@@ -450,7 +918,9 @@ class TestThinkingIsTrainedButNotSentToGame(unittest.TestCase):
         from playpen.marshal.selfplay_agent import play_selfplay_episode
 
         env = _FakeEnv(total_turns=2, terminal_reward=1.0)
-        rollouts = play_selfplay_episode(env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0)
+        rollouts = play_selfplay_episode(
+            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, row_context_mode="spliced"
+        )
 
         # The game only ever received the answer — no reasoning leaked to the parser.
         self.assertTrue(env.seen)
@@ -468,7 +938,8 @@ class TestThinkingIsTrainedButNotSentToGame(unittest.TestCase):
 
         env = _FakeEnv(total_turns=2, terminal_reward=1.0)
         play_selfplay_episode(
-            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, strip_think=False
+            env, _FakeTrainer(), _FakeTokenizer(), instance_idx=0, strip_think=False,
+            row_context_mode="spliced",
         )
         self.assertIn("<think>", env.seen[0])
 

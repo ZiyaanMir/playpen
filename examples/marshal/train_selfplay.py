@@ -120,7 +120,11 @@ def parse_args() -> argparse.Namespace:
                         "runs start to drift/collapse.")
     p.add_argument("--num-generations", type=int, default=2)
     p.add_argument("--per-device-batch-size", type=int, default=4,
-                   help="Keep >= 2*num_generations so both seats co-occur in a batch for seat pooling.")
+                   help="Per-forward micro-batch. NOTE the MARSHAL advantage pool is the "
+                        "*generation* batch (per-device-batch-size x grad-accum), not this "
+                        "value, so that product is what must be >= 2*num_generations for "
+                        "both seats to co-occur in a pool; it must also be divisible by "
+                        "--num-generations.")
     p.add_argument("--grad-accum", type=int, default=1)
     p.add_argument("--max-steps", type=int, default=50)
     p.add_argument("--learning-rate", type=float, default=1e-6)
@@ -212,7 +216,15 @@ def main() -> None:
           f"advantage_norm_mode={marshal_config.advantage_norm_mode} "
           f"fidelity={marshal_config.fidelity_mode} "
           f"whiten_rewards={marshal_config.whiten_rewards} "
-          f"whiten_advantages={marshal_config.whiten_advantages}")
+          f"whiten_advantages={marshal_config.whiten_advantages} "
+          f"row_context_mode={marshal_config.row_context_mode} "
+          f"episode_pairing={marshal_config.episode_pairing}")
+    if marshal_config.row_context_mode != "exact":
+        print("[marshal] WARNING: row_context_mode='spliced' reproduces the pre-fix "
+              "rollout assembly, where the trained token sequence is not the sequence "
+              "the policy generated under from turn 2 onward. TRL's vLLM "
+              "importance-sampling correction then collapses the gradient. Use it only "
+              "to reproduce an old run.")
     if marshal_config.length_penalty:
         from playpen.marshal.advantage import LengthPenaltySpec
 
@@ -242,9 +254,24 @@ def main() -> None:
     env = SelfPlayEnv(args.game)
     print(f"[env] game={args.game} num_players={env.num_players}")
     dataset = build_selfplay_dataset(
-        args.game, num_players=env.num_players, max_instances=args.max_instances
+        args.game,
+        num_players=env.num_players,
+        max_instances=args.max_instances,
+        episode_pairing=marshal_config.episode_pairing,
     )
-    print(f"[data] {len(dataset)} rows ({env.num_players} seats x game instances)")
+    if marshal_config.episode_pairing == "shared":
+        print(f"[data] {len(dataset)} rows (1 per game instance); each run of "
+              f"{env.num_players} consecutive copies is served by ONE episode, so both "
+              f"seats come from the same game and no generation is discarded")
+        if args.num_generations % env.num_players != 0:
+            print(f"[data] WARNING: --num-generations {args.num_generations} is not a "
+                  f"multiple of num_players {env.num_players}; runs that cannot be paired "
+                  f"fall back to replaying a fresh episode per prompt. Pick a multiple "
+                  f"of {env.num_players} to pair every row.")
+    else:
+        print(f"[data] {len(dataset)} rows ({env.num_players} seats x game instances); "
+              f"episode_pairing='replay' -- every prompt replays a whole episode and "
+              f"discards the other seat(s)")
 
     # 3. GRPO config + LoRA (LoRA is always on, independent of the MARSHAL switch).
     # Every run writes into its own timestamped subfolder, so a rerun can never overwrite

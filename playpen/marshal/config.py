@@ -27,6 +27,8 @@ from typing import Any, Dict
 # self-documenting in a YAML file and so a third mode could be added later.
 ADVANTAGE_NORM_MODES = ("mean", "mean_std")
 FIDELITY_MODES = ("paper_correct", "marshal_exact")
+ROW_CONTEXT_MODES = ("exact", "spliced")
+EPISODE_PAIRING_MODES = ("shared", "replay")
 
 
 @dataclass
@@ -142,6 +144,52 @@ class MarshalConfig:
             ships ``1.0``. With the default ``length_penalty_bonus`` of 0 this just
             shifts the zero-crossing away from ``length_penalty_max_len``; prefer
             changing ``length_penalty_max_len`` instead.
+        row_context_mode: How a multi-turn rollout row's token sequence is assembled.
+            Like ``dr_grpo``, this takes effect *regardless of* ``enabled``: it
+            governs rollout collection, which both the MARSHAL path and the plain-GRPO
+            baseline share.
+
+            ``"exact"`` (default) -- the row's ``prompt_ids + completion_ids`` reproduce,
+            token for token, the context each turn was actually generated under. Each
+            turn's generation prompt is the row so far plus the chat template's own
+            per-turn scaffolding, and the environment-feedback span is taken from the
+            token ids vLLM reports for that prompt, so no reconstruction can drift.
+
+            ``"spliced"`` -- the pre-fix behavior, kept only to reproduce earlier runs.
+            The row is the turn-1 prompt followed by every generation concatenated with
+            the raw environment text (``"\\n\\n" + observation``) between them, while
+            generation itself used the full chat template. From turn 2 onward the
+            trained sequence is therefore NOT the sequence the policy generated under:
+            the chat scaffolding (``<|im_end|>``/``<|im_start|>`` turn boundaries), the
+            ``/no_think`` marker and the per-turn empty ``<think>`` block are all
+            missing. Recomputed log-probs then diverge from the sampler's by ~0.6
+            nats/token, and TRL's vLLM importance-sampling correction (on by default,
+            ``vllm_importance_sampling_mode="sequence_mask"``) multiplies the whole
+            row's loss by ``exp(sum of that divergence)`` -- observed at 1e-6 or below
+            for every row, i.e. no gradient at all. Do not use for new runs.
+        episode_pairing: Whether the seats of one episode share that episode. Like
+            ``row_context_mode``, this governs rollout collection and so applies
+            regardless of ``enabled``.
+
+            ``"shared"`` (default) -- MARSHAL's own arrangement: one dataset row per
+            game instance, and each run of ``num_players`` consecutive copies of that
+            prompt is served by a **single** episode, seat *k* taking the *k*-th copy.
+            Both seats' rows therefore come from the same game, which is what makes a
+            per-seat baseline compare like with like. It also halves generation cost --
+            no seat is generated and discarded -- and guarantees every advantage pool
+            holds both seats in equal number.
+
+            ``"replay"`` -- the pre-fix arrangement: one dataset row per (instance,
+            seat), and every prompt replays a whole fresh episode keeping only the
+            requested seat. The other seat's generation is computed and thrown away, so
+            rollout costs ~num_players x more, and the two seats of a "pair" come from
+            different games. Kept to reproduce earlier runs.
+
+            Note for ``"shared"``: ``num_generations`` should be a multiple of the
+            game's player count so the runs of identical prompts divide evenly into
+            episodes. When a run cannot be paired (odd ``num_generations``, or a
+            multi-process split that straddles a prompt's copies) that index silently
+            falls back to ``"replay"`` behavior rather than failing.
     """
 
     enabled: bool = True
@@ -159,6 +207,8 @@ class MarshalConfig:
     length_penalty_min_len: int = 11
     length_penalty_max_len: int = 2048
     length_penalty_offset: float = 1.0
+    row_context_mode: str = "exact"
+    episode_pairing: str = "shared"
 
     def __post_init__(self) -> None:
         if self.advantage_norm_mode not in ADVANTAGE_NORM_MODES:
@@ -169,6 +219,16 @@ class MarshalConfig:
         if self.fidelity_mode not in FIDELITY_MODES:
             raise ValueError(
                 f"fidelity_mode must be one of {FIDELITY_MODES}, got {self.fidelity_mode!r}"
+            )
+        if self.row_context_mode not in ROW_CONTEXT_MODES:
+            raise ValueError(
+                f"row_context_mode must be one of {ROW_CONTEXT_MODES}, "
+                f"got {self.row_context_mode!r}"
+            )
+        if self.episode_pairing not in EPISODE_PAIRING_MODES:
+            raise ValueError(
+                f"episode_pairing must be one of {EPISODE_PAIRING_MODES}, "
+                f"got {self.episode_pairing!r}"
             )
         self.gamma = float(self.gamma)
         self.length_penalty_coef = float(self.length_penalty_coef)

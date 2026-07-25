@@ -24,6 +24,44 @@ advantage_norm_mode: mean
 # Discount for the backward return. MARSHAL uses 1.0.
 gamma: 1.0
 
+# How a multi-turn rollout row's token sequence is assembled. Like dr_grpo, this
+# applies REGARDLESS of `enabled` -- it governs rollout collection, which the MARSHAL
+# path and the plain-GRPO baseline share.
+#
+# "exact"   (default, and the only setting you should use for new runs): the row's
+#           prompt+completion tokens reproduce, token for token, the context each turn
+#           was generated under. Each turn's prompt is the row so far plus the chat
+#           template's own per-turn scaffolding, and the environment span is read back
+#           from the token ids vLLM reports, so nothing can drift unnoticed.
+#
+# "spliced" (pre-2026-07-25 behaviour, kept only to reproduce old runs): raw env text
+#           spliced into the row with no chat scaffolding, while generation used a
+#           freshly rendered chat template. From turn 2 onward the trained sequence is
+#           NOT the generated one, recomputed log-probs diverge by ~0.6 nats/token, and
+#           TRL's vLLM importance-sampling correction (sequence_mask, on by default)
+#           multiplies each row's loss by exp(that divergence) -- measured at <=1e-6 for
+#           every row in guesswhat_Qwen3-4B_no_kl, i.e. grad_norm ~1e-8 and no learning.
+row_context_mode: exact
+
+# Whether the seats of one episode share that episode. Also applies REGARDLESS of
+# `enabled` -- it governs rollout collection.
+#
+# "shared" (default, and what MARSHAL itself does): one dataset row per game instance.
+#           TRL repeats each row `num_generations` times consecutively, and each run of
+#           `num_players` copies is served by ONE episode -- seat k takes the k-th copy.
+#           Both seats of a pair therefore come from the same game (so a per-seat
+#           baseline compares like with like), no seat is generated and thrown away
+#           (~2x faster rollouts for a 2-player game), and every advantage pool holds
+#           the seats in equal number instead of the 1:7..7:1 swings seen before.
+#           Pick `num_generations` as a multiple of the game's player count; runs that
+#           cannot be paired fall back to "replay" for those rows rather than failing.
+#
+# "replay"  (pre-fix behaviour): one dataset row per (instance, seat); every prompt
+#           replays a whole fresh episode and keeps only the requested seat, so the
+#           other seat's generation is wasted and the two seats of a "pair" come from
+#           different games.
+episode_pairing: shared
+
 # "paper_correct" (default): the algorithm the MARSHAL paper describes.
 # "marshal_exact": bit-comparable reproduction of MARSHAL's shipped code,
 #   including its two documented departures from its own paper (a biasing pre-sum
