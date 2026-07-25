@@ -16,7 +16,7 @@ agent_specific_normalization: true
 # Keep rewards at each turn boundary and turn them into per-token returns via a
 # backward cumulative sum (turn-level advantage estimator). False => sum a seat's
 # turn rewards into a single terminal scalar (MARSHAL use_turn_scores=False).
-turn_level_rewards: false
+turn_level_rewards: true
 
 # "mean" mean-centers each pool; "mean_std" z-scores it.
 advantage_norm_mode: mean
