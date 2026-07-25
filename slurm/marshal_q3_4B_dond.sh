@@ -19,6 +19,13 @@ source .venv/bin/activate
 export HF_HOME=$PROJECTDIR/hf
 export TRL_EXPERIMENTAL_SILENCE=1
 export TOKENIZERS_PARALLELISM=false
+# Let TRL/vLLM pick a FREE torch.distributed port instead of the hard-coded default
+# 29500. A pre-set MASTER_PORT (from the module env or an earlier srun) is respected
+# by TRL's ensure_master_addr_port, so a stale/zombie process from a killed run -- or
+# a co-located job -- holding 29500 makes vLLM init die with EADDRINUSE. "0" forces a
+# free-port lookup. MASTER_ADDR pinned to loopback clears any inherited value.
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=0
 # Reduces allocator fragmentation; suggested by the OOM message itself.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
