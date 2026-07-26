@@ -37,6 +37,15 @@ source "$REPO/experiments/lib/experiment.sh"
 exp_layout
 exp_banner train
 
+# Let TRL/vLLM pick a FREE torch.distributed port instead of an already-bound one.
+# The Eddie environment injects a fixed MASTER_PORT (observed: 23456, not torch's
+# 29500 default -- it comes from the module env loaded by _common.sh, not this repo),
+# which TRL's ensure_master_addr_port respects. A stale/zombie process from a killed
+# run, or a co-located job, then makes vLLM init die with EADDRINUSE on that port.
+# "0" forces a free-port lookup. MUST come AFTER `source _common.sh` so it overrides
+# whatever the module load set; MASTER_ADDR pinned to loopback clears any inherited value.
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=0
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 # Record the runtime facts the submitter could not know. Appended rather than
