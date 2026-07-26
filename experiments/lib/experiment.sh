@@ -185,6 +185,56 @@ exp_list_checkpoints() {
     done | sort -n -k1,1 | cut -f2-
 }
 
+# Activate a venv and verify it really is the one we asked for.
+#
+# Compares the venv ROOT DIRECTORIES resolved to physical paths (`pwd -P`).
+#
+# THE BUG THIS FIXES. On Isambard $PROJECTDIR is reached through a symlinked Lustre
+# mount: /projects/<proj>/... and /lus/lfs1aip2/projects/<proj>/... are the SAME
+# directory. A venv's bin/activate hardcodes the physical path it was created under,
+# so after activation `command -v python` returns a different SPELLING of exactly the
+# venv we asked for, and the old string comparison rejected it:
+#
+#   ERROR: wrong venv active: /lus/lfs1aip2/projects/u6ku/.../.venv/bin/python
+#          expected           /projects/u6ku/.../.venv/bin/python
+#
+# -- a false alarm that refused to start a perfectly good job. Resolving both sides
+# to physical paths makes the aliasing compare equal, while a .venv copied from
+# another checkout still resolves elsewhere and is caught.
+#
+# Compare DIRECTORIES, not the interpreters. A venv's bin/python is normally a
+# symlink to the shared base interpreter, so comparing the python files (e.g. with
+# bash's -ef, same device+inode) reports every venv built on the same base Python as
+# identical -- the check would then silently pass anything, which is worse than the
+# false alarm it replaced. Verified: two independent venvs on one base Python do
+# compare equal under -ef.
+exp_activate_venv() {
+    local venv="$1" label="${2:-venv}" got got_dir want_dir
+    [ -f "$venv/bin/activate" ] || {
+        echo "ERROR: no $label at $venv (no bin/activate)." >&2
+        return 1
+    }
+    # shellcheck disable=SC1091
+    source "$venv/bin/activate"
+    got="$(command -v python)"
+    [ -n "$got" ] || {
+        echo "ERROR: no python on PATH after activating $venv." >&2
+        return 1
+    }
+    want_dir="$(cd "$venv" 2>/dev/null && pwd -P)" || want_dir="$venv"
+    got_dir="$(cd "$(dirname "$got")/.." 2>/dev/null && pwd -P)" || got_dir="$(dirname "$got")/.."
+    if [ "$got_dir" != "$want_dir" ]; then
+        echo "ERROR: activated the wrong $label." >&2
+        echo "       expected venv: $want_dir" >&2
+        echo "       active venv:   $got_dir" >&2
+        echo "       (paths above are resolved, so this is a genuine mismatch, not a" >&2
+        echo "        symlinked mount.) The venv was probably copied from another" >&2
+        echo "       checkout -- rebuild it in place." >&2
+        return 1
+    fi
+    echo "[venv] $label: $got"
+}
+
 # Pin torch.distributed / vLLM to a genuinely free port, and say so in the log.
 #
 # THE BUG THIS FIXES (seen on both clusters as, e.g.,

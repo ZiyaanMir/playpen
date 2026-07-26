@@ -39,12 +39,9 @@ VENV_LMEVAL="${VENV_LMEVAL:-$PROJECTDIR/$USER/evaluation/eval}"
     echo "       elsewhere, submit with VENV_LMEVAL=<path-to-venv>." >&2
     exit 1
 }
-source "$VENV_LMEVAL/bin/activate"
-case "$(command -v python)" in
-    "$VENV_LMEVAL/bin/python") ;;
-    *) echo "ERROR: wrong venv active: $(command -v python) (expected $VENV_LMEVAL/bin/python)" >&2
-       exit 1 ;;
-esac
+# Verified by file identity, not path spelling: /projects/... and /lus/... are the
+# same directory on Isambard, and activate hardcodes the physical path.
+exp_activate_venv "$VENV_LMEVAL" "lm-eval venv" || exit 1
 
 export HF_HOME="${HF_HOME:-$PROJECTDIR/hf}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"   # weights pre-cached on the login node

@@ -24,14 +24,10 @@ exp_layout
 exp_banner train
 
 # venvs are NOT relocatable -- a venv copied from another checkout silently
-# activates a different interpreter. Verify rather than trust.
-source "$REPO/.venv/bin/activate"
-case "$(command -v python)" in
-    "$REPO/.venv/bin/python") ;;
-    *) echo "ERROR: wrong venv active: $(command -v python)" >&2
-       echo "       expected $REPO/.venv/bin/python -- rebuild it (it was probably copied)." >&2
-       exit 1 ;;
-esac
+# activates a different interpreter. exp_activate_venv verifies by file identity, so
+# it accepts Isambard's /projects -> /lus/... mount aliasing (which a string
+# comparison wrongly rejected) while still catching a genuine copy.
+exp_activate_venv "$REPO/.venv" "training venv" || exit 1
 
 export HF_HOME="${HF_HOME:-$PROJECTDIR/hf}"
 export TRL_EXPERIMENTAL_SILENCE=1
