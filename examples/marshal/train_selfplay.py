@@ -18,14 +18,22 @@ when off. LoRA is always on (independent of both switches).
 
 Prerequisites (into playpen's venv):
     uv pip install "trl>=0.28.0,<1.0.0" vllm
+    uv pip install wandb          # only for --wandb
 Custom rollouts require vLLM (``use_vllm=True``).
+
+Metrics go to Weights & Biases with ``--wandb`` (or ``--report-to wandb``, or by
+exporting ``WANDB_PROJECT``). The run carries the resolved MARSHAL config, so
+ablation arms are comparable in the UI, and falls back to *offline* recording unless
+a credential exists and the W&B API is reachable -- on a compute node it usually is
+not. See the W&B section of ``examples/marshal/README.md``.
 
 Example:
     python examples/marshal/train_selfplay.py \
         --model HuggingFaceTB/SmolLM2-135M-Instruct \
         --game taboo \
         --marshal-config examples/marshal/marshal_config.yaml \
-        --num-generations 2 --per-device-batch-size 4 --max-steps 10
+        --num-generations 2 --per-device-batch-size 4 --max-steps 10 \
+        --wandb --wandb-project my-dissertation
 """
 
 from __future__ import annotations
@@ -133,7 +141,49 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-instances", type=int, default=None, help="Limit number of game instances used.")
     p.add_argument("--report-to", default="none", choices=["none", "tensorboard", "wandb"],
                    help="Metrics sink. Default 'none' (metrics still print to console). "
-                        "'tensorboard' requires `pip install tensorboard`.")
+                        "'tensorboard' requires `pip install tensorboard`. 'wandb' is "
+                        "equivalent to --wandb and composes with the --wandb-* flags below.")
+
+    # Weights & Biases. Off unless asked for (--wandb, --report-to wandb, or a
+    # WANDB_PROJECT in the environment). Every flag falls back to its WANDB_* env var,
+    # so a job script can export them once; see playpen/marshal/wandb_utils.py.
+    wb = p.add_mutually_exclusive_group()
+    wb.add_argument("--wandb", dest="wandb", action="store_true", default=None,
+                    help="Log this run to Weights & Biases (composes with --report-to, "
+                         "so tensorboard and wandb can both be on).")
+    wb.add_argument("--no-wandb", dest="wandb", action="store_false",
+                    help="Force W&B off even if WANDB_PROJECT is set in the environment.")
+    p.add_argument("--wandb-project", default=None,
+                   help="W&B project (env: WANDB_PROJECT). Default 'playpen-marshal'.")
+    p.add_argument("--wandb-entity", default=None,
+                   help="W&B team or username (env: WANDB_ENTITY). Default: your account's.")
+    p.add_argument("--wandb-run-name", default=None,
+                   help="Run display name (env: WANDB_NAME). Defaults to "
+                        "'{game}_{model}_{timestamp}', matching the on-disk run folder.")
+    p.add_argument("--wandb-group", default=None,
+                   help="Group related runs (env: WANDB_RUN_GROUP). Defaults to "
+                        "'{game}_{model}', which puts an ablation's arms side by side.")
+    p.add_argument("--wandb-job-type", default=None,
+                   help="Job type within the group (env: WANDB_JOB_TYPE). Default 'train'.")
+    p.add_argument("--wandb-tags", default=None,
+                   help="Comma-separated tags (env: WANDB_TAGS). The switch settings "
+                        "(marshal/dr_grpo/length_penalty/fidelity) are tagged automatically.")
+    p.add_argument("--wandb-mode", default=None, choices=["auto", "online", "offline", "disabled"],
+                   help="'auto' (default) uploads live when a credential exists "
+                        "(WANDB_API_KEY or ~/.netrc) AND the W&B API answers, and records "
+                        "offline otherwise -- the safe choice on a compute node, whose "
+                        "shared $HOME carries the credential but which usually has no "
+                        "outbound network. 'disabled' turns W&B off entirely.")
+    p.add_argument("--wandb-dir", default=None,
+                   help="Where the wandb/ run directory goes (env: WANDB_DIR). Defaults to "
+                        "this run's output dir, keeping the run folder self-contained.")
+    p.add_argument("--wandb-id", default=None,
+                   help="Explicit W&B run id (env: WANDB_RUN_ID). Only needed to resume.")
+    p.add_argument("--wandb-resume", default=None, choices=["allow", "must", "never"],
+                   help="Resume policy for --wandb-id (env: WANDB_RESUME). Use "
+                        "'allow' with a fixed id so a requeued job continues one run.")
+    p.add_argument("--wandb-notes", default=None,
+                   help="Free-text note stored on the run (env: WANDB_NOTES).")
 
     # vLLM
     p.add_argument("--vllm-mode", default="colocate", choices=["colocate", "server"],
@@ -167,6 +217,85 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def wandb_tags(args: argparse.Namespace, marshal_config) -> list[str]:
+    """Tags that make the W&B run list filterable without opening any run.
+
+    Every tag encodes a *switch*, not a magnitude: which arm of an ablation this
+    is. Magnitudes (learning rate, batch, steps) go to the run config, where the
+    UI can already sort and group by them.
+    """
+    tags = [
+        args.game,
+        os.path.basename(args.model),
+        "marshal" if marshal_config.enabled else "no-marshal",
+        marshal_config.fidelity_mode,
+    ]
+    if marshal_config.dr_grpo:
+        tags.append("dr_grpo")
+    if marshal_config.length_penalty:
+        tags.append("length_penalty")
+    if not marshal_config.agent_specific_normalization:
+        tags.append("no-seat-norm")
+    if args.kl_beta:
+        tags.append("kl")
+    # Set by experiments/*/run_experiment.sh; absent for a hand-launched run.
+    for env_name in ("EXP_CLUSTER", "EXP_TAG"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            tags.append(value)
+    return tags
+
+
+def wandb_config(args: argparse.Namespace, marshal_config, output_dir: str) -> dict:
+    """The run config: everything needed to tell two runs apart, in one place.
+
+    Deliberately includes the *resolved* MARSHAL config (YAML merged with CLI
+    overrides) rather than the path to the YAML -- the shared YAML is edited between
+    runs, so a recorded path says nothing about what a run six weeks ago actually
+    did. HF's callback adds the full ``GRPOConfig`` on top of this.
+    """
+    return {
+        "marshal": marshal_config.to_dict(),
+        "train": {
+            "model": args.model,
+            "game": args.game,
+            "num_generations": args.num_generations,
+            "per_device_batch_size": args.per_device_batch_size,
+            "grad_accum": args.grad_accum,
+            "generation_batch": args.per_device_batch_size * args.grad_accum,
+            "max_steps": args.max_steps,
+            "save_steps": args.save_steps,
+            "learning_rate": args.learning_rate,
+            "kl_beta": args.kl_beta,
+            "max_completion_length": args.max_completion_length,
+            "max_turns": args.max_turns,
+            "max_instances": args.max_instances,
+            "bf16": args.bf16,
+            "gradient_checkpointing": args.gradient_checkpointing,
+        },
+        "lora": {
+            "r": args.lora_r,
+            "alpha": args.lora_alpha,
+            "dropout": args.lora_dropout,
+            "modules_to_save": args.lora_modules_to_save or None,
+        },
+        "vllm": {
+            "mode": args.vllm_mode,
+            "gpu_memory_utilization": args.vllm_gpu_memory_utilization,
+            "max_model_len": args.vllm_max_model_len,
+            "model_impl": args.vllm_model_impl,
+        },
+        "run": {
+            "output_dir": output_dir,
+            "marshal_config_path": args.marshal_config,
+            "experiment_id": os.environ.get("EXP_ID") or None,
+            "experiment_dir": os.environ.get("EXP_DIR") or None,
+            "cluster": os.environ.get("EXP_CLUSTER") or None,
+            "job_id": os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID") or None,
+        },
+    }
+
+
 def main() -> None:
     args = parse_args()
 
@@ -177,10 +306,12 @@ def main() -> None:
         MarshalConfig,
         MarshalGRPOTrainer,
         SelfPlayEnv,
+        WandbSettings,
         build_reward_func,
         build_selfplay_dataset,
         build_selfplay_rollout_func,
     )
+    from playpen.marshal import wandb_utils
 
     # 1. MARSHAL switch (YAML is the source of truth; --marshal/--no-marshal overrides 'enabled').
     marshal_config = MarshalConfig.from_yaml(args.marshal_config)
@@ -282,6 +413,23 @@ def main() -> None:
     # --no-run-subdir drops the timestamp layer, so checkpoints land directly in the
     # caller's directory. Safe only because the caller owns a fresh dir per run.
     output_dir = os.path.join(base_dir, run_id) if args.run_subdir else base_dir
+
+    # 3a. Weights & Biases. The run is opened HERE, before the trainer exists, for two
+    # reasons: HF's WandbCallback only calls wandb.init when no run is open (so this is
+    # what lets us set entity/group/tags/id/offline-dir at all), and a credential or
+    # package problem then fails in the first seconds of the job instead of after the
+    # model and vLLM have been loaded. Nothing below changes when W&B is off.
+    wandb_settings = WandbSettings.from_args(args).with_defaults(
+        output_dir=output_dir,
+        run_id_stamp=run_id,
+        game=args.game,
+        model=args.model,
+        extra_tags=wandb_tags(args, marshal_config),
+    )
+    print(wandb_settings.summary())
+    wandb_run = wandb_settings.start(config=wandb_config(args, marshal_config, output_dir))
+    report_to = wandb_settings.report_to(args.report_to)
+
     grpo_config = trl.GRPOConfig(
         use_vllm=True,
         vllm_mode=args.vllm_mode,
@@ -305,8 +453,12 @@ def main() -> None:
         # Checkpoint every N steps. save_strategy is TRL/HF's default "steps", so this
         # alone controls the cadence; the last step always saves as well.
         save_steps=args.save_steps,
-        report_to=args.report_to,
-        logging_dir=(f"{output_dir}/tb" if args.report_to == "tensorboard" else None),
+        report_to=report_to,
+        # run_name is what HF's W&B callback would name the run; we already opened it
+        # under this name, and setting it here keeps HF from warning that run_name
+        # defaulted to output_dir.
+        run_name=(wandb_settings.run_name if wandb_settings.enabled else None),
+        logging_dir=(f"{output_dir}/tb" if "tensorboard" in report_to else None),
         log_completions=True,
         # Dr. GRPO recipe (loss_type + scale_rewards) when enabled; empty dict = no
         # change, so with dr_grpo off this call is identical to before the flag existed.
@@ -351,7 +503,17 @@ def main() -> None:
     except Exception:
         pass
 
-    trainer.train()
+    # Record which W&B run this output directory belongs to before training starts:
+    # a job killed at the walltime still leaves the pointer behind, which is when you
+    # most want it. finish() runs in a `finally` for the same reason -- a crashed run
+    # left open shows up in the UI as "running" forever.
+    wandb_utils.write_run_metadata(
+        os.path.join(output_dir, "wandb_run.json"), wandb_run, wandb_settings
+    )
+    try:
+        trainer.train()
+    finally:
+        wandb_utils.finish(wandb_run, wandb_settings)
     print(f"[done] LoRA adapters saved under {output_dir}/checkpoint-<step>/")
 
 

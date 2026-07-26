@@ -64,6 +64,7 @@ ENV_FILE="$EXP_DIR/experiment.env"
                NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
                LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
                VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF EXTRA_TRAIN_ARGS \
+               WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
                EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE LMEVAL_CONDA_ENV; do
         printf '%s=%q\n' "$var" "${!var-}"
     done
@@ -108,6 +109,8 @@ directory  : $EXP_DIR
   train/              checkpoints (checkpoint-<step>/)
   eval/               lm-eval output per checkpoint
   RESULTS.md          score table               (written when eval finishes)
+  wandb/              W&B run data ($([ "${WB_ENABLE:-1}" = "1" ] && echo "project ${WB_PROJECT:-playpen-marshal}, mode ${WB_MODE:-auto}" || echo "disabled"))
+                      offline runs upload with  experiments/lib/wandb_sync.sh $EXP_DIR
 
   qstat -u $USER            # watch both jobs
   qdel $TRAIN_ID $EVAL_ID   # cancel the experiment

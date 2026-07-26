@@ -6,8 +6,9 @@ playpen's TRL ``GRPOTrainer`` + PEFT/LoRA stack, runnable directly against
 clembench games.
 
 Import structure:
-  * ``config`` and ``advantage`` depend only on the standard library / torch and
-    are always importable (unit-testable without the training stack).
+  * ``config``, ``wandb_utils`` and ``advantage`` depend only on the standard
+    library / torch and are always importable (unit-testable without the training
+    stack -- ``wandb_utils`` does not even require ``wandb`` until a run starts).
   * ``selfplay_env`` depends on clemcore (a hard playpen dependency).
   * ``selfplay_agent`` and ``trainer`` require ``trl`` (and ``vllm`` at train
     time); they are exposed lazily so ``import playpen.marshal`` does not require
@@ -17,9 +18,11 @@ Import structure:
 from __future__ import annotations
 
 from playpen.marshal.config import MarshalConfig
+from playpen.marshal.wandb_utils import WandbSettings
 
 __all__ = [
     "MarshalConfig",
+    "WandbSettings",
     # lazily provided (require heavier deps):
     "MarshalGRPOTrainer",
     "SelfPlayEnv",

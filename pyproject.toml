@@ -28,6 +28,12 @@ marshal = [
     "trl>=0.28.0,<1.0.0",
     "vllm"
 ]
+# Weights & Biases logging for the marshal pipeline (train_selfplay.py --wandb).
+# Kept separate from the `marshal` extra so a run that only wants console/tensorboard
+# metrics does not pull it in; playpen/marshal/wandb_utils.py imports it lazily.
+wandb = [
+    "wandb>=0.18.0,<1.0.0"
+]
 
 [project.scripts]
 playpen = "playpen.cli:main"

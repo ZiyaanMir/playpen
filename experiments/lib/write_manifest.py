@@ -155,6 +155,31 @@ def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
     return cfg.to_dict(), None
 
 
+def _wandb_summary() -> dict:
+    """What the training job will do about W&B, from the WB_* the submitter exported.
+
+    Recorded at submit time so the manifest names the project and run before the job
+    starts -- and so an experiment directory found months later says where its curves
+    live even if the W&B run itself was never synced. The trainer writes the run's
+    actual id/url into ``train/wandb_run.json`` once it opens.
+    """
+    enabled = _env("WB_ENABLE", "1") == "1" and _env("WB_MODE", "auto") != "disabled"
+    if not enabled:
+        return {"enabled": False}
+    return {
+        "enabled": True,
+        "project": _env("WB_PROJECT", "playpen-marshal"),
+        "entity": _env("WB_ENTITY") or None,
+        "group": _env("WB_GROUP") or None,   # None => trainer derives {game}_{model}
+        "tags": _env("WB_TAGS") or None,
+        "mode": _env("WB_MODE", "auto"),
+        # The run is named after the experiment, which is what ties a W&B row to
+        # this directory.
+        "run_name": _env("EXP_ID") or None,
+        "dir": os.path.join(_env("EXP_DIR"), "wandb") if _env("EXP_DIR") else None,
+    }
+
+
 def _length_penalty_summary(cfg: dict) -> dict:
     """What the penalty is actually worth, in reward units, for this run.
 
@@ -237,6 +262,7 @@ def main() -> None:
         "marshal_config": marshal_cfg,
         "marshal_config_source": _env("MARSHAL_CONFIG"),
         "length_penalty_effect": _length_penalty_summary(marshal_cfg),
+        "wandb": _wandb_summary(),
         "evaluation": {
             "tasks": _env("EVAL_TASKS"),
             "batch_size": _env("EVAL_BATCH"),
@@ -307,6 +333,23 @@ def main() -> None:
                     "           Raise LP_MAX_LEN or lower LP_COEF so the episode total "
                     "stays under ~0.5."
                 )
+
+    wb = manifest["wandb"]
+    lines += ["", "-- weights & biases -------------------------------------------------"]
+    if wb["enabled"]:
+        lines += [
+            f"  project                      {wb['project']}",
+            f"  entity                       {wb['entity'] or '<account default>'}",
+            f"  run name                     {wb['run_name'] or '<derived>'}",
+            f"  group                        {wb['group'] or '<game>_<model>'}",
+            f"  mode                         {wb['mode']}"
+            f"{'  (offline unless a credential is reachable)' if wb['mode'] == 'auto' else ''}",
+            f"  run data                     {wb['dir'] or '-'}",
+        ]
+        if wb["tags"]:
+            lines.append(f"  extra tags                   {wb['tags']}")
+    else:
+        lines.append("  disabled (WB_ENABLE=0)")
 
     lines += [
         "",

@@ -38,7 +38,9 @@ $MARSHAL_RUNS/dond_Qwen3-4B_lp384_20260723-142530/
 │   └── eval.<jobid>.out/.err
 ├── train/<timestamp>/
 │   ├── checkpoint-50/ … checkpoint-200/
-│   └── completions/*.parquet
+│   ├── completions/*.parquet
+│   └── wandb_run.json      which W&B run this is (id, url, or offline sync command)
+├── wandb/                  W&B run data; offline runs live here until synced
 └── eval/
     ├── base/               lm-eval on the UNTRAINED model — the baseline
     ├── checkpoint-50/      full lm-eval output incl. --log_samples
@@ -107,8 +109,50 @@ Scheduler options pass through too:
 | `EVAL_BASE` | `1` | also score the untrained model |
 | `EVAL_LIMIT` | — | `--limit N`, smoke tests only |
 | `EVAL_EXTRA` | — | extra lm-eval flags, applied to **every** row |
+| `WB_PROJECT` | `playpen-marshal` | Weights & Biases project |
+| `WB_ENABLE` | `1` | `0` turns W&B off for this run |
+| `WB_MODE` | `auto` | `auto` \| `online` \| `offline` \| `disabled` |
+| `WB_ENTITY` / `WB_GROUP` / `WB_TAGS` | — | W&B team, run group, extra tags |
 
 Everything else lives in `presets/<game>.env` — that file is the per-game source of truth.
+
+---
+
+## Weights & Biases
+
+On by default. The run is **named after the experiment** (`EXP_ID`), grouped by
+`{game}_{model}`, and tagged with the switches that define the arm (`marshal` /
+`no-marshal`, `dr_grpo`, `length_penalty`, `paper_correct` / `marshal_exact`, the cluster,
+your `EXP_TAG`). Its config carries the *resolved* MARSHAL config plus every training
+hyperparameter, so two arms can be diffed in the UI without opening a manifest.
+
+`WB_MODE=auto` is what makes this safe to leave on: it uploads live only when a credential
+exists (`WANDB_API_KEY`, or `~/.netrc` after `wandb login`) **and** the W&B API answers,
+and **records offline otherwise**. Both checks are needed — `$HOME` is shared with the
+login nodes, so a compute node can read a credential it has no network to use. A node with
+no outbound network is therefore not a failure: the run is written to `$EXP_DIR/wandb/` and
+travels with the experiment directory. A failed online init falls back to offline rather
+than taking the training job down.
+
+```bash
+# upload offline runs later, from a login node or your laptop after an rsync
+experiments/lib/wandb_sync.sh $MARSHAL_RUNS/dond_Qwen3-4B_20260726-120000
+experiments/lib/wandb_sync.sh                # everything under $MARSHAL_RUNS
+DRY_RUN=1 experiments/lib/wandb_sync.sh      # list what would be uploaded
+
+# per-run overrides
+WB_PROJECT=diss-ablations WB_TAGS=pilot experiments/eddie/run_experiment.sh dond
+WB_ENABLE=0 experiments/eddie/run_experiment.sh dond          # off for this run
+```
+
+`wandb` must be installed in the training venv (`uv pip install wandb`); without it a run
+launched this way fails at startup rather than training for hours with nothing recorded.
+Which W&B run a directory belongs to is written to `train/wandb_run.json` **before**
+training starts, so a job killed at the walltime still leaves the pointer behind.
+
+The `WB_*` names are deliberately not `WANDB_*`: the latter are read by the wandb SDK
+itself, and `WANDB_MODE=auto` is not a value it accepts. Setting the real `WANDB_*`
+variables still works — `train_selfplay.py` falls back to them.
 
 ---
 
@@ -162,8 +206,9 @@ mean is the honest signal.
 
 ## Prerequisites
 
-Training uses the repo's own `.venv`. **Evaluation uses a separate lm-eval environment**
-that must already exist — these scripts do not build it:
+Training uses the repo's own `.venv`, plus `wandb` in it for the metrics logging described
+above (`uv pip install wandb`, or `WB_ENABLE=0` to skip). **Evaluation uses a separate
+lm-eval environment** that must already exist — these scripts do not build it:
 
 * **Eddie** — conda env `lmeval` with `peft` installed and `logiglue`/`logicbench` baked
   into its `lm_eval/tasks/`. Override the name with `LMEVAL_CONDA_ENV`.

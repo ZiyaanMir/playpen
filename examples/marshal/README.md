@@ -24,6 +24,7 @@ Reusable library code lives in the installable package:
 - [`playpen/marshal/selfplay_env.py`](../../playpen/marshal/selfplay_env.py) — a two-seat wrapper over a clembench game (both seats marked "learner").
 - [`playpen/marshal/selfplay_agent.py`](../../playpen/marshal/selfplay_agent.py) — per-seat rollout collection.
 - [`playpen/marshal/trainer.py`](../../playpen/marshal/trainer.py) — `MarshalGRPOTrainer` + rollout/reward/dataset helpers.
+- [`playpen/marshal/wandb_utils.py`](../../playpen/marshal/wandb_utils.py) — `WandbSettings`: W&B run setup, offline fallback (stdlib-only; does not import `wandb` until a run starts).
 
 This directory holds only the runnable wiring:
 
@@ -38,6 +39,9 @@ Install the training stack into playpen's environment (the repo uses `uv`):
 VIRTUAL_ENV=.venv uv pip install "trl>=0.28.0,<1.0.0" vllm
 # or, via the extra:
 VIRTUAL_ENV=.venv uv pip install -e ".[marshal]"
+
+# optional: Weights & Biases logging (--wandb)
+VIRTUAL_ENV=.venv uv pip install -e ".[wandb]"
 ```
 
 Custom `rollout_func` generation requires vLLM (`use_vllm=True`).
@@ -116,11 +120,76 @@ python examples/marshal/train_selfplay.py --game taboo --no-marshal --dr-grpo --
 
 # Longer run keeping an intermediate checkpoint every 20 steps
 python examples/marshal/train_selfplay.py --game taboo --max-steps 100 --save-steps 20
+
+# Logged to Weights & Biases (see below; records offline when there is no credential)
+python examples/marshal/train_selfplay.py --game taboo --max-steps 100 \
+    --wandb --wandb-project my-dissertation --wandb-tags pilot
 ```
 
-Monitor: `tensorboard --logdir models/marshal/`. When MARSHAL is enabled the run
-logs `marshal/seat_{0,1}/adv_mean` and `.../rows` so you can confirm the per-seat
-split is live and the two seats' advantage distributions differ.
+Monitor: `tensorboard --logdir models/marshal/`, or Weights & Biases (below). When
+MARSHAL is enabled the run logs `marshal/seat_{0,1}/adv_mean` and `.../rows` so you
+can confirm the per-seat split is live and the two seats' advantage distributions
+differ.
+
+## Weights & Biases
+
+```bash
+uv pip install wandb        # once, into playpen's venv
+
+python examples/marshal/train_selfplay.py --game taboo --max-steps 10 \
+    --wandb --wandb-project my-dissertation
+```
+
+Everything TRL and the trainer already log goes to W&B — reward, KL, loss, the
+`marshal/*` per-seat and length-penalty metrics, and the completions table
+(`log_completions` is on). What the flags add is the context that makes a *set* of
+runs comparable:
+
+| flag | env fallback | default |
+|---|---|---|
+| `--wandb` / `--no-wandb` | — | off (also on via `--report-to wandb`, or by exporting `WANDB_PROJECT`) |
+| `--wandb-project` | `WANDB_PROJECT` | `playpen-marshal` |
+| `--wandb-entity` | `WANDB_ENTITY` | your account's default |
+| `--wandb-run-name` | `WANDB_NAME` | `{game}_{model}_{timestamp}` — the same name as the run folder |
+| `--wandb-group` | `WANDB_RUN_GROUP` | `{game}_{model}`, so an ablation's arms sit together |
+| `--wandb-tags` | `WANDB_TAGS` | switch tags are added automatically |
+| `--wandb-mode` | `WANDB_MODE` | `auto` |
+| `--wandb-dir` | `WANDB_DIR` | this run's output dir |
+| `--wandb-id` + `--wandb-resume` | `WANDB_RUN_ID` / `WANDB_RESUME` | — (use to continue one run after a requeue) |
+
+The run's config records the **resolved** MARSHAL config (YAML merged with CLI
+overrides), the LoRA/vLLM/GRPO settings and the output directory, and the run is
+auto-tagged with the switches that define the arm (`marshal`/`no-marshal`,
+`dr_grpo`, `length_penalty`, `paper_correct`/`marshal_exact`). So "which of these
+runs had per-seat normalization off" is a filter, not an archaeology exercise.
+
+**`--wandb-mode auto` (the default) goes online only when a credential exists *and*
+the W&B API answers a connection; otherwise it records offline.** Both halves matter
+on a cluster. `$HOME` is shared between login and compute nodes, so `wandb login`
+leaves a `~/.netrc` a compute node can read perfectly well but cannot use — deciding
+"online" on the strength of that file is how a job ends up blocked inside
+`wandb.init`. The probe costs a few seconds once per run. If an online init fails
+anyway (the network went away between the probe and the call), it retries offline
+rather than losing the training run. Offline always works and costs one command
+afterwards:
+
+```bash
+wandb sync <output-dir>/wandb/offline-run-*        # printed at the end of the run
+experiments/lib/wandb_sync.sh $MARSHAL_RUNS        # or, for whole experiment dirs
+```
+
+The run is opened before the model loads, so a missing package or bad credential
+fails in the first seconds rather than after vLLM has spun up. `wandb_run.json` is
+written into the output directory (id, url, or the exact `wandb sync` command) so a
+checkpoint folder always says which W&B run it belongs to.
+
+Cluster runs launched through `experiments/*/run_experiment.sh` get all of this
+wired up already (`WB_*` variables, run named after the experiment, offline data
+inside the experiment directory) — see [`experiments/README.md`](../../experiments/README.md).
+The older hardcoded `slurm/` and `slurm_eddie/` job scripts need no edit either:
+exporting `WANDB_PROJECT` before submitting turns W&B on through the env fallbacks.
+Enabled that way it degrades to a warning if `wandb` is not installed, rather than
+failing the job — only an explicit `--wandb` is treated as a hard requirement.
 
 ## Output & checkpoints
 
@@ -133,6 +202,9 @@ models/marshal/{game}/{model}/20260721-142233/
 │   ├── adapter_config.json + adapter_model.safetensors   # LoRA only, no base weights
 │   └── optimizer.pt, scheduler.pt, trainer_state.json, tokenizer files
 ├── completions/completions_*.parquet
+├── wandb_run.json                        # only with --wandb: id/url/sync command
+├── wandb/                                # only with --wandb: run data (offline runs
+│                                         #   stay here until `wandb sync`)
 └── tb/                                   # only with --report-to tensorboard
 ```
 

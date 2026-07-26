@@ -74,6 +74,11 @@ ARGS=(
 [ "${GRAD_CKPT:-1}" = "1" ] && ARGS+=( --gradient-checkpointing )
 [ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )
 [ -n "${LP_COEF:-}"    ] && ARGS+=( --length-penalty-coef "$LP_COEF" )
+# W&B: named after this experiment, data written inside $EXP_DIR. WB_MODE=auto
+# records offline when the compute node has no credential/network, which is the
+# normal case here -- experiments/lib/wandb_sync.sh uploads it from the login node.
+exp_wandb_args
+ARGS+=( "${WANDB_ARGS[@]}" )
 # Unquoted on purpose: a pre-split flag string (e.g. "--no-length-penalty").
 [ -n "${EXTRA_TRAIN_ARGS:-}" ] && ARGS+=( ${EXTRA_TRAIN_ARGS} )
 

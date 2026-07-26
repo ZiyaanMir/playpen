@@ -82,6 +82,11 @@ ARGS=(
 # Empty => don't pass the flag, so the YAML value stands (see presets/*.env).
 [ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )
 [ -n "${LP_COEF:-}"    ] && ARGS+=( --length-penalty-coef "$LP_COEF" )
+# W&B: named after this experiment, data written inside $EXP_DIR. WB_MODE=auto
+# records offline when the compute node has no credential/network -- upload it later
+# with experiments/lib/wandb_sync.sh from a login node.
+exp_wandb_args
+ARGS+=( "${WANDB_ARGS[@]}" )
 # Unquoted on purpose: this is a pre-split flag string (e.g. "--no-length-penalty").
 [ -n "${EXTRA_TRAIN_ARGS:-}" ] && ARGS+=( ${EXTRA_TRAIN_ARGS} )
 

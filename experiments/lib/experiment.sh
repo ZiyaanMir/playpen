@@ -69,6 +69,7 @@ exp_load_preset() {
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
               VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
+              WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
               EXTRA_TRAIN_ARGS EXP_TAG; do
         if [ -n "${!_v+set}" ]; then
             _override_names+=("$_v")
@@ -106,6 +107,26 @@ exp_load_preset() {
     LP_MAX_LEN="${LP_MAX_LEN:-}"
     LP_COEF="${LP_COEF:-}"
 
+    # --- Weights & Biases ----------------------------------------------------
+    # Named WB_* rather than WANDB_* on purpose: WANDB_MODE, WANDB_PROJECT and
+    # friends are read by the wandb SDK itself, and exporting WB_MODE=auto as
+    # WANDB_MODE would hand the SDK a value it rejects. train_selfplay.py still
+    # honours the real WANDB_* variables if you prefer to set those directly.
+    #
+    # On by default because the cost of it being on is a directory of offline run
+    # data inside the experiment folder, and the cost of it being off is a finished
+    # 5 h run you cannot plot. WB_MODE=auto uploads live when a credential is
+    # reachable and records offline otherwise, so a compute node with no outbound
+    # network is not a failure case.
+    WB_ENABLE="${WB_ENABLE:-1}"
+    WB_PROJECT="${WB_PROJECT:-playpen-marshal}"
+    WB_ENTITY="${WB_ENTITY:-}"           # empty => your account's default entity
+    WB_GROUP="${WB_GROUP:-}"             # empty => {game}_{model}, set by the trainer
+    WB_TAGS="${WB_TAGS:-}"               # extra comma-separated tags; switches are automatic
+    WB_MODE="${WB_MODE:-auto}"           # auto | online | offline | disabled
+    WB_ID="${WB_ID:-}"                   # set with WB_RESUME=allow to continue a run
+    WB_RESUME="${WB_RESUME:-}"
+
     EVAL_TASKS="${EVAL_TASKS:-logiglue,logicbench}"
     EVAL_BATCH="${EVAL_BATCH:-16}"
     EVAL_BASE="${EVAL_BASE:-1}"          # also score the untrained base model
@@ -123,7 +144,43 @@ exp_load_preset() {
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
            VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
+           WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
            EXTRA_TRAIN_ARGS EXP_TAG
+}
+
+# Build train_selfplay.py's W&B flags into the global array $WANDB_ARGS.
+#
+# A global array rather than a printed string because the values contain spaces
+# (a group or a note), and word-splitting a printed string would silently break
+# them apart -- the same reason ARGS=() is built element by element in train.sh.
+#
+# The run is named after the experiment ($EXP_ID) and its data is written inside
+# $EXP_DIR, so the link between a row in the W&B UI and a directory on the cluster
+# is the identity of their names, not a mapping anyone has to maintain. Requires
+# EXP_ID/EXP_DIR, i.e. call it after exp_make_id + exp_layout.
+exp_wandb_args() {
+    WANDB_ARGS=()
+    if [ "${WB_ENABLE:-1}" != "1" ] || [ "${WB_MODE:-auto}" = "disabled" ]; then
+        WANDB_ARGS=( --no-wandb )
+        return 0
+    fi
+    WANDB_ARGS=(
+        --wandb
+        --wandb-project "${WB_PROJECT:-playpen-marshal}"
+        --wandb-mode "${WB_MODE:-auto}"
+        --wandb-run-name "${EXP_ID:-marshal}"
+        # Offline run data lands in $EXP_DIR/wandb/, so it travels with the rest of
+        # the experiment when the directory is rsynced home (nothing on the clusters
+        # is backed up) and disappears with it when the experiment is deleted.
+        --wandb-dir "${EXP_DIR:-.}"
+        --wandb-notes "experiment ${EXP_ID:-?} on ${EXP_CLUSTER:-?}"
+    )
+    [ -n "${WB_ENTITY:-}" ] && WANDB_ARGS+=( --wandb-entity "$WB_ENTITY" )
+    [ -n "${WB_GROUP:-}"  ] && WANDB_ARGS+=( --wandb-group "$WB_GROUP" )
+    [ -n "${WB_TAGS:-}"   ] && WANDB_ARGS+=( --wandb-tags "$WB_TAGS" )
+    [ -n "${WB_ID:-}"     ] && WANDB_ARGS+=( --wandb-id "$WB_ID" )
+    [ -n "${WB_RESUME:-}" ] && WANDB_ARGS+=( --wandb-resume "$WB_RESUME" )
+    return 0
 }
 
 # --- identity + layout -------------------------------------------------------
@@ -375,6 +432,12 @@ exp_banner() {
 "${NUM_GENERATIONS:-?} generations"
         echo "max_compl   = ${MAX_COMPLETION_LENGTH:-?} tokens/turn"
         echo "len_penalty = max_len=${LP_MAX_LEN:-<yaml>} coef=${LP_COEF:-<yaml>}"
+        if [ "${WB_ENABLE:-1}" = "1" ] && [ "${WB_MODE:-auto}" != "disabled" ]; then
+            echo "wandb       = ${WB_PROJECT:-playpen-marshal}${WB_ENTITY:+ ($WB_ENTITY)} "\
+"mode=${WB_MODE:-auto} run=${EXP_ID:-?}"
+        else
+            echo "wandb       = off"
+        fi
         echo "extra_args  = ${EXTRA_TRAIN_ARGS:-none}"
     else
         echo "tasks       = ${EVAL_TASKS:-?} (batch ${EVAL_BATCH:-?})"
