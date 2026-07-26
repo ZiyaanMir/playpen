@@ -43,6 +43,11 @@ VENV_LMEVAL="${VENV_LMEVAL:-$PROJECTDIR/$USER/evaluation/eval}"
 # same directory on Isambard, and activate hardcodes the physical path.
 exp_activate_venv "$VENV_LMEVAL" "lm-eval venv" || exit 1
 
+# Must run BEFORE the import check below: the inherited TMPDIR (/local/user/<uid>)
+# is a login-node path that does not exist on the compute node, and `import peft`
+# pulls in torch, whose inductor cache setup dies there. See exp_setup_tmpdir.
+exp_setup_tmpdir || exit 1
+
 export HF_HOME="${HF_HOME:-$PROJECTDIR/hf}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"   # weights pre-cached on the login node
 export TOKENIZERS_PARALLELISM=false

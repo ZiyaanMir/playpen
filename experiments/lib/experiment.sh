@@ -292,6 +292,68 @@ exp_activate_venv() {
     echo "[venv] $label: $got"
 }
 
+# Point TMPDIR -- and the torch/triton/vLLM caches that derive from it -- at a
+# directory that actually exists and is writable ON THIS NODE.
+#
+# THE BUG THIS FIXES. The job inherits TMPDIR=/local/user/<uid> from the submitting
+# environment (sbatch --export=ALL copies the login node's env). That path is
+# NODE-LOCAL: it is real on the login node, but on a compute node /local/user is not
+# writable by the user and the per-uid directory does not exist. Anything wanting
+# scratch space then dies during `import torch`, before a line of our code runs:
+#
+#   PermissionError:   [Errno 13] Permission denied: '/local/user/1483806040'
+#     torch/_inductor/runtime/cache_dir_utils.py -> os.makedirs(cache_dir)
+#   FileNotFoundError: [Errno  2] No such file or directory:
+#                      '/local/user/1483806040/tmp61l5a74t'
+#     torch/distributed/nn/jit/instantiator.py -> tempfile.TemporaryDirectory()
+#
+# Both the training and the eval job hit it, hence a shared helper.
+#
+# Preference order: $LOCALDIR (BriCS node-local scratch: fastest, scheduler-cleaned),
+# then the inherited $TMPDIR, then a per-job directory on project storage.
+# Writability is PROVEN BY MKDIR rather than tested with `[ -w ]`, because the path
+# that failed did not exist at all -- `[ -w ]` on a missing directory is simply false
+# and would have told us nothing about why.
+#
+# Per-job subdirectory (never a bare shared dir) so two concurrent jobs cannot fight
+# over the same torch.compile / vLLM cache -- the failure mode where one job writes
+# autotune results into another's private tmp and dies with EACCES.
+exp_setup_tmpdir() {
+    local jobid="${SLURM_JOB_ID:-${JOB_ID:-$$}}" candidate try base=""
+    for candidate in "${LOCALDIR:-}" "${TMPDIR:-}" \
+                     "${PROJECTDIR:+$PROJECTDIR/$USER/tmp}"; do
+        [ -n "$candidate" ] || continue
+        try="$candidate/marshal-$jobid"
+        if mkdir -p "$try" 2>/dev/null && [ -w "$try" ]; then
+            base="$try"
+            break
+        fi
+        echo "[tmp] not usable on this node: $candidate" >&2
+    done
+    if [ -z "$base" ]; then
+        echo "ERROR: found no writable temp directory." >&2
+        echo "       Tried \$LOCALDIR, \$TMPDIR and \$PROJECTDIR/\$USER/tmp." >&2
+        echo "       Set TMPDIR=<writable path> and resubmit." >&2
+        return 1
+    fi
+
+    export TMPDIR="$base"
+    export TMP="$base" TEMP="$base"          # some libraries read these instead
+    export TORCHINDUCTOR_CACHE_DIR="$base/inductor"
+    export TRITON_CACHE_DIR="$base/triton"
+    export VLLM_CACHE_ROOT="$base/vllm"
+    mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT"
+
+    # Clean up only what we put on shared storage; node-local scratch is reclaimed by
+    # the scheduler, and a trap cannot fire on SIGKILL anyway.
+    # The path is baked into the trap NOW rather than read from $TMPDIR when it
+    # fires, so a later reassignment of TMPDIR cannot redirect the rm.
+    case "$base" in
+        "${PROJECTDIR:-/dev/null}"/*) trap "rm -rf -- '$base'" EXIT ;;
+    esac
+    echo "[tmp] TMPDIR=$TMPDIR (torch/triton/vLLM caches inside it, per job)"
+}
+
 # Pin torch.distributed / vLLM to a genuinely free port, and say so in the log.
 #
 # THE BUG THIS FIXES (seen on both clusters as, e.g.,

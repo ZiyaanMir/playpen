@@ -29,6 +29,11 @@ exp_banner train
 # comparison wrongly rejected) while still catching a genuine copy.
 exp_activate_venv "$REPO/.venv" "training venv" || exit 1
 
+# Must run BEFORE anything imports torch: the inherited TMPDIR (/local/user/<uid>)
+# is a login-node path that does not exist on the compute node, and torch's inductor
+# cache + tempfile use both blow up at import time. See exp_setup_tmpdir.
+exp_setup_tmpdir || exit 1
+
 export HF_HOME="${HF_HOME:-$PROJECTDIR/hf}"
 export TRL_EXPERIMENTAL_SILENCE=1
 export TOKENIZERS_PARALLELISM=false
