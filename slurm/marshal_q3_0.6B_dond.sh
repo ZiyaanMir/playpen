@@ -19,13 +19,29 @@ source .venv/bin/activate
 export HF_HOME=$PROJECTDIR/hf
 export TRL_EXPERIMENTAL_SILENCE=1
 export TOKENIZERS_PARALLELISM=false
-# Let TRL/vLLM pick a FREE torch.distributed port instead of the hard-coded default
-# 29500. A pre-set MASTER_PORT (from the module env or an earlier srun) is respected
-# by TRL's ensure_master_addr_port, so a stale/zombie process from a killed run -- or
-# a co-located job -- holding 29500 makes vLLM init die with EADDRINUSE. "0" forces a
-# free-port lookup. MASTER_ADDR pinned to loopback clears any inherited value.
+# Pin torch.distributed to an OS-assigned free port so vLLM's init cannot collide
+# with a co-located job or a stale process from a killed run.
+#
+# NOT MASTER_PORT=0: TRL's ensure_master_addr_port treats "0" (and "auto", and unset)
+# as "choose for me" and then walks a FIXED candidate list -- (29500, 23456, 12355,
+# 12345), trl/trainer/utils.py:_find_free_port. That is where the observed
+# "EADDRINUSE port: 23456" comes from: on a shared node every concurrent TRL job
+# walks the same list in the same order and they race for the same ports. A concrete
+# non-zero MASTER_PORT is taken verbatim, so we ask the OS for one instead.
+# Runs after the venv activation above, which this probe needs.
 export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=0
+MASTER_PORT="$(python -c 'import socket
+s = socket.socket()
+s.bind(("", 0))
+print(s.getsockname()[1])
+s.close()' 2>/dev/null)"
+if [ -n "$MASTER_PORT" ]; then
+    export MASTER_PORT
+    echo "[port] MASTER_PORT=$MASTER_PORT (OS-assigned; bypasses TRL's fixed candidate list)"
+else
+    unset MASTER_PORT
+    echo "[port] WARNING: free-port probe failed; TRL will use its collision-prone list." >&2
+fi
 # Reduces allocator fragmentation; suggested by the OOM message itself.
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 

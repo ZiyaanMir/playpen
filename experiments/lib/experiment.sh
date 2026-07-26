@@ -185,6 +185,55 @@ exp_list_checkpoints() {
     done | sort -n -k1,1 | cut -f2-
 }
 
+# Pin torch.distributed / vLLM to a genuinely free port, and say so in the log.
+#
+# THE BUG THIS FIXES (seen on both clusters as, e.g.,
+#   DistNetworkError: ... port: 23456 ... EADDRINUSE ... address already in use
+# raised from vLLM's init_distributed_environment during LLM() construction):
+#
+# TRL picks the port via ensure_master_addr_port -> _find_free_port
+# (trl/trainer/utils.py), which walks a FIXED candidate list -- (29500, 23456,
+# 12355, 12345) -- and only falls back to an OS-assigned port if all four are busy.
+# So 23456 comes from TRL itself, NOT from the cluster's module environment. On a
+# shared GPU node (Eddie hands out one H200 of eight, other users' jobs run
+# alongside) every concurrent TRL job walks that same list in the same order, and
+# _is_port_free binds-then-closes, so two jobs can both see a port free and race to
+# claim it. Collisions are systematic, not unlucky.
+#
+# `MASTER_PORT=0` does NOT avoid this: ensure_master_addr_port treats "0" (and
+# "auto", and unset) as "choose for me" and runs the same candidate walk. Verified
+# against the installed trl 0.29.1 -- with 29500 and 23456 held, MASTER_PORT=0
+# resolved to 12355, i.e. still a fixed candidate.
+#
+# A concrete NON-ZERO MASTER_PORT is taken verbatim, so asking the OS for an
+# ephemeral port here bypasses the candidate list entirely. The probe->export gap
+# leaves a race in principle, but the ephemeral range is ~28k ports wide and the
+# kernel avoids recently-used ones, so it is negligible next to a shared 4-entry list.
+#
+# Requires the training venv to be active (it uses `python`). Returns non-zero and
+# leaves MASTER_PORT alone if the probe fails, so the job still starts -- on TRL's
+# old, collision-prone path, which the warning says out loud.
+exp_export_master_port() {
+    local port
+    port="$(python -c 'import socket
+s = socket.socket()
+s.bind(("", 0))
+print(s.getsockname()[1])
+s.close()' 2>/dev/null)"
+    case "$port" in
+        ''|*[!0-9]*)
+            echo "[port] WARNING: could not probe a free port (is the venv active?)." >&2
+            echo "[port]          Falling back to TRL's fixed candidate list" >&2
+            echo "[port]          (29500, 23456, 12355, 12345) -- the one that collides" >&2
+            echo "[port]          on a shared node. Re-run if this job dies with EADDRINUSE." >&2
+            return 1 ;;
+    esac
+    export MASTER_ADDR=127.0.0.1
+    export MASTER_PORT="$port"
+    echo "[port] MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT" \
+         "(OS-assigned; bypasses TRL's fixed candidate list)"
+}
+
 # True if a directory already holds an lm-eval result file (checked recursively,
 # because lm-eval nests output under a sanitized model-name subdir).
 exp_have_results() {
