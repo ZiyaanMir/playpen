@@ -705,6 +705,56 @@ class TestInstanceIndexing(unittest.TestCase):
             env.reset(len(self.rows))
 
 
+class TestInstanceIsNotMutatedAcrossEpisodes(unittest.TestCase):
+    """A game must never be able to damage the packaged instance it was handed.
+
+    clembench games are written for benchmark runs that play each instance once, so
+    they may keep references into `game_instance` and mutate them. codenames does:
+    `CodenamesBoard.__init__` stores the assignment lists by reference and
+    `reveal_word` calls `.remove(word)` on them. A training loop replays one instance
+    thousands of times, which turned that into permanent corruption -- a 25-word
+    codenames board fell to ~7 words by step 150 of a 500-step run.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from playpen.marshal.selfplay_env import SelfPlayEnv
+
+            cls.env = SelfPlayEnv("taboo")
+        except Exception as e:
+            raise unittest.SkipTest(f"clembench taboo not resolvable: {e}")
+
+    def test_reset_hands_down_a_copy_not_the_cached_row(self):
+        import copy
+
+        row = self.env._instance_rows[0]
+        pristine = copy.deepcopy(row)
+        captured = {}
+
+        real_reset = self.env._pz_env.reset
+
+        def hostile_reset(seed=None, options=None):
+            # Stand in for a game that keeps a reference and mutates it.
+            captured["instance"] = options["game_instance"]
+            for value in options["game_instance"].values():
+                if isinstance(value, list):
+                    value.clear()
+                    break
+            options["experiment"]["__scribbled__"] = True
+
+        self.env._pz_env.reset = hostile_reset
+        try:
+            self.env.reset(0, seed=0)
+        finally:
+            self.env._pz_env.reset = real_reset
+
+        self.assertIsNot(captured["instance"], row["game_instance"],
+                         "reset must not hand the cached row's dict straight to the game")
+        self.assertEqual(row, pristine,
+                         "the cached instance row was mutated by the game")
+
+
 class TestRenderPromptDisablesThinking(unittest.TestCase):
     """Reasoning is disabled at the source, for every model and game."""
 

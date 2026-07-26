@@ -16,6 +16,7 @@ here, so this module is importable without the training stack.
 
 from __future__ import annotations
 
+import copy
 from typing import Callable, Dict, List, Optional
 
 # clemcore is a hard dependency of playpen, so importing at module load is safe.
@@ -122,7 +123,22 @@ class SelfPlayEnv:
     # -- lifecycle ---------------------------------------------------------
 
     def reset(self, instance_idx: int, *, seed: int = 0) -> None:
-        """Reset to the packaged instance at ``instance_idx`` (see ``list_instance_indices``)."""
+        """Reset to the packaged instance at ``instance_idx`` (see ``list_instance_indices``).
+
+        The instance is handed down as a **deep copy**. Games are free to keep references
+        into it and mutate them, because a benchmark run plays each instance exactly once
+        -- codenames does exactly that: ``CodenamesBoard.__init__`` stores
+        ``game_instance["assignments"][...]`` lists by reference and ``reveal_word`` calls
+        ``self.hidden[assignment].remove(word)`` on them. A *training* loop replays one
+        instance thousands of times, so without the copy every episode permanently strips
+        words from the packaged board.
+
+        Measured before this copy existed: a codenames board starts at 25 words and fell
+        to ~7 by step 150 of a 500-step run, at which point the game is degenerate (it
+        ends on or right after the cluegiver's move, so the guesser seat never plays and
+        ~46% of every batch was a placeholder row). The better the policy got, the faster
+        the corruption ran, because a valid clue reveals more words per episode.
+        """
         instance_idx = int(instance_idx)
         if not 0 <= instance_idx < len(self._instance_rows):
             raise IndexError(
@@ -133,8 +149,8 @@ class SelfPlayEnv:
         self._pz_env.reset(
             seed=seed,
             options={
-                "experiment": row["experiment"],
-                "game_instance": row["game_instance"],
+                "experiment": copy.deepcopy(row["experiment"]),
+                "game_instance": copy.deepcopy(row["game_instance"]),
             },
         )
         self._done = False
