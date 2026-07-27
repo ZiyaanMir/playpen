@@ -49,7 +49,17 @@ exp_activate_venv "$VENV_LMEVAL" "lm-eval venv" || exit 1
 exp_setup_tmpdir || exit 1
 
 export HF_HOME="${HF_HOME:-$PROJECTDIR/hf}"
-export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"   # weights pre-cached on the login node
+# Isambard compute nodes DO have outbound access (ISAMBARD_GUIDE.md §8 describes HF
+# rate-limiting over a shared outbound IP, and documents `srun ... uv pip install`),
+# so we do NOT force offline mode here. Forcing it was the bug: the model weights
+# were cached but the task DATASETS were not, and lm-eval died on every checkpoint
+# with
+#   ConnectionError: Couldn't reach 'logicreasoning/logi_glue' (OfflineModeIsEnabled)
+# Leaving this at 0 lets the first run fetch the datasets into $HF_HOME; later runs
+# hit that cache. Prefetch them on a login node with
+# experiments/lib/prefetch_eval_data.sh to avoid the shared-IP rate limit mid-job,
+# then set HF_HUB_OFFLINE=1 if you want a guaranteed-network-free run.
+export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
 export TOKENIZERS_PARALLELISM=false
 mkdir -p "$HF_HOME" "$EVAL_DIR"
 
@@ -68,6 +78,37 @@ echo "[eval] run dir = $RUN_DIR"
 
 mapfile -t CHECKPOINTS < <(exp_list_checkpoints "$RUN_DIR")
 echo "[eval] ${#CHECKPOINTS[@]} checkpoint(s) to score"
+
+# Pre-flight: resolve the task data ONCE, with no model and no GPU work. A missing or
+# unreachable dataset then fails here in seconds instead of after loading Qwen3-4B for
+# every checkpoint in turn -- the "8 evaluation(s) FAILED" loop that made a dataset
+# problem look like an evaluation problem.
+python - "$EVAL_TASKS" <<'PY'
+import sys
+tasks = [t for t in sys.argv[1].split(",") if t]
+try:
+    from lm_eval.tasks import TaskManager
+    loader = getattr(TaskManager(), "load", None)
+except Exception:
+    loader = None
+if loader is None:               # older/newer lm-eval without this API
+    print("[eval] task pre-flight unavailable on this lm-eval; skipping")
+    sys.exit(0)
+try:
+    loader(tasks)
+except Exception as exc:
+    print("[eval] task data NOT available: %s: %s" % (type(exc).__name__, exc))
+    sys.exit(3)
+print("[eval] task data OK: %s" % ", ".join(tasks))
+PY
+case $? in
+    0) ;;
+    3) echo "ERROR: the task datasets for '$EVAL_TASKS' could not be loaded." >&2
+       echo "       Nothing was evaluated -- fix the data, then re-run eval only:" >&2
+       echo "         experiments/lib/prefetch_eval_data.sh '$EVAL_TASKS'   # on a LOGIN node" >&2
+       echo "         experiments/isambard/run_eval.sh '$EXP_DIR'" >&2
+       exit 1 ;;
+esac
 
 # EVAL_BATCH defaults to 16 from the preset; a ~96 GB GH200 comfortably takes more
 # for loglikelihood tasks. Raise with EVAL_BATCH=32 at submit time.
