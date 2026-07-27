@@ -236,6 +236,14 @@ class SeatRollout:
     ``owner_mask`` / ``env_mask`` are the same thing (1 = model token, 0 =
     environment token); the name ``env_mask`` is what TRL expects as an extra
     field, ``owner_mask`` is what the advantage code reads.
+
+    ``drifted`` distinguishes the two reasons a row can arrive training-inert:
+    the seat never got a usable turn (the game ended first), or its row failed
+    :meth:`_SeatBuilder.sync_context` and was dropped. Both look identical
+    downstream -- ``owner_mask == [0]``, no gradient, excluded from the advantage
+    pools -- so without this flag a rising drift rate is indistinguishable from a
+    game that simply ends early, and censoring is silent. The trainer turns it
+    into the ``marshal/rows/drift_*`` metrics.
     """
 
     seat: int
@@ -246,6 +254,7 @@ class SeatRollout:
     turn_end_positions: List[int] = field(default_factory=list)
     turn_rewards: List[float] = field(default_factory=list)
     terminal_reward: float = 0.0
+    drifted: bool = False
 
     @property
     def has_model_tokens(self) -> bool:
@@ -527,5 +536,9 @@ def play_selfplay_episode(
                 turn_end_positions=[],
                 turn_rewards=[],
                 terminal_reward=float(final_cum[seat]),
+                # Only drift is a *censoring* event -- this seat played and its data
+                # was thrown away. A seat that never moved is not censored, so the
+                # two must not share a counter.
+                drifted=bool(builder.invalid),
             )
     return rollouts

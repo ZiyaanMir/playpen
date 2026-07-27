@@ -21,6 +21,7 @@ importable without it.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from typing import Any, Callable, Dict, List, Optional
@@ -37,6 +38,8 @@ from playpen.marshal.advantage import (
 from playpen.marshal.config import MarshalConfig
 from playpen.marshal.selfplay_agent import play_selfplay_episode
 from playpen.marshal.selfplay_env import SelfPlayEnv, list_instance_indices
+
+logger = logging.getLogger(__name__)
 
 
 def parse_prompt(prompt: str) -> tuple[int, Optional[int]]:
@@ -207,6 +210,7 @@ def build_selfplay_rollout_func(
             "turn_rewards": [],
             "seat": [],
             "rewards": [],
+            "drifted": [],
         }
 
         def play(instance_idx: int):
@@ -254,6 +258,7 @@ def build_selfplay_rollout_func(
             out["turn_rewards"].append(list(row.turn_rewards))
             out["seat"].append(int(row.seat))
             out["rewards"].append(float(row.terminal_reward))
+            out["drifted"].append(bool(getattr(row, "drifted", False)))
         return out
 
     return rollout_func
@@ -306,10 +311,104 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         # is 0 in that case, so clamping the normalizer keeps the loss at 0.
         if "num_items_in_batch" in output:
             output["num_items_in_batch"] = torch.clamp(output["num_items_in_batch"], min=1)
+        # Health metrics are logged on BOTH paths: a censored row and a collapsed
+        # importance-sampling ratio harm the plain-GRPO baseline exactly as much as
+        # they harm the MARSHAL path, so gating them on `enabled` would hide the two
+        # failures most likely to be mistaken for "the model just isn't learning".
+        self._log_rollout_health(inputs, output)
         if not self.marshal_config.enabled:
             return output
         output["advantages"] = self._compute_marshal_advantages(inputs, output)
         return output
+
+    # Warn once per process, not once per step: at 700 steps a per-step warning is
+    # noise that gets scrolled past, which is how the original failure survived a
+    # 500-step run.
+    _WARNED_IS_COLLAPSE = False
+    _WARNED_DRIFT = False
+
+    # Below this mean vLLM importance-sampling ratio, the loss is being scaled down
+    # by more than 10x and the run is not really training. Chosen well under the
+    # healthy range measured on working runs (0.59-0.96) and well above the broken
+    # one (5e-8), so it fires on the failure and never on a good run.
+    IS_RATIO_WARN_THRESHOLD = 0.1
+
+    def _log_rollout_health(self, inputs, output) -> None:
+        """Log row-censoring and importance-sampling health, and shout when either fails.
+
+        Two *different* ways a step can produce no useful gradient, which look the
+        same from the outside (flat reward, tiny grad_norm) and so must be
+        distinguished at the source:
+
+        * **Row censoring** -- ``_SeatBuilder.sync_context`` could not prove a row's
+          owner mask, so the row was dropped and replaced by an inert placeholder
+          (``selfplay_agent.SeatRollout.drifted``). Gradient is lost for those rows
+          only, and silently: they still occupy a slot in the batch.
+        * **Importance-sampling collapse** -- the row survived intact, but the token
+          sequence the loss scores is not the one vLLM sampled, so TRL's correction
+          multiplies the whole row's loss by ``exp(sum of the per-token log-prob
+          divergence)``. Every row is scaled down at once, including uncensored ones.
+
+        The second is NOT detected by the drift counter and cannot be: drift is about
+        whether the mask is *provable*, IS collapse is about whether the context is
+        *identical*, and a row can be perfectly provable and still wrong (that is
+        exactly what ``row_context_mode="spliced"`` produced). TRL already computes
+        the ratio; what it does not do is complain, so we read its tensor back out of
+        ``output`` and threshold it.
+        """
+        try:
+            metrics = self._metrics["train"]
+
+            drifted = [bool(inp.get("drifted", False)) for inp in inputs]
+            owner_masks = [inp.get("owner_mask", []) for inp in inputs]
+            inert = [not any(m == 1 for m in mask) for mask in owner_masks]
+            n = len(inputs)
+            if n:
+                metrics["marshal/rows/drift_count"].append(float(sum(drifted)))
+                metrics["marshal/rows/drift_rate"].append(sum(drifted) / n)
+                # Inert-but-not-drifted == a seat that never got a turn. Separating
+                # the two is the point; a game that ends early is not censoring.
+                metrics["marshal/rows/placeholder_rate"].append(sum(inert) / n)
+                metrics["marshal/rows/idle_seat_rate"].append(
+                    sum(1 for i, d in zip(inert, drifted) if i and not d) / n
+                )
+            if any(drifted) and not MarshalGRPOTrainer._WARNED_DRIFT:
+                MarshalGRPOTrainer._WARNED_DRIFT = True
+                logger.warning(
+                    "MARSHAL: %d/%d rows dropped for re-tokenization drift this step. "
+                    "Those rows carry no gradient and are excluded from the advantage "
+                    "pools, so the batch is smaller than it looks. Watch "
+                    "marshal/rows/drift_rate -- a rate that grows with training means "
+                    "the policy is drifting toward generations that do not round-trip.",
+                    sum(drifted),
+                    n,
+                )
+
+            ratio = output.get("importance_sampling_ratio")
+            if ratio is not None and ratio.numel():
+                mean_ratio = ratio.float().mean().item()
+                metrics["marshal/is_ratio/mean"].append(mean_ratio)
+                if (
+                    mean_ratio < self.IS_RATIO_WARN_THRESHOLD
+                    and not MarshalGRPOTrainer._WARNED_IS_COLLAPSE
+                ):
+                    MarshalGRPOTrainer._WARNED_IS_COLLAPSE = True
+                    logger.warning(
+                        "MARSHAL: mean vLLM importance-sampling ratio is %.3g (< %.3g). "
+                        "The policy loss is being scaled down by ~%.0fx, so grad_norm "
+                        "will be near zero and the run will not learn -- this is NOT a "
+                        "reward or advantage problem. It means the trained token "
+                        "sequence differs from the one vLLM sampled: check "
+                        "row_context_mode='exact' and that the tokenizer's chat "
+                        "template round-trips. See sampling/sampling_logp_difference/mean "
+                        "(healthy is ~0.03 nats/token; ~0.6 indicates a broken context).",
+                        mean_ratio,
+                        self.IS_RATIO_WARN_THRESHOLD,
+                        1.0 / max(mean_ratio, 1e-12),
+                    )
+        except Exception:
+            # Metrics logging must never break training.
+            pass
 
     def _compute_marshal_advantages(self, inputs, output) -> torch.Tensor:
         cfg = self.marshal_config
