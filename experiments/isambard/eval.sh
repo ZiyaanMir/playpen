@@ -14,7 +14,7 @@
 #SBATCH --job-name=marshal_eval
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --time=02:00:00
+#SBATCH --time=05:00:00
 #SBATCH --no-requeue
 
 set -euo pipefail
