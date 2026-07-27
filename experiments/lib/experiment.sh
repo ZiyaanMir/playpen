@@ -292,48 +292,38 @@ exp_activate_venv() {
     echo "[venv] $label: $got"
 }
 
-# Point TMPDIR -- and the torch/triton/vLLM caches that derive from it -- at a
-# directory that actually exists and is writable ON THIS NODE.
+# Put TMPDIR -- and every torch/triton/vLLM cache that derives from it -- on project
+# storage, inside this experiment's own directory.
 #
-# THE BUG THIS FIXES. The job inherits TMPDIR=/local/user/<uid> from the submitting
-# environment (sbatch --export=ALL copies the login node's env). That path is
-# NODE-LOCAL: it is real on the login node, but on a compute node /local/user is not
-# writable by the user and the per-uid directory does not exist. Anything wanting
-# scratch space then dies during `import torch`, before a line of our code runs:
+# THE BUG THIS FIXES. Jobs inherit TMPDIR=/local/user/<uid> (sbatch --export=ALL
+# copies the login node's environment). On Isambard that path is worse than merely
+# wrong: it is TRANSIENT. Observed across two attempts on the same path:
 #
 #   PermissionError:   [Errno 13] Permission denied: '/local/user/1483806040'
-#     torch/_inductor/runtime/cache_dir_utils.py -> os.makedirs(cache_dir)
+#     -- the directory did not exist and could not be created
 #   FileNotFoundError: [Errno  2] No such file or directory:
-#                      '/local/user/1483806040/tmp61l5a74t'
-#     torch/distributed/nn/jit/instantiator.py -> tempfile.TemporaryDirectory()
+#                      '/local/user/1483806040/marshal-5789516/tmpids8ymd0'
+#     -- our own mkdir HAD succeeded; the directory then vanished before python ran
 #
-# Both the training and the eval job hit it, hence a shared helper.
+# Both crash during `import torch`, before a line of our code runs (inductor's
+# cache_dir() does os.makedirs; torch.distributed's instantiator opens a
+# TemporaryDirectory). Both the training and the eval job hit it.
 #
-# Preference order: $LOCALDIR (BriCS node-local scratch: fastest, scheduler-cleaned),
-# then the inherited $TMPDIR, then a per-job directory on project storage.
-# Writability is PROVEN BY MKDIR rather than tested with `[ -w ]`, because the path
-# that failed did not exist at all -- `[ -w ]` on a missing directory is simply false
-# and would have told us nothing about why.
+# So we do NOT probe /local, and do NOT trust the inherited TMPDIR: creating a
+# directory there and checking it is writable proves nothing, because it can
+# disappear underneath us a second later. $EXP_DIR is on Lustre project storage,
+# already exists (the submitter made it), and lives as long as the experiment.
+# Slower than node-local SSD for compile caches, which is a fair price for a job
+# that actually starts.
 #
-# Per-job subdirectory (never a bare shared dir) so two concurrent jobs cannot fight
-# over the same torch.compile / vLLM cache -- the failure mode where one job writes
-# autotune results into another's private tmp and dies with EACCES.
+# Kept under $EXP_DIR/tmp rather than a shared directory so concurrent jobs cannot
+# fight over one torch.compile / vLLM cache, and so anything left behind is obvious
+# and belongs to a known experiment.
 exp_setup_tmpdir() {
-    local jobid="${SLURM_JOB_ID:-${JOB_ID:-$$}}" candidate try base=""
-    for candidate in "${LOCALDIR:-}" "${TMPDIR:-}" \
-                     "${PROJECTDIR:+$PROJECTDIR/$USER/tmp}"; do
-        [ -n "$candidate" ] || continue
-        try="$candidate/marshal-$jobid"
-        if mkdir -p "$try" 2>/dev/null && [ -w "$try" ]; then
-            base="$try"
-            break
-        fi
-        echo "[tmp] not usable on this node: $candidate" >&2
-    done
-    if [ -z "$base" ]; then
-        echo "ERROR: found no writable temp directory." >&2
-        echo "       Tried \$LOCALDIR, \$TMPDIR and \$PROJECTDIR/\$USER/tmp." >&2
-        echo "       Set TMPDIR=<writable path> and resubmit." >&2
+    local base="${EXP_DIR:?exp_setup_tmpdir needs EXP_DIR}/tmp"
+    if ! mkdir -p "$base" 2>/dev/null || [ ! -w "$base" ]; then
+        echo "ERROR: cannot create a temp directory at $base" >&2
+        echo "       \$EXP_DIR must be writable -- check project storage quota." >&2
         return 1
     fi
 
@@ -344,14 +334,13 @@ exp_setup_tmpdir() {
     export VLLM_CACHE_ROOT="$base/vllm"
     mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT"
 
-    # Clean up only what we put on shared storage; node-local scratch is reclaimed by
-    # the scheduler, and a trap cannot fire on SIGKILL anyway.
-    # The path is baked into the trap NOW rather than read from $TMPDIR when it
-    # fires, so a later reassignment of TMPDIR cannot redirect the rm.
-    case "$base" in
-        "${PROJECTDIR:-/dev/null}"/*) trap "rm -rf -- '$base'" EXIT ;;
-    esac
-    echo "[tmp] TMPDIR=$TMPDIR (torch/triton/vLLM caches inside it, per job)"
+    # Remove it on the way out so compile caches don't bloat the experiment directory
+    # or get rsync'd home. The path is baked into the trap NOW rather than read from
+    # $TMPDIR when it fires, so a later reassignment cannot redirect the rm. A SIGKILL
+    # (walltime) skips the trap and leaves $EXP_DIR/tmp behind -- harmless, and
+    # obviously attributable to that experiment.
+    trap "rm -rf -- '$base'" EXIT
+    echo "[tmp] TMPDIR=$TMPDIR (torch/triton/vLLM caches inside it)"
 }
 
 # Pin torch.distributed / vLLM to a genuinely free port, and say so in the log.

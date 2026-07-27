@@ -5,7 +5,7 @@
 #SBATCH --job-name=marshal_train
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --time=05:00:00
+#SBATCH --time=07:00:00
 #SBATCH --no-requeue
 #
 # --time stays under the 24 h cap with margin, and Slurm reserves credits against
