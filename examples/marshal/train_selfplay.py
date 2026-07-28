@@ -43,8 +43,94 @@ import dataclasses
 import os
 from datetime import datetime
 
+# Safe at module scope: playpen.marshal.config is deliberately stdlib + PyYAML only
+# (no torch/trl/vllm), so importing it costs nothing and keeps --help working. The
+# tuples below feed argparse `choices=`, so the accepted values can never drift from
+# what MarshalConfig actually validates.
+from playpen.marshal.config import (
+    ADVANTAGE_NORM_MODES,
+    EPISODE_PAIRING_MODES,
+    FIDELITY_MODES,
+    ROW_CONTEXT_MODES,
+)
+
 # Custom rollout_func + experimental openenv utils emit warnings; silence unless debugging.
 os.environ.setdefault("TRL_EXPERIMENTAL_SILENCE", "1")
+
+# Every MarshalConfig field settable from the CLI, EXCEPT `enabled`, which keeps its
+# historical --marshal/--no-marshal spelling. Each name here is both the argparse dest
+# and the dataclass field, so the merge in main() is a single dataclasses.replace and
+# a new config field cannot be added without also being wired up here.
+MARSHAL_CLI_FIELDS = (
+    "agent_specific_normalization",
+    "turn_level_rewards",
+    "advantage_norm_mode",
+    "gamma",
+    "fidelity_mode",
+    "whiten_rewards",
+    "whiten_advantages",
+    "row_context_mode",
+    "episode_pairing",
+    "dr_grpo",
+    "length_penalty",
+    "length_penalty_coef",
+    "length_penalty_bonus",
+    "length_penalty_min_len",
+    "length_penalty_max_len",
+    "length_penalty_offset",
+    "sampling_top_p",
+    "sampling_top_k",
+)
+
+
+def resolve_marshal_config(args, config_path=None):
+    """Load the YAML and apply every CLI flag that was actually passed.
+
+    Module-level rather than inline in :func:`main` so the precedence rules are
+    testable without loading a model. Returns ``(config, overrides)``; ``overrides`` is
+    what came from the CLI, for logging.
+
+    Precedence, lowest to highest: dataclass defaults, the YAML, then any flag actually
+    passed. A flag left off is ``None`` and changes nothing.
+
+    All fields go through ONE ``dataclasses.replace`` so ``__post_init__`` re-validates
+    the MERGED result -- the max_len > min_len check, the enum checks, the top_p range --
+    rather than only the values that came from the file. (Assigning to attributes
+    instead, as this used to do for ``enabled``/``dr_grpo``, silently skips that.)
+    """
+    from playpen.marshal.config import MarshalConfig
+
+    cfg = MarshalConfig.from_yaml(config_path or args.marshal_config)
+    overrides = {
+        name: getattr(args, name)
+        for name in MARSHAL_CLI_FIELDS
+        if getattr(args, name, None) is not None
+    }
+    # `enabled` keeps its historical --marshal/--no-marshal spelling.
+    if getattr(args, "marshal", None) is not None:
+        overrides["enabled"] = args.marshal
+    # --no-sampling-truncation is a convenience spelling for "both neutral". setdefault,
+    # not assignment, so an explicit --sampling-top-p/--sampling-top-k still wins if both
+    # are passed -- consistent with every other flag here, where what you typed applies.
+    if getattr(args, "no_sampling_truncation", False):
+        overrides.setdefault("sampling_top_p", 1.0)
+        overrides.setdefault("sampling_top_k", 0)
+    if overrides:
+        cfg = dataclasses.replace(cfg, **overrides)
+    return cfg, overrides
+
+
+def _add_bool_override(parser, name, help_on):
+    """Add a ``--name`` / ``--no-name`` pair that defaults to None.
+
+    None (rather than False) is what makes "flag not passed" distinguishable from
+    "flag passed as off" -- only the former leaves the YAML value alone.
+    """
+    dest = name.replace("-", "_")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(f"--{name}", dest=dest, action="store_true", default=None, help=help_on)
+    group.add_argument(f"--no-{name}", dest=dest, action="store_false",
+                       help=f"Force {dest} OFF (overrides the YAML).")
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,6 +158,39 @@ def parse_args() -> argparse.Namespace:
                         help="Force Dr. GRPO ON (overrides the YAML 'dr_grpo').")
     drgrpo.add_argument("--no-dr-grpo", dest="dr_grpo", action="store_false",
                         help="Force Dr. GRPO OFF (TRL default loss/scaling).")
+
+    # --- the rest of the MARSHAL algorithm config ----------------------------------
+    # Every remaining MarshalConfig field, so a cluster sweep can vary any of them
+    # without editing the YAML. Omitting a flag leaves the YAML value untouched.
+    _add_bool_override(
+        p, "agent-specific-normalization",
+        "Pool/normalize advantages PER SEAT (MARSHAL's headline contribution). "
+        "--no-... keeps turn-level credit but pools batch-wide (ablation).")
+    _add_bool_override(
+        p, "turn-level-rewards",
+        "Keep each turn's reward at its own turn boundary (turn-level estimator). "
+        "--no-... sums a seat's turn rewards into one terminal scalar.")
+    _add_bool_override(
+        p, "whiten-rewards",
+        "Z-score the token-level reward field batch-wide BEFORE the cumulative sum "
+        "(ROLL's whiten_rewards).")
+    _add_bool_override(
+        p, "whiten-advantages",
+        "Z-score the final advantages batch-wide AFTER per-seat normalization "
+        "(ROLL's whiten_advantages).")
+    p.add_argument("--advantage-norm-mode", choices=ADVANTAGE_NORM_MODES, default=None,
+                   help="'mean' mean-centers each pool; 'mean_std' z-scores it. Note "
+                        "--dr-grpo realigns 'mean_std' back to 'mean'.")
+    p.add_argument("--gamma", type=float, default=None,
+                   help="Discount for the backward cumulative return. MARSHAL uses 1.0.")
+    p.add_argument("--fidelity-mode", choices=FIDELITY_MODES, default=None,
+                   help="'paper_correct' = the algorithm the paper describes; "
+                        "'marshal_exact' = MARSHAL's shipped code, incl. its distinct-value "
+                        "pooling and pre-sum reward normalization.")
+    p.add_argument("--row-context-mode", choices=ROW_CONTEXT_MODES, default=None,
+                   help="How a seat's row context is assembled.")
+    p.add_argument("--episode-pairing", choices=EPISODE_PAIRING_MODES, default=None,
+                   help="How the two seats of an episode are paired into rollout rows.")
 
     # Length penalty (MARSHAL's compute_length_penalty; overrides the YAML fields).
     # Off by default, which is also the MARSHAL-faithful setting: MARSHAL applies this
@@ -101,6 +220,25 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--length-penalty-offset", type=float, default=None,
                    help="Vertical offset of the raw term (MARSHAL's 'coef', ships 1.0). "
                         "Prefer changing --length-penalty-max-len instead.")
+
+    # Sampling-tail truncation (maps onto GRPOConfig.top_p / top_k; overrides the YAML).
+    # Applies on both the MARSHAL path and the --no-marshal baseline, because it
+    # configures generation rather than the advantage math. Defaults on (0.95 / 50):
+    # untruncated sampling from a low-entropy policy occasionally draws a far-tail
+    # token whose log-prob vLLM and the trainer disagree about by many nats, which
+    # sequence-level importance sampling then turns into a dead row.
+    p.add_argument("--sampling-top-p", type=float, default=None,
+                   help="Nucleus cutoff for generation (YAML 'sampling_top_p', ships "
+                        "0.95). 1.0 disables nucleus truncation, i.e. TRL's default.")
+    p.add_argument("--sampling-top-k", type=int, default=None,
+                   help="Top-k cutoff for generation (YAML 'sampling_top_k', ships 50). "
+                        "0 disables top-k truncation, i.e. TRL's default.")
+    p.add_argument("--no-sampling-truncation", dest="no_sampling_truncation",
+                   action="store_true",
+                   help="Revert to TRL's untruncated sampling (top_p=1.0, top_k=0). "
+                        "Use to reproduce a pre-2026-07-28 run; note that with "
+                        "--kl-beta 0 this is what lets the importance-sampling ratio "
+                        "decay as the policy's entropy collapses.")
 
     # LoRA (always applied)
     p.add_argument("--lora-r", type=int, default=16)
@@ -313,32 +451,20 @@ def main() -> None:
     )
     from playpen.marshal import wandb_utils
 
-    # 1. MARSHAL switch (YAML is the source of truth; --marshal/--no-marshal overrides 'enabled').
-    marshal_config = MarshalConfig.from_yaml(args.marshal_config)
-    if args.marshal is not None:
-        marshal_config.enabled = args.marshal
-    # Dr. GRPO switch (YAML source of truth; --dr-grpo/--no-dr-grpo overrides). Reconcile
-    # aligns advantage_norm_mode 'mean_std' -> 'mean' when dr_grpo is on (keeps per-seat
-    # pooling; drops only the std divisor Dr. GRPO removes). No-op when dr_grpo is off.
-    if args.dr_grpo is not None:
-        marshal_config.dr_grpo = args.dr_grpo
-    # Length penalty (YAML source of truth; CLI overrides any field that was passed).
-    # Re-run __post_init__ via dataclasses.replace so the max_len > min_len check
-    # applies to the merged values, not just the ones that came from the YAML.
-    lp_overrides = {
-        name: getattr(args, name)
-        for name in (
-            "length_penalty",
-            "length_penalty_coef",
-            "length_penalty_bonus",
-            "length_penalty_min_len",
-            "length_penalty_max_len",
-            "length_penalty_offset",
-        )
-        if getattr(args, name) is not None
-    }
-    if lp_overrides:
-        marshal_config = dataclasses.replace(marshal_config, **lp_overrides)
+    # 1. MARSHAL config: the YAML is the source of truth, and any CLI flag that was
+    #    actually passed overrides it. A flag left off is None, so it changes nothing.
+    #
+    #    All fields go through ONE dataclasses.replace so __post_init__ re-validates the
+    #    MERGED result -- e.g. the max_len > min_len check, and the enum checks -- rather
+    #    than only the values that came from the file. (Assigning to attributes instead,
+    #    as this used to do for `enabled`/`dr_grpo`, silently skips that validation.)
+    marshal_config, overrides = resolve_marshal_config(args)
+    if overrides:
+        print(f"[marshal] CLI overrides: "
+              + " ".join(f"{k}={v}" for k, v in sorted(overrides.items())))
+    # Reconcile aligns advantage_norm_mode 'mean_std' -> 'mean' when dr_grpo is on (keeps
+    # per-seat pooling; drops only the std divisor Dr. GRPO removes). Must run AFTER the
+    # merge so it sees the final values. No-op when dr_grpo is off.
     for notice in marshal_config.reconcile_for_dr_grpo():
         print(f"[dr_grpo] {notice}")
     print(f"[marshal] enabled={marshal_config.enabled} "
@@ -350,6 +476,17 @@ def main() -> None:
           f"whiten_advantages={marshal_config.whiten_advantages} "
           f"row_context_mode={marshal_config.row_context_mode} "
           f"episode_pairing={marshal_config.episode_pairing}")
+    _sampling = marshal_config.trl_sampling_overrides()
+    print(f"[sampling] top_p={marshal_config.sampling_top_p} "
+          f"top_k={marshal_config.sampling_top_k}"
+          + (f" -> GRPOConfig{_sampling}" if _sampling
+             else " (untruncated: TRL defaults, no key set)"))
+    if not _sampling:
+        print("[sampling] NOTE: full-vocabulary sampling. With --kl-beta 0 the policy's "
+              "entropy collapses over training and rare far-tail draws make vLLM and the "
+              "trainer disagree by many nats on single tokens, which sequence-level "
+              "importance sampling turns into dead rows. Watch "
+              "sampling/importance_sampling_ratio/min and marshal/is_ratio/mean.")
     if marshal_config.row_context_mode != "exact":
         print("[marshal] WARNING: row_context_mode='spliced' reproduces the pre-fix "
               "rollout assembly, where the trained token sequence is not the sequence "
@@ -463,6 +600,10 @@ def main() -> None:
         # Dr. GRPO recipe (loss_type + scale_rewards) when enabled; empty dict = no
         # change, so with dr_grpo off this call is identical to before the flag existed.
         **marshal_config.trl_grpo_overrides(),
+        # Sampling-tail truncation (top_p / top_k). Same contract: an empty dict when
+        # both are neutral, so --no-sampling-truncation reproduces the old GRPOConfig
+        # exactly rather than passing top_p=1.0/top_k=0 explicitly.
+        **marshal_config.trl_sampling_overrides(),
     )
     modules_to_save = [m.strip() for m in args.lora_modules_to_save.split(",") if m.strip()] or None
     peft_config = LoraConfig(

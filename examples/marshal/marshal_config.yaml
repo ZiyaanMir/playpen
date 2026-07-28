@@ -62,6 +62,39 @@ row_context_mode: exact
 #           different games.
 episode_pairing: shared
 
+# Sampling-tail truncation, mapped onto TRL's GRPOConfig.top_p / top_k. Like dr_grpo
+# and row_context_mode, this applies REGARDLESS of `enabled` -- it configures
+# generation, which the MARSHAL path and the plain-GRPO baseline share.
+# CLI: --sampling-top-p / --sampling-top-k, or --no-sampling-truncation to revert.
+#
+# WHY THESE ARE NOT TRL's DEFAULTS (1.0 / 0 = untruncated). With kl_beta 0 the policy's
+# entropy collapses as it learns -- measured 0.091 -> 0.029 nats on guesswhat/Qwen3-4B
+# over 700 steps. Sampling at temperature 1.0 over the FULL vocabulary then occasionally
+# draws a far-tail token, and down there log p is so sensitive to a small bf16 logit
+# difference that vLLM and the training model disagree by many nats on that single token
+# (observed max 16.0). TRL's vllm_importance_sampling_mode defaults to "sequence_mask",
+# which SUMS the per-token divergence over the row and exponentiates it -- so one tail
+# token annihilates the whole row: the worst row's ratio hit 1.6e-14, and 0.0 outright
+# (float underflow, not the >3.0 cap -- that never fired), while grad_norm decayed 7.7x.
+# Across 5 runs / 350 logged steps, corr(1/entropy, logp-divergence) = +0.90.
+#
+# This does NOT bias the importance ratio. vLLM computes the logprobs it reports from the
+# raw logits BEFORE applying top-p/top-k (vllm/v1/sample/sampler.py:74-86; logprobs_mode
+# defaults to "raw_logprobs"), so both sides of the ratio remain full-distribution
+# quantities -- only the sampled support narrows.
+#
+# Both are set because they fail differently on a collapsed policy: at a
+# near-deterministic position top_p keeps only the argmax (correct -- there is no real
+# choice there) while top_k still admits ranks 2..50; at a genuinely uncertain position
+# top_k bounds the support where top_p may keep a long tail.
+#
+# This is a MITIGATION. The root cause is training without a KL term, which MARSHAL's own
+# shipped *_selfplay.yaml never does (use_kl_loss: true, kl_loss_coef: 0.20).
+# Set 1.0 / 0 (or pass --no-sampling-truncation) to reproduce pre-2026-07-28 generation:
+# no key is then added to GRPOConfig at all.
+sampling_top_p: 0.95
+sampling_top_k: 50
+
 # "paper_correct" (default): the algorithm the MARSHAL paper describes.
 # "marshal_exact": bit-comparable reproduction of MARSHAL's shipped code,
 #   including its two documented departures from its own paper (a biasing pre-sum

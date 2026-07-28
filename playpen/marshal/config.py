@@ -190,6 +190,48 @@ class MarshalConfig:
             episodes. When a run cannot be paired (odd ``num_generations``, or a
             multi-process split that straddles a prompt's copies) that index silently
             falls back to ``"replay"`` behavior rather than failing.
+        sampling_top_p: Nucleus cutoff for generation, mapped onto ``GRPOConfig.top_p``.
+            ``1.0`` disables it (TRL's default). Like ``dr_grpo``, this applies
+            *regardless of* ``enabled`` -- it configures generation, which the MARSHAL
+            path and the plain-GRPO baseline share.
+
+            Default ``0.95``, which is a change from TRL's untruncated default, for a
+            measured reason. With ``KL_BETA=0`` the policy's entropy collapses over
+            training (0.091 -> 0.029 nats on guesswhat/Qwen3-4B by step 700). At
+            ``top_p=1.0``/``top_k=0`` the sampler still draws from the *whole* vocabulary,
+            so it occasionally emits a far-tail token. Down there ``log p`` is enormously
+            sensitive to a small bf16 logit difference, and vLLM and the training model
+            disagree by many nats on that one token (observed max 16.0). Because TRL's
+            ``vllm_importance_sampling_mode`` defaults to ``"sequence_mask"``, that
+            per-token divergence is *summed* over the row and exponentiated, so a single
+            tail token annihilates the whole row's gradient: the worst row's ratio fell
+            to 1.6e-14 (and to exactly 0 -- float underflow, not the ``>3.0`` cap, which
+            never fired) while grad_norm decayed 7.7x over the run.
+
+            Truncating the tail removes those draws. It does **not** bias the importance
+            ratio: vLLM computes reported logprobs from the raw logits *before* applying
+            top-p/top-k (``vllm/v1/sample/sampler.py:74-86``, ``logprobs_mode`` defaults
+            to ``"raw_logprobs"``), so both sides of the ratio stay full-distribution
+            quantities and only the *sampled* support narrows.
+
+            This is a mitigation, not the cure -- the root cause is running without a KL
+            term, which MARSHAL's own shipped ``*_selfplay.yaml`` never does
+            (``use_kl_loss: true``, ``kl_loss_coef: 0.20``).
+        sampling_top_k: Top-k cutoff for generation, mapped onto ``GRPOConfig.top_k``.
+            ``0`` disables it (TRL's default). Default ``50``.
+
+            Kept alongside ``sampling_top_p`` because the two fail differently on a
+            collapsed policy. At a near-deterministic position (top token p ~ 0.998, which
+            is what a mean entropy of 0.029 nats implies) ``top_p=0.95`` keeps only the
+            argmax -- correct here, since that position carries no real choice -- whereas
+            ``top_k=50`` still admits ranks 2..50. Conversely at a genuinely uncertain
+            position ``top_k`` bounds the support where ``top_p`` may keep a long tail.
+            Applying both bounds the tail at every position.
+
+            Set both to their neutral values (``sampling_top_p: 1.0``,
+            ``sampling_top_k: 0``), or pass ``--no-sampling-truncation``, to reproduce
+            pre-2026-07-28 generation exactly: :meth:`trl_sampling_overrides` then returns
+            an empty dict and no key is added to ``GRPOConfig``.
     """
 
     enabled: bool = True
@@ -209,6 +251,8 @@ class MarshalConfig:
     length_penalty_offset: float = 1.0
     row_context_mode: str = "exact"
     episode_pairing: str = "shared"
+    sampling_top_p: float = 0.95
+    sampling_top_k: int = 50
 
     def __post_init__(self) -> None:
         if self.advantage_norm_mode not in ADVANTAGE_NORM_MODES:
@@ -229,6 +273,21 @@ class MarshalConfig:
             raise ValueError(
                 f"episode_pairing must be one of {EPISODE_PAIRING_MODES}, "
                 f"got {self.episode_pairing!r}"
+            )
+        self.sampling_top_p = float(self.sampling_top_p)
+        self.sampling_top_k = int(self.sampling_top_k)
+        # vLLM reads top_p as a probability mass and top_k as a count. Out-of-range
+        # values are accepted silently there and quietly change (or disable) the
+        # truncation, so reject them here where the message can say what was meant.
+        if not 0.0 < self.sampling_top_p <= 1.0:
+            raise ValueError(
+                f"sampling_top_p must be in (0.0, 1.0], got {self.sampling_top_p}. "
+                "Use 1.0 to disable nucleus truncation."
+            )
+        if self.sampling_top_k < 0:
+            raise ValueError(
+                f"sampling_top_k must be >= 0, got {self.sampling_top_k}. "
+                "Use 0 to disable top-k truncation."
             )
         self.gamma = float(self.gamma)
         self.length_penalty_coef = float(self.length_penalty_coef)
@@ -281,6 +340,35 @@ class MarshalConfig:
         if not self.dr_grpo:
             return {}
         return {"loss_type": "dr_grpo", "scale_rewards": "none"}
+
+    def trl_sampling_overrides(self) -> Dict[str, Any]:
+        """TRL ``GRPOConfig`` kwargs for sampling-tail truncation (or nothing).
+
+        Returns only the keys that actually differ from TRL's defaults, and an empty
+        dict when both are neutral -- so setting ``sampling_top_p: 1.0`` and
+        ``sampling_top_k: 0`` gives a *byte-identical* ``GRPOConfig`` to the pre-fix
+        one, with no key added. Same contract as :meth:`trl_grpo_overrides`.
+
+        These map onto ``GRPOConfig.top_p`` / ``.top_k`` rather than
+        ``generation_kwargs`` deliberately. TRL reads the first-class fields in
+        ``_build_base_generation_kwargs`` (``trl/experimental/openenv/utils.py:34-47``)
+        *and* in its own non-rollout generation path (``grpo_trainer.py:734-736``), so
+        setting them covers evaluation generation too; ``generation_kwargs`` would only
+        reach the custom rollout path and would silently leave eval untruncated.
+
+        Values are plain floats/ints, so this stays importable without ``trl``.
+        """
+        overrides: Dict[str, Any] = {}
+        if self.sampling_top_p != 1.0:
+            overrides["top_p"] = self.sampling_top_p
+        if self.sampling_top_k != 0:
+            overrides["top_k"] = self.sampling_top_k
+        return overrides
+
+    def disable_sampling_truncation(self) -> None:
+        """Revert to TRL's untruncated sampling (``--no-sampling-truncation``)."""
+        self.sampling_top_p = 1.0
+        self.sampling_top_k = 0
 
     def reconcile_for_dr_grpo(self) -> list[str]:
         """Align MARSHAL's advantage normalization with Dr. GRPO, in place.

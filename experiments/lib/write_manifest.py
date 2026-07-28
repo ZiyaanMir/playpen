@@ -92,6 +92,69 @@ def _versions() -> dict:
     return out
 
 
+def _marshal_flag_spec() -> dict:
+    """``{cli flag: (field, caster_or_bool_value)}``, derived from MarshalConfig itself.
+
+    Mirrors ``train_selfplay.py``'s naming convention -- ``field_name`` becomes
+    ``--field-name``, bools additionally get ``--no-field-name``, and ``enabled`` keeps
+    its historical ``--marshal`` / ``--no-marshal`` spelling. Deriving this from the
+    dataclass rather than hardcoding a list means a config field added later is picked
+    up here automatically, instead of being silently misreported in every manifest.
+
+    ``bool`` is checked before ``int`` because ``isinstance(True, int)`` is True; and
+    the *default value's* type is used rather than ``field.type``, which is a plain
+    string under ``from __future__ import annotations``.
+    """
+    spec: dict = {}
+    for f in dataclasses.fields(MarshalConfig):
+        base = "--marshal" if f.name == "enabled" else "--" + f.name.replace("_", "-")
+        if isinstance(f.default, bool):
+            spec[base] = (f.name, True)
+            spec["--no-" + base[2:]] = (f.name, False)
+        else:
+            spec[base] = (f.name, type(f.default))
+    return spec
+
+
+def _marshal_overrides_from_argv(tokens: list) -> dict:
+    """Extract MarshalConfig overrides from a list of CLI tokens.
+
+    Matching is on whole tokens, so ``--length-penalty`` (bool) is never confused with
+    ``--length-penalty-coef`` (valued), nor ``--marshal`` with ``--marshal-config``.
+    Unparseable values are skipped rather than raised: the manifest is diagnostic, and
+    the training job will reject a bad value loudly on its own.
+    """
+    spec = _marshal_flag_spec()
+    out: dict = {}
+    i = 0
+    while i < len(tokens):
+        entry = spec.get(tokens[i])
+        if entry is not None:
+            field, kind = entry
+            if isinstance(kind, bool):
+                out[field] = kind
+            elif i + 1 < len(tokens):
+                try:
+                    out[field] = kind(tokens[i + 1])
+                except (TypeError, ValueError):
+                    pass
+                i += 1
+        i += 1
+
+    # Convenience ALIASES: flags that train_selfplay.py maps onto config fields but
+    # which are not fields themselves, so the derived spec above cannot see them.
+    # Without this the manifest would report the YAML's sampling values for a run that
+    # actually neutralised them -- the exact class of lie this parser exists to avoid.
+    # `setdefault` mirrors train_selfplay.py: an explicit --sampling-top-* still wins.
+    known = {f.name for f in dataclasses.fields(MarshalConfig)}
+    if "--no-sampling-truncation" in tokens:
+        if "sampling_top_p" in known:
+            out.setdefault("sampling_top_p", 1.0)
+        if "sampling_top_k" in known:
+            out.setdefault("sampling_top_k", 0)
+    return out
+
+
 def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
     """Merge the YAML with the CLI length-penalty overrides, exactly as training does.
 
@@ -112,39 +175,17 @@ def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
     if _env("LP_COEF"):
         overrides["length_penalty_coef"] = float(_env("LP_COEF"))
 
-    # EXTRA_TRAIN_ARGS is how ablation arms are expressed (EXTRA_TRAIN_ARGS=
-    # --no-length-penalty). Those flags override the YAML at train time, so a
-    # manifest that ignored them would report the opposite of what ran -- exactly
-    # the field an ablation turns on. Only the on/off switches are parsed here;
-    # valued flags stay recorded verbatim under training.extra_train_args.
-    extra = _env("EXTRA_TRAIN_ARGS").split()
-    for flag, field, value in [
-        ("--no-length-penalty", "length_penalty", False),
-        ("--length-penalty", "length_penalty", True),
-        ("--no-marshal", "enabled", False),
-        ("--marshal", "enabled", True),
-        ("--no-dr-grpo", "dr_grpo", False),
-        ("--dr-grpo", "dr_grpo", True),
-    ]:
-        if flag in extra:
-            overrides[field] = value
-    for i, token in enumerate(extra):
-        # Valued length-penalty flags, so the recorded numbers stay truthful too.
-        if token in ("--length-penalty-coef", "--length-penalty-max-len",
-                     "--length-penalty-min-len", "--length-penalty-bonus",
-                     "--length-penalty-offset") and i + 1 < len(extra):
-            field = "length_penalty_" + token[len("--length-penalty-"):].replace("-", "_")
-            caster = int if field.endswith(("_len",)) else float
-            try:
-                overrides[field] = caster(extra[i + 1])
-            except ValueError:
-                pass
+    # EXTRA_TRAIN_ARGS is how a run varies the algorithm (EXTRA_TRAIN_ARGS=
+    # "--no-length-penalty --gamma 0.95"). Those flags override the YAML at train
+    # time, so a manifest that ignored them would report the OPPOSITE of what ran --
+    # exactly the fields an ablation is defined by.
+    overrides.update(_marshal_overrides_from_argv(_env("EXTRA_TRAIN_ARGS").split()))
 
     if overrides:
         try:
             cfg = dataclasses.replace(cfg, **overrides)
         except Exception as exc:
-            return cfg.to_dict(), f"length-penalty override rejected: {exc}"
+            return cfg.to_dict(), f"config override rejected: {exc}"
 
     # Freeze the config next to the results so a later edit to the shared YAML
     # cannot silently rewrite what this run claims to have used.

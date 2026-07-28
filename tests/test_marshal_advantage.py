@@ -248,6 +248,92 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(MarshalConfig(fidelity_mode="marshal_exact").marshal_exact)
 
 
+class TestSamplingTruncation(unittest.TestCase):
+    """top_p / top_k, and the byte-identical revert contract.
+
+    These exist because untruncated sampling from a low-entropy policy produces rare
+    far-tail draws whose log-prob vLLM and the trainer disagree about by many nats,
+    which sequence-level importance sampling turns into a dead row. The revert path
+    matters as much as the fix: reproducing a pre-2026-07-28 run must add NO key to
+    GRPOConfig, not pass top_p=1.0/top_k=0 explicitly.
+    """
+
+    def test_defaults_are_truncating(self):
+        cfg = MarshalConfig()
+        self.assertEqual(cfg.sampling_top_p, 0.95)
+        self.assertEqual(cfg.sampling_top_k, 50)
+        self.assertEqual(cfg.trl_sampling_overrides(), {"top_p": 0.95, "top_k": 50})
+
+    def test_neutral_values_add_no_key_at_all(self):
+        cfg = MarshalConfig(sampling_top_p=1.0, sampling_top_k=0)
+        self.assertEqual(cfg.trl_sampling_overrides(), {})
+
+    def test_each_knob_is_independently_neutral(self):
+        self.assertEqual(
+            MarshalConfig(sampling_top_p=1.0, sampling_top_k=50).trl_sampling_overrides(),
+            {"top_k": 50},
+        )
+        self.assertEqual(
+            MarshalConfig(sampling_top_p=0.9, sampling_top_k=0).trl_sampling_overrides(),
+            {"top_p": 0.9},
+        )
+
+    def test_disable_helper_matches_the_neutral_config(self):
+        cfg = MarshalConfig()
+        cfg.disable_sampling_truncation()
+        self.assertEqual(cfg.sampling_top_p, 1.0)
+        self.assertEqual(cfg.sampling_top_k, 0)
+        self.assertEqual(cfg.trl_sampling_overrides(), {})
+
+    def test_rejects_out_of_range_top_p(self):
+        for bad in (0.0, -0.1, 1.5):
+            with self.assertRaises(ValueError):
+                MarshalConfig(sampling_top_p=bad)
+
+    def test_rejects_negative_top_k(self):
+        with self.assertRaises(ValueError):
+            MarshalConfig(sampling_top_k=-1)
+
+    def test_values_are_coerced_to_their_types(self):
+        cfg = MarshalConfig(sampling_top_p="0.9", sampling_top_k="20")
+        self.assertIsInstance(cfg.sampling_top_p, float)
+        self.assertIsInstance(cfg.sampling_top_k, int)
+        self.assertEqual(cfg.trl_sampling_overrides(), {"top_p": 0.9, "top_k": 20})
+
+    def test_from_dict_roundtrip(self):
+        cfg = MarshalConfig.from_dict({"sampling_top_p": 0.8, "sampling_top_k": 10})
+        self.assertEqual(cfg.to_dict()["sampling_top_p"], 0.8)
+        self.assertEqual(cfg.to_dict()["sampling_top_k"], 10)
+
+    def test_applies_regardless_of_enabled(self):
+        """It configures generation, which the plain-GRPO baseline shares."""
+        cfg = MarshalConfig(enabled=False)
+        self.assertEqual(cfg.trl_sampling_overrides(), {"top_p": 0.95, "top_k": 50})
+
+    def test_composes_with_dr_grpo_without_key_collision(self):
+        cfg = MarshalConfig(dr_grpo=True)
+        merged = {**cfg.trl_grpo_overrides(), **cfg.trl_sampling_overrides()}
+        self.assertEqual(
+            merged,
+            {"loss_type": "dr_grpo", "scale_rewards": "none", "top_p": 0.95, "top_k": 50},
+        )
+        self.assertFalse(
+            set(cfg.trl_grpo_overrides()) & set(cfg.trl_sampling_overrides()),
+            "the two override dicts must not fight over a key",
+        )
+
+    def test_overrides_are_valid_grpoconfig_kwargs(self):
+        """Guards against a TRL rename turning this into a silently ignored kwarg."""
+        try:
+            from trl import GRPOConfig
+        except Exception:  # pragma: no cover - trl not installed
+            self.skipTest("trl not installed")
+        cfg = MarshalConfig()
+        gc = GRPOConfig(output_dir="/tmp/marshal-test", **cfg.trl_sampling_overrides())
+        self.assertEqual(gc.top_p, 0.95)
+        self.assertEqual(gc.top_k, 50)
+
+
 class TestDrGrpo(unittest.TestCase):
     """The Dr. GRPO switch: TRL-config overrides + non-interfering reconciliation."""
 
