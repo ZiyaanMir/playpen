@@ -27,6 +27,8 @@ REPO="${REPO:-$(dirname "$HERE")}"
 
 DRY_RUN=0
 FORCE=0
+FRESH=0
+ASSUME_YES=0
 LIMIT=0
 CLUSTER=""
 RUNS=""
@@ -41,11 +43,28 @@ gameplay results yet.
 
 options:
   -n, --dry-run      list what would be queued, submit nothing
-      --force        re-queue experiments that already have results
+      --force        re-queue experiments that already have results, keeping their
+                     existing playpen-eval/ directory
+      --fresh        DESTRUCTIVE. Delete each selected experiment's playpen-eval/
+                     AND the shared base-model cache, then recompute everything
+                     from scratch. Implies --force. Asks before deleting unless
+                     --yes. Use when results are not missing but WRONG -- a harness
+                     bug, changed generation settings, a new clembench.
+      --yes          skip the --fresh confirmation (for scripts)
       --limit N      queue at most N jobs this time (0 = no limit)
       --runs DIR     experiments root      (default: \$MARSHAL_RUNS or the cluster's)
       --cluster C    eddie | isambard      (default: detected from qsub/sbatch)
   -h, --help         this
+
+--force vs --fresh. --force replays into a directory that still holds the previous
+run's episodes. Fine when replaying the same games; but if the game set changed, the
+episodes of games no longer played are left behind and clemeval still aggregates
+them -- silently mixing two runs into one table. --fresh removes them first.
+
+--fresh also deletes \$PPEVAL_CACHE, which --force does NOT. The base-model cache key
+is (model, games, max_tokens, temperature) -- it does not include the harness version,
+so a baseline computed under a bug stays a cache HIT and gets copied into every new
+result as the row everything is compared against.
 
 Patterns are shell globs matched against the experiment directory name:
   $(basename "$0") 'guesswhat_*' 'dond_Qwen3-4B_*'
@@ -60,6 +79,8 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -n|--dry-run)  DRY_RUN=1 ;;
         --force)       FORCE=1 ;;
+        --fresh)       FRESH=1; FORCE=1 ;;
+        --yes)         ASSUME_YES=1 ;;
         --limit)       LIMIT="$2"; shift ;;
         --runs)        RUNS="$2"; shift ;;
         --cluster)     CLUSTER="$2"; shift ;;
@@ -102,6 +123,10 @@ if [ -z "$RUNS" ]; then
     fi
 fi
 [ -d "$RUNS" ] || { echo "ERROR: no experiments root: $RUNS" >&2; exit 1; }
+
+# Must match pp_layout's default in lib/playpen_eval.sh, or --fresh would clear a
+# cache the jobs do not actually read and leave the real one in place.
+PPEVAL_CACHE_DIR="${PPEVAL_CACHE:-$RUNS/_playpen_base_cache}"
 
 # --- what needs doing ---------------------------------------------------------
 # An experiment qualifies when it has at least one COMPLETE checkpoint (a directory
@@ -177,8 +202,56 @@ echo "${#TODO[@]} experiment(s) to queue" \
 
 if [ "$DRY_RUN" = 1 ]; then
     echo
-    echo "DRY RUN -- nothing submitted. Re-run without -n to queue these."
+    if [ "$FRESH" = 1 ]; then
+        echo "DRY RUN (--fresh) -- nothing deleted, nothing submitted."
+        echo "Re-running without -n would DELETE the playpen-eval/ directory of each"
+        echo "experiment above, plus $PPEVAL_CACHE_DIR, then recompute from scratch."
+    else
+        echo "DRY RUN -- nothing submitted. Re-run without -n to queue these."
+    fi
     exit 0
+fi
+
+# --- --fresh: delete stale results before queueing ---------------------------
+# Deliberately loud and confirmed: this throws away gameplay that cost GPU hours,
+# and unlike a failed run it cannot be rebuilt by rescore_playpen_eval.py -- the
+# episodes themselves are gone. Worth it only when the episodes are WRONG.
+if [ "$FRESH" = 1 ]; then
+    echo
+    echo "--fresh will DELETE:"
+    _n_dirs=0
+    for EXP in "${TODO[@]}"; do
+        [ -d "$EXP/playpen-eval" ] || continue
+        printf '  %s  (%s)\n' "$(basename "$EXP")/playpen-eval/" \
+            "$(du -sh "$EXP/playpen-eval" 2>/dev/null | cut -f1)"
+        _n_dirs=$((_n_dirs + 1))
+    done
+    [ "$_n_dirs" -eq 0 ] && echo "  (no existing playpen-eval/ directories -- nothing to remove)"
+    if [ -d "$PPEVAL_CACHE_DIR" ]; then
+        printf '  %s  (%s)   <- the untrained-model baseline, shared by every experiment\n' \
+            "$PPEVAL_CACHE_DIR" "$(du -sh "$PPEVAL_CACHE_DIR" 2>/dev/null | cut -f1)"
+    fi
+    echo
+    echo "Gameplay is NOT recoverable afterwards (rescore_playpen_eval.py needs the"
+    echo "episode files). Everything will be replayed on the GPU from scratch."
+
+    if [ "$ASSUME_YES" != 1 ]; then
+        if [ -t 0 ]; then
+            printf 'Type "yes" to proceed: '
+            read -r _reply
+            [ "$_reply" = "yes" ] || { echo "aborted -- nothing deleted."; exit 1; }
+        else
+            echo "ERROR: --fresh needs confirmation, but stdin is not a terminal." >&2
+            echo "       Re-run with --yes if you are sure." >&2
+            exit 1
+        fi
+    fi
+
+    for EXP in "${TODO[@]}"; do
+        rm -rf "$EXP/playpen-eval" "$EXP/PLAYPEN_RESULTS.md" "$EXP/playpen_results.tsv"
+    done
+    rm -rf "$PPEVAL_CACHE_DIR"
+    echo "[fresh] removed $_n_dirs playpen-eval/ director(ies) and the base cache."
 fi
 
 if [ "$LIMIT" -gt 0 ] && [ "${#TODO[@]}" -gt "$LIMIT" ]; then

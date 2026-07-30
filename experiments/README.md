@@ -200,6 +200,31 @@ tomorrow and it picks up where it left off. `PPEVAL_*` is passed through to ever
 it submits, so `PPEVAL_CKPTS=last experiments/queue_playpen_eval_backfill.sh` sets the
 policy for a whole backfill in one place.
 
+### Recomputing results that are wrong, not missing
+
+```bash
+experiments/queue_playpen_eval_backfill.sh --fresh -n     # what would be DELETED
+experiments/queue_playpen_eval_backfill.sh --fresh        # confirm, then recompute
+```
+
+`--fresh` deletes each selected experiment's `playpen-eval/` and the shared base cache,
+then queues everything from scratch. It prints the directories and their sizes and
+requires a typed `yes` (or `--yes`) first, because unlike a failed run this **cannot**
+be rebuilt by `rescore_playpen_eval.py` — the episodes themselves are gone.
+Checkpoints are never touched.
+
+Two reasons `--force` alone is not enough when results are *wrong* rather than missing:
+
+* **Stale episodes get aggregated.** `--force` replays into a directory that still
+  holds the previous run's episodes. If the game set changed, the games no longer
+  being played are left behind and clemeval still counts them — silently mixing two
+  runs into one table.
+* **The base cache is a false hit.** Its key is
+  `(model, games, max_tokens, temperature)` — it does not include the harness version.
+  A baseline computed under a bug stays a cache hit afterwards and is copied into every
+  new result as the row everything is compared against. `--force` does not clear it;
+  `--fresh` does.
+
 To (re-)score a single experiment instead:
 
 ```bash
