@@ -1,7 +1,7 @@
 # Experiments: one command, one directory, train + evaluate
 
-Submits a MARSHAL self-play training run **and** its lm-eval evaluation as a single
-chained pair of jobs, and puts everything that run produced — parameters, checkpoints,
+Submits a MARSHAL self-play training run **and** both of its evaluations as a single
+chained set of jobs, and puts everything that run produced — parameters, checkpoints,
 scores, logs — inside **one self-contained directory**.
 
 ```bash
@@ -13,8 +13,17 @@ module load brics/userenv
 experiments/isambard/run_experiment.sh dond
 ```
 
-That is the whole interface. It queues training, queues evaluation held behind it, and
-prints where everything will land.
+That is the whole interface. It queues three jobs, each held until the previous one
+leaves the queue, and prints where everything will land:
+
+| # | job | what it answers |
+|---|---|---|
+| 1 | **train** | — |
+| 2 | **eval** (lm-eval: logiglue, logicbench) | did self-play change the model's *reasoning*? |
+| 3 | **playpen eval** (clembench gameplay, clemscore) | did it get better at *playing*, including the 13 games it never trained on? |
+
+Job 3 is the one that produces the number the shared task is scored on. Turn it off
+for a run with `PPEVAL_ENABLE=0`.
 
 Replaces the older split workflow (`slurm/`, `slurm_eddie/` for training; a separate
 `lm_eval_jobs/` tree writing into a shared `Results/`), where a checkpoint and its score
@@ -31,20 +40,30 @@ $MARSHAL_RUNS/dond_Qwen3-4B_lp384_20260723-142530/
 ├── manifest.json           the same, machine-readable
 ├── marshal_config.yaml     frozen copy of the config this run used
 ├── experiment.env          every setting, re-sourceable to re-run by hand
-├── RESULTS.md            ← the score table, with deltas vs the untrained base
+├── RESULTS.md            ← lm-eval scores, with deltas vs the untrained base
 ├── results.tsv             the same numbers for pandas
+├── PLAYPEN_RESULTS.md    ← clemscore + per-game table, same deltas
+├── playpen_results.tsv     the same numbers for pandas
 ├── logs/
 │   ├── train.<jobid>.out/.err
-│   └── eval.<jobid>.out/.err
+│   ├── eval.<jobid>.out/.err
+│   └── ppeval.<jobid>.out/.err
 ├── train/<timestamp>/
 │   ├── checkpoint-50/ … checkpoint-200/
 │   ├── completions/*.parquet
 │   └── wandb_run.json      which W&B run this is (id, url, or offline sync command)
 ├── wandb/                  W&B run data; offline runs live here until synced
-└── eval/
-    ├── base/               lm-eval on the UNTRAINED model — the baseline
-    ├── checkpoint-50/      full lm-eval output incl. --log_samples
-    └── …
+├── eval/
+│   ├── base/               lm-eval on the UNTRAINED model — the baseline
+│   ├── checkpoint-50/      full lm-eval output incl. --log_samples
+│   └── …
+└── playpen-eval/
+    ├── base/               the untrained model, played
+    │   ├── <name>.val.json     clemscore / statscore
+    │   └── clem/results.csv    per-game % Played and Quality Score
+    │       └── <name>/<game>/  interactions, transcripts, per-episode scores
+    ├── checkpoint-50/      … one per adapter
+    └── .work/              the generated registries each row was run with
 ```
 
 The directory name alone tells you the game, the model, the tag and when it ran. Nothing
@@ -66,6 +85,123 @@ guesswhat_Qwen3-0.6B_lp_off_20260723-152920  1 ckpt, not evaluated
 ```
 
 Works on a login node or on your laptop after an `rsync` — it only reads files.
+
+### The playpen games evaluation (job 3)
+
+Every checkpoint plays the clembench games on the `playpen-data` **validation** split
+— the same instances, the same scoring, and the same `clemscore` as `LEADERBOARD.md`
+— and is reported against the untrained model:
+
+```
+| checkpoint       | clemscore      | avg % played  | avg quality  |
+| `base`           | 4.00           | 33.3          | 12.0         |
+| `checkpoint-100` | 24.00 (+20.00) | 66.7 (+33.4)  | 36.0 (+24.0) |
+
+| checkpoint       | guesswhat  | taboo      | wordle |
+| `base`           | 100 / 20.0 | 0 / -      | 0 / -  |
+| `checkpoint-100` | 100 / 60.0 | 100 / 30.0 | 0 / -  |
+```
+
+The per-game table is the point. `% played` is how often the model produced a
+parseable, rule-legal game and `quality score` is how well it did in those, so
+**0 % played is not a score of zero** — it is a formatting failure, a different
+problem with a different fix, and the two are indistinguishable in a clemscore
+column. (For the same reason a blank clemscore means every episode aborted, not
+that the model scored nothing; `summarize_playpen_eval.py` recomputes it from
+`% played × quality` whenever clemeval left it out.)
+
+Only the training game is in-distribution here. The other thirteen are the actual
+question — whether self-play on one game taught it to *play*, or only to play
+`guesswhat`.
+
+| variable | default | what it does |
+|---|---|---|
+| `PPEVAL_ENABLE` | `1` | `0` doesn't queue the job at all |
+| `PPEVAL_SUITE` | `clem` | `clem` (the 14 interactive games) \| `static` \| `all` |
+| `PPEVAL_GAMES` | — | explicit list, overrides the suite: `dond,guesswhat` |
+| `PPEVAL_CKPTS` | all | `last`, or `100,200` |
+| `PPEVAL_BASE` | `1` | also play the untrained model (cached across experiments) |
+| `PPEVAL_MAX_TOKENS` / `PPEVAL_TEMPERATURE` | `300` / `0.0` | generation budget — playpen's own defaults, i.e. what the leaderboard used |
+| `PPEVAL_TIMEOUT` | — | per-checkpoint ceiling, e.g. `3h` |
+| `PPEVAL_HF_OFFLINE` | `0` | `1` for a guaranteed network-free run, once the data is cached |
+
+> **`dond` is not in the `clem` suite.** It carries `benchmark: 3.0`, not `2.0`, so a
+> dond experiment is otherwise scored only on games it never trained on. Add it
+> explicitly: `PPEVAL_GAMES=dond,guesswhat,taboo,codenames,wordle`.
+
+This is generation, not loglikelihood scoring: ~70 validation instances across 14
+games, each a multi-turn dialogue, **per checkpoint**. Budget hours per row for a 4B
+model, and reach for `PPEVAL_CKPTS=last` rather than a longer walltime when that is
+too much.
+
+```bash
+# only the last checkpoint, and add the game this run actually trained on
+PPEVAL_CKPTS=last PPEVAL_GAMES=dond,guesswhat,taboo \
+  experiments/eddie/run_experiment.sh dond
+```
+
+**Prerequisite:** the `colab-potsdam/playpen-data` validation split must be fetchable
+or already in `$HF_HOME`. The job checks for it before loading any model and stops
+with the one-line command to fetch it, rather than failing once per checkpoint after
+an hour of GPU. Nothing else is needed — unlike lm-eval, this runs in the repo's own
+`.venv` (clemcore + playpen + peft are all there), so there is no second environment
+to build and the job is the same on both clusters.
+
+### Scoring runs that finished before this existed
+
+```bash
+experiments/queue_playpen_eval_backfill.sh -n     # what WOULD be queued
+experiments/queue_playpen_eval_backfill.sh        # queue it
+experiments/queue_playpen_eval_backfill.sh 'guesswhat_*' --limit 3
+```
+
+Walks `$MARSHAL_RUNS`, finds every experiment with real checkpoints and no gameplay
+results, and submits one eval job each through the same `run_playpen_eval.sh` a fresh
+experiment would use — so a backfilled run is indistinguishable from one scored on
+the day. Nothing is retrained and no checkpoint is touched.
+
+Re-running it is safe: an experiment that already has results is skipped (`--force`
+overrides), so it only ever queues what is genuinely missing. Since each job wants a
+whole GPU for hours, `--limit N` is worth using on a busy queue — run it again
+tomorrow and it picks up where it left off. `PPEVAL_*` is passed through to every job
+it submits, so `PPEVAL_CKPTS=last experiments/queue_playpen_eval_backfill.sh` sets the
+policy for a whole backfill in one place.
+
+To (re-)score a single experiment instead:
+
+```bash
+experiments/eddie/run_playpen_eval.sh    $MARSHAL_RUNS/<experiment>
+experiments/isambard/run_playpen_eval.sh $MARSHAL_RUNS/<experiment>
+```
+
+Like `run_eval.sh`, it reuses that experiment's own stored settings so the run stays
+comparable, and any `PPEVAL_*` you export overrides them for that submission only.
+
+### Did the checkpoints actually change?
+
+```bash
+.venv/bin/python experiments/check_checkpoints.py                    # everything under $MARSHAL_RUNS
+.venv/bin/python experiments/check_checkpoints.py $MARSHAL_RUNS/<exp>
+.venv/bin/python experiments/check_checkpoints.py <exp> --base Qwen/Qwen3-4B --top 10
+```
+
+```
+     step  ||dW|| vs base  moved vs prev  max|dparam|  tensors moved         lr  grad_norm
+      100      1.5597e+00     1.5597e+00   3.7723e-02        392/392   1.00e-06       0.83
+      200      1.5597e+00              0            0          0/392   1.00e-06        0.0
+
+  PROBLEM: checkpoint-200: byte-identical to checkpoint-100 -- no weight update landed
+```
+
+Reads the adapters' safetensors and reports the delta each one applies to the base model
+(`scaling * B @ A`, summed over every LoRA module) and how far that delta moved between
+checkpoints. Because PEFT zero-initialises `lora_B`, **column 1 is literally the change
+versus the untrained model** — a checkpoint whose `lora_B` is still all-zero is a no-op
+and cannot score differently from base, whatever `RESULTS.md` says. That distinguishes the
+two ways a run "learns nothing": no optimizer step landed (frozen weights) versus the
+weights moved and the behaviour did not. `--base` adds `||dW||/||W||` for relative sizing;
+`--strict` exits non-zero for use in a script. Needs the training venv (numpy +
+safetensors); like `status.sh` it only reads files.
 
 ---
 
@@ -219,6 +355,13 @@ lm-eval environment** that must already exist — these scripts do not build it:
 See `notes/LMEVAL_CHECKPOINTS_EDDIE.md` / `..._ISAMBARD.md` for building them, and
 pre-cache the base model on a login node (compute nodes may be offline).
 
+**The playpen games evaluation needs no third environment** — it runs in the repo's
+own `.venv`, where clemcore, playpen and peft already are. What it does need is
+`clembench/` cloned in the repo root (as usual — that is how the games are
+discovered) and the `colab-potsdam/playpen-data` validation split reachable or
+cached; it checks for the latter before loading a model and tells you the command
+to fetch it.
+
 ---
 
 ## Design notes
@@ -226,6 +369,26 @@ pre-cache the base model on a login node (compute nodes may be offline).
 **Why a separate eval job rather than eval at the end of training.** Different environment
 (lm-eval + peft, not trl + vllm), different walltime, different GPU needs. Chaining also
 means a failed eval can be re-run without redoing 20 h of training.
+
+**Why the playpen eval is a third job rather than part of the second.** It needs the
+opposite environment from lm-eval: the repo's own venv rather than the lm-eval one,
+and it is generation rather than loglikelihood scoring, so its walltime is an order
+of magnitude larger. Chaining it behind lm-eval rather than beside it keeps one
+experiment to one GPU at a time, and `afterany`/`-hold_jid` means a failed lm-eval
+does not silently cancel the gameplay scores.
+
+**A checkpoint is made addressable by a generated registry, not by merging.**
+`playpen eval` takes a registered model *name*; a checkpoint is a LoRA adapter
+directory. Rather than merge each adapter into full base weights (GBs per
+checkpoint, and a merge step that can itself be wrong), the eval job writes a
+throwaway `model_registry.json` naming the base with `model_config.peft_model` set to
+the adapter — a path clemcore's `huggingface_local` backend already supports — into a
+private working directory it then `cd`s into. The repo's own registry is never
+modified, so concurrent jobs cannot race on it and a killed job leaves the checkout
+clean. That entry is **cloned** from the base model's real registry entry rather than
+synthesized, because settings like Qwen3's `enable_thinking: false` are the
+difference between playing the game and emitting `<think>` blocks that score as
+ABORTED.
 
 **The dependency is `afterany`, not `afterok`.** A 20 h run that hits the walltime exits
 non-zero but has still written `checkpoint-150`; `afterok` would silently skip evaluating

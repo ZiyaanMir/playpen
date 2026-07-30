@@ -8,6 +8,13 @@
 #   EXP_TAG=lp_off EXTRA_TRAIN_ARGS=--no-length-penalty \
 #     experiments/isambard/run_experiment.sh dond
 #
+# Queues three chained jobs, each held until the one before it leaves the queue:
+#   1. training
+#   2. lm-eval        (logiglue/logicbench -- did reasoning transfer?)
+#   3. playpen eval   (clembench gameplay across all the games -- did it learn to play?)
+#
+# Job 3 off:  PPEVAL_ENABLE=0 experiments/isambard/run_experiment.sh dond
+#
 # Same layout, tags and overrides as the Eddie version -- see
 # experiments/README.md. Differences here are Slurm vs Grid Engine, $PROJECTDIR vs
 # scratch, and the 24 h walltime cap.
@@ -53,7 +60,9 @@ ENV_FILE="$EXP_DIR/experiment.env"
                LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
                VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF EXTRA_TRAIN_ARGS \
                WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
-               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE VENV_LMEVAL; do
+               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE VENV_LMEVAL \
+               PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
+               PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_CACHE PPEVAL_HF_OFFLINE; do
         printf '%s=%q\n' "$var" "${!var-}"
     done
 } > "$ENV_FILE"
@@ -83,6 +92,25 @@ EVAL_ID="$(sbatch --parsable \
     "$HERE/eval.sh")"
 echo "[submit] eval      job $EVAL_ID  (held until $TRAIN_ID finishes)"
 
+# Third job: play the clembench games. Held behind the LM-EVAL job, not the training
+# job, because both want the whole GPU -- chaining them keeps one experiment to one
+# GPU at a time. afterany again, so a failed lm-eval does not cancel the gameplay
+# scores.
+PPEVAL_ID=""
+if [ "${PPEVAL_ENABLE:-1}" = "1" ]; then
+    PPEVAL_ID="$(sbatch --parsable \
+        --job-name="pp_${GAME}_$(basename "$MODEL")" \
+        --dependency="afterany:$EVAL_ID" \
+        --output="$LOG_DIR/ppeval_${EXP_ID}_%j.out" \
+        --error="$LOG_DIR/ppeval_${EXP_ID}_%j.err" \
+        --export="ALL,EXP_ENV_FILE=$ENV_FILE" \
+        ${PPEVAL_SBATCH_OPTS:-} \
+        "$HERE/playpen_eval.sh")"
+    echo "[submit] playpen   job $PPEVAL_ID  (held until $EVAL_ID finishes)"
+else
+    echo "[submit] playpen   skipped (PPEVAL_ENABLE=0)"
+fi
+
 cat <<EOF
 
 experiment : $EXP_ID
@@ -92,12 +120,14 @@ directory  : $EXP_DIR
   logs/               job output                tail -f $LOG_DIR/train_${EXP_ID}_$TRAIN_ID.out
   train/              checkpoints (checkpoint-<step>/)
   eval/               lm-eval output per checkpoint
-  RESULTS.md          score table               (written when eval finishes)
+  RESULTS.md          lm-eval score table       (written when eval finishes)
+  playpen-eval/       clembench gameplay per checkpoint
+  PLAYPEN_RESULTS.md  clemscore + per-game table (written when playpen eval finishes)
   wandb/              W&B run data ($([ "${WB_ENABLE:-1}" = "1" ] && echo "project ${WB_PROJECT:-playpen-marshal}, mode ${WB_MODE:-auto}" || echo "disabled"))
                       offline runs upload with  experiments/lib/wandb_sync.sh $EXP_DIR
 
-  squeue --me                 # watch both jobs
-  scancel $TRAIN_ID $EVAL_ID  # cancel the experiment
+  squeue --me                 # watch the jobs
+  scancel $TRAIN_ID $EVAL_ID${PPEVAL_ID:+ $PPEVAL_ID}  # cancel the experiment
 
 Nothing on Isambard is backed up -- rsync the experiment home when it finishes:
   rsync -avz <host>:$EXP_DIR ./

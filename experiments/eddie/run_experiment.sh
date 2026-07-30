@@ -9,9 +9,14 @@
 #   MODEL=Qwen/Qwen3-0.6B MAX_STEPS=20 SAVE_STEPS=10 EXP_TAG=smoke \
 #     experiments/eddie/run_experiment.sh guesswhat
 #
-# Creates the experiment directory, writes the manifest, then queues two jobs:
-# training, and an evaluation job held until training finishes. Prints the paths
-# and job ids; nothing else to remember.
+# Creates the experiment directory, writes the manifest, then queues three jobs,
+# each held until the one before it leaves the queue:
+#   1. training
+#   2. lm-eval        (logiglue/logicbench -- did reasoning transfer?)
+#   3. playpen eval   (clembench gameplay across all the games -- did it learn to play?)
+# Prints the paths and job ids; nothing else to remember.
+#
+# Job 3 off:  PPEVAL_ENABLE=0 experiments/eddie/run_experiment.sh dond
 #
 # Any preset value can be overridden by exporting it first (see
 # experiments/presets/<game>.env for the full list). ALWAYS set EXP_TAG when a run
@@ -65,7 +70,9 @@ ENV_FILE="$EXP_DIR/experiment.env"
                LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
                VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF EXTRA_TRAIN_ARGS \
                WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
-               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE LMEVAL_CONDA_ENV; do
+               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE LMEVAL_CONDA_ENV \
+               PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
+               PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_CACHE PPEVAL_HF_OFFLINE; do
         printf '%s=%q\n' "$var" "${!var-}"
     done
 } > "$ENV_FILE"
@@ -99,6 +106,25 @@ EVAL_ID="$(qsub -terse \
     "$HERE/eval.sh" | tr -d '[:space:]')"
 echo "[submit] eval      job $EVAL_ID  (held until $TRAIN_ID finishes)"
 
+# Third job: play the clembench games. Held behind the LM-EVAL job, not the training
+# job, because both want the whole GPU -- chaining them keeps one experiment to one
+# GPU at a time. -hold_jid again waits for it to leave the queue whatever its exit
+# status, so a failed lm-eval does not cancel the gameplay scores.
+PPEVAL_ID=""
+if [ "${PPEVAL_ENABLE:-1}" = "1" ]; then
+    PPEVAL_ID="$(qsub -terse \
+        -N "pp_${GAME}_$(basename "$MODEL")" \
+        -hold_jid "$EVAL_ID" \
+        -o "$LOG_DIR/ppeval_${EXP_ID}_\$JOB_ID.out" \
+        -e "$LOG_DIR/ppeval_${EXP_ID}_\$JOB_ID.err" \
+        -v "EXP_ENV_FILE=$ENV_FILE" \
+        ${PPEVAL_QSUB_OPTS:-} \
+        "$HERE/playpen_eval.sh" | tr -d '[:space:]')"
+    echo "[submit] playpen   job $PPEVAL_ID  (held until $EVAL_ID finishes)"
+else
+    echo "[submit] playpen   skipped (PPEVAL_ENABLE=0)"
+fi
+
 cat <<EOF
 
 experiment : $EXP_ID
@@ -108,10 +134,12 @@ directory  : $EXP_DIR
   logs/               job output                tail -f $LOG_DIR/train_${EXP_ID}_$TRAIN_ID.out
   train/              checkpoints (checkpoint-<step>/)
   eval/               lm-eval output per checkpoint
-  RESULTS.md          score table               (written when eval finishes)
+  RESULTS.md          lm-eval score table       (written when eval finishes)
+  playpen-eval/       clembench gameplay per checkpoint
+  PLAYPEN_RESULTS.md  clemscore + per-game table (written when playpen eval finishes)
   wandb/              W&B run data ($([ "${WB_ENABLE:-1}" = "1" ] && echo "project ${WB_PROJECT:-playpen-marshal}, mode ${WB_MODE:-auto}" || echo "disabled"))
                       offline runs upload with  experiments/lib/wandb_sync.sh $EXP_DIR
 
-  qstat -u $USER            # watch both jobs
-  qdel $TRAIN_ID $EVAL_ID   # cancel the experiment
+  qstat -u $USER            # watch the jobs
+  qdel $TRAIN_ID $EVAL_ID${PPEVAL_ID:+ $PPEVAL_ID}   # cancel the experiment
 EOF

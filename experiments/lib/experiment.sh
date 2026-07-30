@@ -69,6 +69,8 @@ exp_load_preset() {
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
               VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
+              PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
+              PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT \
               WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
               EXTRA_TRAIN_ARGS EXP_TAG; do
         if [ -n "${!_v+set}" ]; then
@@ -133,6 +135,20 @@ exp_load_preset() {
     EVAL_LIMIT="${EVAL_LIMIT:-}"         # smoke tests only
     EVAL_EXTRA="${EVAL_EXTRA:-}"         # verbatim extra lm-eval flags
 
+    # --- playpen games eval (the third job) ----------------------------------
+    # Plays every checkpoint through clembench and reports the clemscore. Game
+    # independent on purpose: the point is to score the 13 games the run was NOT
+    # trained on as well as the one it was. See lib/playpen_eval.sh for what each
+    # of these does; a preset may still override them like anything else.
+    PPEVAL_ENABLE="${PPEVAL_ENABLE:-1}"          # 0 => don't queue the job at all
+    PPEVAL_SUITE="${PPEVAL_SUITE:-clem}"         # clem | static | all
+    PPEVAL_GAMES="${PPEVAL_GAMES:-}"             # explicit list, overrides the suite
+    PPEVAL_BASE="${PPEVAL_BASE:-1}"              # also play the untrained model
+    PPEVAL_CKPTS="${PPEVAL_CKPTS:-}"             # "" = all | last | 100,200
+    PPEVAL_MAX_TOKENS="${PPEVAL_MAX_TOKENS:-300}"
+    PPEVAL_TEMPERATURE="${PPEVAL_TEMPERATURE:-0.0}"
+    PPEVAL_TIMEOUT="${PPEVAL_TIMEOUT:-}"         # per-row ceiling, e.g. 3h
+
     EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
     EXP_TAG="${EXP_TAG:-}"
 
@@ -144,6 +160,8 @@ exp_load_preset() {
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
            VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
+           PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
+           PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT \
            WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
            EXTRA_TRAIN_ARGS EXP_TAG
 }
