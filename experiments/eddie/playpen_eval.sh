@@ -9,8 +9,10 @@
 #     $EXP_DIR/playpen-eval/checkpoint-50/   ... one dir per adapter
 #     $EXP_DIR/PLAYPEN_RESULTS.md            the table across all of them
 #
-# Re-runnable by hand once training is done:
-#     source <EXP_DIR>/experiment.env && experiments/eddie/playpen_eval.sh
+# Re-runnable by hand once training is done -- pass the env file, don't source it.
+# (experiment.env holds plain assignments, so sourcing exports nothing to this script,
+# and it does not define EXP_ENV_FILE at all.)
+#     EXP_ENV_FILE=<EXP_DIR>/experiment.env experiments/eddie/playpen_eval.sh
 #
 # --- Grid Engine options (overridable via PPEVAL_QSUB_OPTS) -------------------
 #$ -N marshal_ppeval
