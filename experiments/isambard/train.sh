@@ -79,6 +79,18 @@ ARGS=(
 [ "${GRAD_CKPT:-1}" = "1" ] && ARGS+=( --gradient-checkpointing )
 [ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )
 [ -n "${LP_COEF:-}"    ] && ARGS+=( --length-penalty-coef "$LP_COEF" )
+# Dense per-turn rewards. Same convention: empty => leave the YAML alone. TR_ENABLE
+# is a tri-state (1 on / 0 off / empty = whatever the YAML says) because "on" and
+# "leave alone" must stay distinguishable, exactly as --turn-rewards/--no-turn-rewards
+# are in train_selfplay.py.
+case "${TR_ENABLE:-}" in
+    1) ARGS+=( --turn-rewards ) ;;
+    0) ARGS+=( --no-turn-rewards ) ;;
+esac
+[ -n "${TR_SOURCE:-}"     ] && ARGS+=( --turn-reward-source "$TR_SOURCE" )
+[ -n "${TR_SCALE:-}"      ] && ARGS+=( --turn-reward-scale "$TR_SCALE" )
+[ -n "${TR_BUDGET:-}"     ] && ARGS+=( --turn-reward-budget "$TR_BUDGET" )
+[ -n "${TR_COMPONENTS:-}" ] && ARGS+=( --turn-reward-components "$TR_COMPONENTS" )
 # W&B: named after this experiment, data written inside $EXP_DIR. WB_MODE=auto
 # records offline when the compute node has no credential/network, which is the
 # normal case here -- experiments/lib/wandb_sync.sh uploads it from the login node.

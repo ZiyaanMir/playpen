@@ -158,9 +158,38 @@ pp_eval_one() {
         if [ -n "${PPEVAL_TIMEOUT:-}" ] && [ "$rc" -eq 124 ]; then
             echo "[ppeval] TIMED OUT after $PPEVAL_TIMEOUT: $row" >&2
         fi
+        # Gameplay is the expensive part; scoring is seconds of CPU. If the episodes
+        # were played but the aggregation died, rebuild it here rather than throwing
+        # hours of GPU away.
+        #
+        # THE FAILURE THIS RECOVERS FROM. clembench's privateshared imports sklearn.
+        # With that package missing, clemcore skips the game during play (13 of 14
+        # still run) but `clemcore.cli.score` collects the error and calls
+        # **sys.exit(1)** -- no traceback, no message -- killing `playpen eval` before
+        # clemeval ever runs. One absent package therefore cost the aggregation for
+        # every game and every checkpoint of the 2026-07-30 Isambard run, ~3.5 h of
+        # GH200 time that had already produced perfectly good interaction files.
+        if pp_has_gameplay "$dest"; then
+            echo "[ppeval] $row: gameplay is on disk -- rebuilding scores from it" >&2
+            if python "$REPO/experiments/lib/rescore_playpen_eval.py" \
+                   --row "$row" "$EXP_DIR" >&2; then
+                if pp_have_results "$dest"; then
+                    echo "[ppeval] $row: RECOVERED (scored from existing gameplay)" >&2
+                    return 0
+                fi
+            fi
+            echo "[ppeval] $row: recovery failed too -- gameplay kept at $dest" >&2
+        fi
         return "$rc"
     fi
     return 0
+}
+
+# True if a row directory holds played episodes, whether or not they were ever scored.
+# Distinguishes "the GPU work is done, only aggregation failed" (recoverable, cheap)
+# from "nothing ran" (needs the GPU again).
+pp_has_gameplay() {
+    [ -n "$(find "$1" -name 'interactions.json' -print -quit 2>/dev/null)" ]
 }
 
 # The untrained base model, reusing a shared cache so it is played at most once per
@@ -186,20 +215,35 @@ pp_eval_base_cached() {
     fi
 
     echo "[ppeval] base model: $base_model -- not cached, playing once then caching"
-    stage="$(mktemp -d "$cache_root/.staging.XXXXXX")" || return 1
-    if pp_eval_one base "$base_model" "" "$stage"; then
-        printf 'model=%s\nsuite=%s\ngames=%s\nmax_tokens=%s\ntemperature=%s\ncreated=%s\ncluster=%s\n' \
-            "$base_model" "${PPEVAL_SUITE:-}" "${PPEVAL_GAMES:-}" \
-            "${PPEVAL_MAX_TOKENS:-}" "${PPEVAL_TEMPERATURE:-}" \
-            "$(date --iso-8601=seconds)" "${EXP_CLUSTER:-?}" > "$stage/CACHE_INFO.txt"
-        rm -rf "$dir"
-        mkdir -p "$(dirname "$dir")"
-        mv "$stage" "$dir" 2>/dev/null || { mkdir -p "$dir"; cp -r "$stage/." "$dir/"; rm -rf "$stage"; }
-        cp -r "$dir/." "$dest/"
-        return 0
+    # Play into $dest, NOT into a staging directory that gets deleted on failure.
+    #
+    # THE BUG THIS FIXES. The base row used to be played into a temp dir under the
+    # cache and `rm -rf`'d if anything went wrong -- so when the 2026-07-30 run hit the
+    # scoring crash, the checkpoints' gameplay survived under playpen-eval/ and could be
+    # rescored, but the base row's 16 minutes of GH200 was deleted outright and the
+    # experiment was left with no baseline at all. Playing into $dest means a failure
+    # leaves the episodes inside the experiment where pp_eval_one's recovery (and
+    # rescore_playpen_eval.py) can reach them, exactly like every other row.
+    pp_eval_one base "$base_model" "" "$dest" || return 1
+
+    printf 'model=%s\nsuite=%s\ngames=%s\nmax_tokens=%s\ntemperature=%s\ncreated=%s\ncluster=%s\n' \
+        "$base_model" "${PPEVAL_SUITE:-}" "${PPEVAL_GAMES:-}" \
+        "${PPEVAL_MAX_TOKENS:-}" "${PPEVAL_TEMPERATURE:-}" \
+        "$(date --iso-8601=seconds)" "${EXP_CLUSTER:-?}" > "$dest/CACHE_INFO.txt"
+
+    # Publish to the cache via a staging copy, so a concurrent job never sees a
+    # half-written directory as a hit. Failing to cache is not failing the row -- the
+    # result is already in the experiment.
+    if stage="$(mktemp -d "$cache_root/.staging.XXXXXX")"; then
+        if cp -r "$dest/." "$stage/"; then
+            rm -rf "$dir"
+            mkdir -p "$(dirname "$dir")"
+            mv "$stage" "$dir" 2>/dev/null || rm -rf "$stage"
+        else
+            rm -rf "$stage"
+        fi
     fi
-    rm -rf "$stage"
-    return 1
+    return 0
 }
 
 # Narrow the checkpoint list to PPEVAL_CKPTS. Reads paths on stdin, writes the kept

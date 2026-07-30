@@ -23,6 +23,7 @@ Reusable library code lives in the installable package:
 - [`playpen/marshal/advantage.py`](../../playpen/marshal/advantage.py) — turn-level returns + per-seat normalization (pure torch, unit-tested).
 - [`playpen/marshal/selfplay_env.py`](../../playpen/marshal/selfplay_env.py) — a two-seat wrapper over a clembench game (both seats marked "learner").
 - [`playpen/marshal/selfplay_agent.py`](../../playpen/marshal/selfplay_agent.py) — per-seat rollout collection.
+- [`playpen/marshal/turn_rewards.py`](../../playpen/marshal/turn_rewards.py) — optional dense per-turn rewards read off the live game state (stdlib-only, unit-tested).
 - [`playpen/marshal/trainer.py`](../../playpen/marshal/trainer.py) — `MarshalGRPOTrainer` + rollout/reward/dataset helpers.
 - [`playpen/marshal/wandb_utils.py`](../../playpen/marshal/wandb_utils.py) — `WandbSettings`: W&B run setup, offline fallback (stdlib-only; does not import `wandb` until a run starts).
 
@@ -61,6 +62,7 @@ Custom `rollout_func` generation requires vLLM (`use_vllm=True`).
 | `whiten_rewards` | z-score the token-level reward field batch-wide *before* the cumulative sum (mirrors ROLL's `whiten_rewards: true`, set in every shipped MARSHAL selfplay YAML; densifies sparse rewards with a length-dependent component). Default `false`. |
 | `whiten_advantages` | z-score the final advantages batch-wide *after* per-seat normalization (mirrors ROLL's `whiten_advantages: true`; scale stabilization). Default `false`. |
 | `dr_grpo` | run with the **Dr. GRPO** ([arXiv:2503.20783](https://arxiv.org/abs/2503.20783)) recipe: TRL `loss_type='dr_grpo'` (loss normalized by the constant `max_completion_length` ⇒ no length bias) + `scale_rewards='none'` (no std division ⇒ no difficulty bias). Default `false`. |
+| `turn_rewards` | **dense per-turn rewards** read off the game's live state, on top of the terminal outcome. Default `false` (terminal-only, i.e. unchanged). See [below](#dense-per-turn-rewards). |
 
 KL regularization is a CLI switch (not part of the advantage math): `--kl-beta 0.2`
 adds TRL's built-in KL(policy ‖ base model) loss term (MARSHAL's shipped coefficient
@@ -96,6 +98,119 @@ Flip it off for a run without editing the file:
 ```bash
 python examples/marshal/train_selfplay.py --game taboo --no-marshal
 ```
+
+## Dense per-turn rewards
+
+Playpen is **terminal-only** out of the box: clemcore scores an episode `SUCCESS +1`
+/ `FAILURE 0` / `ABORTED -1` and hands that one team scalar to every seat's last
+turn. `turn_rewards: true` (or `--turn-rewards`) adds a second, bounded reward
+channel read off the game's own `GameState` after every step — the route clemcore
+itself suggests for game-specific rewards (see the `reward_func` docstring in
+`clemcore/clemgame/envs/pettingzoo/master.py`). Implementation:
+[`playpen/marshal/turn_rewards.py`](../../playpen/marshal/turn_rewards.py).
+
+Off by default, and with it off a run is byte-identical to before the feature
+existed — no extra rollout columns, no changed values.
+
+### Why
+
+Two problems it addresses, both structural:
+
+1. **Turn-level credit has nothing to work with.** MARSHAL's turn-level estimator
+   attributes reward at each turn boundary, but with a terminal-only reward every
+   turn of a row carries the same return — so `turn_level_rewards: true` currently
+   separates nothing.
+2. **Per-seat credit has nothing to work with either.** clembench gives *both* seats
+   the same team outcome, so `agent_specific_normalization` mean-centers two
+   identical distributions and both seats end up with identical advantages. A
+   per-turn reward is attributed to *the seat that acted* — it is the only mechanism
+   in this pipeline that makes the two seats' advantages genuinely differ.
+
+### What each game supplies
+
+Each extractor mirrors that game's own scorer definitions, and normalizes every
+component to `[-1, 1]`.
+
+| game | components | signal |
+|---|---|---|
+| `wordle` | `closeness`, `format` | how much of the target the guess revealed, using clembench's own `turns_closeness` weights (green 5, yellow 3). Paid as the **gain over the best guess so far**, so it telescopes to ≤ 1 per episode, repeating a guess earns nothing and a worse guess is not punished. `format` charges a guess the game rejected. |
+| `codenames` | `board`, `format` | words **our team** revealed this turn: `+1` team / `−0.5` innocent / `−1` opponent / `−2` assassin, over the board's team count. Read from `board.revealed["team"]`, not the drop in `board.hidden` — codenames simulates the opposing team between rounds, and diffing `hidden` charged us for *their* moves (measured: it cancelled to exactly 0.0 every turn). |
+| `taboo` | `format`, `clue` | which seat's turn broke the response format, or gave a clue containing the target/a related word. |
+| `guesswhat` | `format` | malformed or disallowed question/answer. |
+| `dond` | `proposal`, `format` | committing a well-formed secret proposal; aborting on a parse/rule error. |
+| *anything else* | `format` | generic compliance, from whichever validation flags that game's `GameState` carries. |
+
+`taboo`/`guesswhat` have no progress signal to expose — compliance is genuinely all
+there is. That is a real finding about those games, not a wiring failure; the
+`marshal/turn_rewards/component/*` metrics tell the two apart.
+
+### Scaling: why this cannot overwhelm the terminal reward
+
+Per seat, per episode: components are summed and clipped to `[-1, 1]`, multiplied by
+`turn_reward_scale`, and then — if the episode's total exceeds `turn_reward_budget`
+— the whole episode's shaping vector is **rescaled proportionally** (relative credit
+between turns survives; no sign flips).
+
+The invariant is `|sum of one seat's shaping over one episode| ≤ budget`. Because the
+MARSHAL return is a backward cumulative *sum*, that episode total is exactly what
+competes with the `±1` outcome. With `budget < 0.5` the worst-case swing between two
+episodes is `2 × budget < 1.0`, smaller than the gap between any two distinct
+clembench outcomes (`SUCCESS−FAILURE = 1`, `FAILURE−ABORTED = 1`):
+
+> **shaping can reorder episodes *within* an outcome class, never across one.**
+> A shaped loss can never out-score a bare win.
+
+The launch script and `experiments/lib/write_manifest.py` both check this and warn
+when `turn_reward_budget ≥ 0.5` (or `0`, which disables the cap entirely).
+
+The budget is a **safety net, not the operating point**: pick `turn_reward_scale` so
+a typical episode lands under it, and watch
+`marshal/turn_rewards/budget_clip_rate` — a rate near 1.0 means the cap binds every
+episode, so the budget rather than the game is setting your signal's magnitude and
+only its *shape* survives.
+
+### Both paths
+
+Like `row_context_mode`/`episode_pairing`/`dr_grpo`, this applies **regardless of
+`enabled`** — it governs rollout collection, which the MARSHAL path and the
+`--no-marshal` baseline share. On the MARSHAL path the shaping lands at each turn
+boundary and gets full turn-level credit; on the plain-GRPO path (which consumes only
+one scalar per row) the episode total is added to the terminal reward. Either way
+`marshal/turn_rewards/terminal_mean` logs the **unshaped** outcome, so a turn-rewards
+arm stays comparable with one that has the feature off.
+
+Prefer `fidelity_mode: paper_correct` here. Under `marshal_exact` the pre-sum pass
+subtracts a mean over all turn-boundary slots, which already biases by turn count; a
+denser reward field makes that term larger.
+
+### Knobs
+
+| field | CLI | default | meaning |
+|---|---|---|---|
+| `turn_rewards` | `--turn-rewards` / `--no-turn-rewards` | `false` | master switch |
+| `turn_reward_source` | `--turn-reward-source` | `auto` | `auto` = game extractor else generic; `game` = game-specific only (off, with a warning, for an unregistered game); `generic` = force compliance-only |
+| `turn_reward_scale` | `--turn-reward-scale` | `0.05` | most a single turn can contribute |
+| `turn_reward_budget` | `--turn-reward-budget` | `0.3` | cap on an episode's total; `0` disables (and forfeits the guarantee) |
+| `turn_reward_components` | `--turn-reward-components` | `""` (all) | allowlist, e.g. `closeness`. An unknown name is an error at startup |
+
+```bash
+# wordle with its progress signal, default scaling
+python examples/marshal/train_selfplay.py --game wordle --turn-rewards --max-steps 10
+
+# progress only, no format penalty, and a larger per-turn signal
+python examples/marshal/train_selfplay.py --game wordle --turn-rewards \
+    --turn-reward-components closeness --turn-reward-scale 0.1
+
+# compliance-only ablation arm, on any game
+python examples/marshal/train_selfplay.py --game taboo --turn-rewards \
+    --turn-reward-source generic
+
+# force off for one run regardless of the YAML
+python examples/marshal/train_selfplay.py --game wordle --no-turn-rewards
+```
+
+Metrics: `marshal/turn_rewards/{sum_mean,sum_abs_mean,sum_max_abs,nonzero_rate,budget_clip_rate,terminal_mean}`
+and one `marshal/turn_rewards/component/<name>` per component.
 
 ## Run
 

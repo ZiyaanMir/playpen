@@ -140,12 +140,45 @@ PPEVAL_CKPTS=last PPEVAL_GAMES=dond,guesswhat,taboo \
   experiments/eddie/run_experiment.sh dond
 ```
 
-**Prerequisite:** the `colab-potsdam/playpen-data` validation split must be fetchable
-or already in `$HF_HOME`. The job checks for it before loading any model and stops
-with the one-line command to fetch it, rather than failing once per checkpoint after
-an hour of GPU. Nothing else is needed — unlike lm-eval, this runs in the repo's own
-`.venv` (clemcore + playpen + peft are all there), so there is no second environment
-to build and the job is the same on both clusters.
+**Prerequisites:** the `colab-potsdam/playpen-data` validation split must be fetchable
+or already in `$HF_HOME` (the job checks before loading any model and stops with the
+one-line command to fetch it), and **`scikit-learn` must be in the venv** —
+`clembench/privateshared` imports it. Nothing else: unlike lm-eval, this runs in the
+repo's own `.venv` (clemcore + playpen + peft are all there), so there is no second
+environment to build and the job is the same on both clusters.
+
+### Recovering scores without replaying
+
+Gameplay is hours of GPU; scoring and aggregation are seconds of CPU. If the second
+part fails, the episodes are still on disk:
+
+```bash
+python experiments/lib/rescore_playpen_eval.py <EXP_DIR>
+python experiments/lib/rescore_playpen_eval.py <EXP_DIR> --row checkpoint-100
+python experiments/lib/rescore_playpen_eval.py --all $MARSHAL_RUNS
+```
+
+The job does this itself now — a row that fails with interaction files present is
+rescored in place and reported `RECOVERED` — so this is the manual path for older runs.
+
+Two things make it necessary. `clemcore.cli.score` reports any scoring error with a
+bare `sys.exit(1)`: no traceback, no message, and `playpen eval` dies before `clemeval`
+runs, so **one** broken game costs the aggregation for **all** of them. And a missing
+`scikit-learn` makes `privateshared` exactly that broken game. On 2026-07-30 the pair
+threw away ~3.5 h of GH200 aggregation across 8 rows from interaction files that were
+completely intact; rescoring rebuilt it in under a minute. Hence also
+`pp_eval_base_cached` playing into the experiment directory rather than a staging dir
+it deletes on failure — the base row used to be the one thing that could not be
+recovered.
+
+> **`enable_thinking` lives in the wrong place in `model_registry.json`.** clemcore
+> 3.7.2 only reads `model_config.chat_template_kwargs`; a top-level
+> `model_config.enable_thinking` is silently ignored. Qwen3 then emits `<think>` blocks,
+> clembench parses them as malformed moves, and **every episode aborts** — a whole
+> benchmark at 0 % played that reads as "the model cannot play". `playpen_registry.py`
+> rewrites the key when it clones an entry, and says so in the log. The shared
+> `model_registry.json` still has it at the top level, which matters if you call
+> `playpen eval <model>` directly.
 
 ### Scoring runs that finished before this existed
 
@@ -337,6 +370,40 @@ mean is the honest signal.
 > algorithms and the gradient direction is unchanged, but an on/off length-penalty ablation
 > at `marshal_exact` also silently switches pooling rule — pin `fidelity_mode` consistently
 > across arms, and don't describe such a run as reproducing MARSHAL's shipped normalization.
+
+---
+
+## Dense per-turn rewards (`TR_*`)
+
+Off by default. Turn them on for a run the same way as everything else — an env var,
+which the job script turns into a CLI flag, which overrides the YAML:
+
+```bash
+TR_ENABLE=1 EXP_TAG=turnrew ./run_experiment.sh wordle
+TR_ENABLE=1 TR_SCALE=0.1 TR_BUDGET=0.4 EXP_TAG=turnrew_strong ./run_experiment.sh codenames
+TR_ENABLE=0 EXP_TAG=no_turnrew ./run_experiment.sh wordle        # force off over a YAML that says on
+```
+
+| var | flag | meaning |
+|---|---|---|
+| `TR_ENABLE` | `--turn-rewards` / `--no-turn-rewards` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `LP_*`) |
+| `TR_SOURCE` | `--turn-reward-source` | `auto` (default) / `game` / `generic` |
+| `TR_SCALE` | `--turn-reward-scale` | most a single turn can contribute (default `0.05`) |
+| `TR_BUDGET` | `--turn-reward-budget` | cap on an episode's shaping total (default `0.3`) |
+| `TR_COMPONENTS` | `--turn-reward-components` | allowlist, e.g. `closeness` |
+
+Unlike the length penalty, **no per-game calibration is needed**: extractors normalize
+every component to `[-1, 1]`, so a turn is worth at most `TR_SCALE` and an episode at
+most `TR_BUDGET` whatever the game's turn count. Keeping `TR_BUDGET` under `0.5` is
+what guarantees shaping cannot reorder two different clembench outcomes (the worst-case
+swing `2 × budget` stays under the 1.0 gap between them); `manifest.txt` prints the
+numbers and warns if that stops holding.
+
+Watch `marshal/turn_rewards/sum_abs_mean` (is there any signal at all?) and
+`marshal/turn_rewards/budget_clip_rate` (is the cap, rather than the game, setting the
+magnitude?). A flat zero on taboo or guesswhat is the honest result — their only
+per-turn signal is rule compliance, and a compliant policy trips nothing. Full details
+and the per-game component table: [`examples/marshal/README.md`](../examples/marshal/README.md#dense-per-turn-rewards).
 
 ---
 

@@ -120,6 +120,17 @@ class SelfPlayEnv:
     def num_instances(self) -> int:
         return len(self._instance_rows)
 
+    @property
+    def resolved_game_name(self) -> str:
+        """The clembench name of the game actually loaded, not the string asked for.
+
+        ``resolve_game_spec`` unifies a *selector* against the registry, so
+        ``SelfPlayEnv("wordle")`` may well be running ``wordle_withclue``. Anything
+        keyed by game -- the turn-reward extractor registry, for one -- should key on
+        this, so it cannot resolve against a name the run is not playing.
+        """
+        return str(getattr(self._game_spec, "game_name", self.game_name))
+
     # -- lifecycle ---------------------------------------------------------
 
     def reset(self, instance_idx: int, *, seed: int = 0) -> None:
@@ -225,18 +236,59 @@ class SelfPlayEnv:
 
     @property
     def cumulative_rewards(self) -> List[float]:
-        """Per-seat cumulative reward, read straight from the underlying env.
+        """Per-seat reward accrued **since that seat last acted**, from the env.
 
-        For clembench's default sparse rewards this stays 0 for every seat until
-        the terminal step, at which point every seat receives the shared outcome
-        (SUCCESS: +1, FAILURE: 0, ABORTED: -1). We do not call ``last()`` during a
-        rollout, so this accumulator is never cleared mid-episode.
+        NOT an episode total, despite the name (which is PettingZoo's). clemcore
+        sets ``_cumulative_rewards[current_agent] = 0`` at the top of every step by
+        that agent (``clemcore/clemgame/envs/pettingzoo/master.py``) and then
+        ``_accumulate_rewards()`` adds the step's rewards, so the entry means
+        "everything this seat has been handed since its own last move".
+
+        With clembench's default terminal-only rewards the distinction never shows:
+        every entry is 0 until the terminal step, where each seat receives the shared
+        outcome (SUCCESS ``+1``, FAILURE ``0``, ABORTED ``-1``), so the value read
+        right after a step *is* the reward for that step. Delta arithmetic over this
+        property is therefore correct today -- but it would break the moment a custom
+        clemcore ``reward_func`` made rewards dense, because the reset discards what
+        accrued during the opponent's turns.
+
+        This is why playpen's dense per-turn rewards do not go through clemcore's
+        ``reward_func`` at all: ``playpen/marshal/turn_rewards.py`` runs as a second,
+        independent channel, leaving this one terminal-only and its arithmetic sound.
         """
         unwrapped = self._pz_env.unwrapped
         return [
             float(unwrapped._cumulative_rewards.get(f"player_{i}", 0.0))
             for i in range(self.num_players)
         ]
+
+    @property
+    def game_state(self):
+        """The game's live ``GameState`` (usually a game-specific subclass), or None.
+
+        This is what ``playpen/marshal/turn_rewards.py`` reads a per-turn signal off
+        after each step -- clemcore's own suggested route for game-specific rewards
+        (see its ``reward_func`` docstring). Returns ``None`` rather than raising
+        before the first ``reset()``, or if a clemcore version stops exposing it, so
+        a missing state degrades to "no shaping" instead of killing a run.
+        """
+        try:
+            return self._pz_env.unwrapped.game_master.state
+        except Exception:
+            return None
+
+    def info_for_seat(self, seat: int) -> Dict:
+        """clemcore's ``info`` dict for that seat's most recent step (may be empty).
+
+        No shipped clembench game populates ``info`` today (clemcore's ``GameMaster``
+        allocates it and every game leaves it empty), so this is almost always ``{}``
+        -- read anyway so a game that starts to emit ``turn_score``/``episode_score``
+        there is picked up without a code change here.
+        """
+        try:
+            return dict(self._pz_env.unwrapped.infos.get(f"player_{seat}", {}) or {})
+        except Exception:
+            return {}
 
     @property
     def outcome_success(self) -> bool:

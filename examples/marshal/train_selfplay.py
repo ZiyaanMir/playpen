@@ -52,6 +52,7 @@ from playpen.marshal.config import (
     EPISODE_PAIRING_MODES,
     FIDELITY_MODES,
     ROW_CONTEXT_MODES,
+    TURN_REWARD_SOURCES,
 )
 
 # Custom rollout_func + experimental openenv utils emit warnings; silence unless debugging.
@@ -80,6 +81,11 @@ MARSHAL_CLI_FIELDS = (
     "length_penalty_offset",
     "sampling_top_p",
     "sampling_top_k",
+    "turn_rewards",
+    "turn_reward_source",
+    "turn_reward_scale",
+    "turn_reward_budget",
+    "turn_reward_components",
 )
 
 
@@ -220,6 +226,36 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--length-penalty-offset", type=float, default=None,
                    help="Vertical offset of the raw term (MARSHAL's 'coef', ships 1.0). "
                         "Prefer changing --length-penalty-max-len instead.")
+
+    # Dense per-turn rewards (playpen/marshal/turn_rewards.py; overrides the YAML).
+    # Off by default, and with it off a run is byte-identical to before this feature
+    # existed. Applies on BOTH the MARSHAL path and the --no-marshal baseline, since
+    # it is a rollout-collection feature rather than advantage math.
+    turnrew = p.add_mutually_exclusive_group()
+    turnrew.add_argument("--turn-rewards", dest="turn_rewards", action="store_true", default=None,
+                         help="Force dense per-turn rewards ON (overrides the YAML "
+                              "'turn_rewards'). Reads a bounded per-turn signal off the "
+                              "game's live state and adds it to that turn's reward.")
+    turnrew.add_argument("--no-turn-rewards", dest="turn_rewards", action="store_false",
+                         help="Force dense per-turn rewards OFF (terminal reward only).")
+    p.add_argument("--turn-reward-source", choices=TURN_REWARD_SOURCES, default=None,
+                   help="'auto' (default) = the game's own extractor, else generic "
+                        "format compliance; 'game' = game-specific only (off, with a "
+                        "warning, for an unregistered game); 'generic' = force format "
+                        "compliance even where a richer extractor exists.")
+    p.add_argument("--turn-reward-scale", type=float, default=None,
+                   help="Multiplier on each turn's signal, which extractors normalize "
+                        "to [-1, 1] -- so this is the most a single turn can contribute "
+                        "(YAML 'turn_reward_scale', ships 0.05).")
+    p.add_argument("--turn-reward-budget", type=float, default=None,
+                   help="Cap on |sum of one seat's shaping over one episode| (YAML "
+                        "'turn_reward_budget', ships 0.3). Below 0.5 this GUARANTEES "
+                        "shaping cannot reorder two episodes with different clembench "
+                        "outcomes. 0 disables the cap and that guarantee.")
+    p.add_argument("--turn-reward-components", default=None,
+                   help="Comma-separated allowlist of components to keep (e.g. "
+                        "'closeness' for wordle progress without its format penalty). "
+                        "Empty = all. An unknown name is an error, not a silent no-op.")
 
     # Sampling-tail truncation (maps onto GRPOConfig.top_p / top_k; overrides the YAML).
     # Applies on both the MARSHAL path and the --no-marshal baseline, because it
@@ -372,6 +408,9 @@ def wandb_tags(args: argparse.Namespace, marshal_config) -> list[str]:
         tags.append("dr_grpo")
     if marshal_config.length_penalty:
         tags.append("length_penalty")
+    if marshal_config.turn_rewards:
+        tags.append("turn_rewards")
+        tags.append(f"turn_rewards_{marshal_config.turn_reward_source}")
     if not marshal_config.agent_specific_normalization:
         tags.append("no-seat-norm")
     if args.kl_beta:
@@ -432,6 +471,56 @@ def wandb_config(args: argparse.Namespace, marshal_config, output_dir: str) -> d
             "job_id": os.environ.get("SLURM_JOB_ID") or os.environ.get("JOB_ID") or None,
         },
     }
+
+
+def _report_turn_rewards(marshal_config, env) -> None:
+    """Print what the dense per-turn reward channel will actually do, and warn.
+
+    Resolving the extractor here (rather than leaving it to the first rollout) turns
+    three otherwise-silent misconfigurations into a message you see before the model
+    loads: a game with no registered extractor, a component allowlist that matches
+    nothing, and a budget large enough to out-rank the game outcome itself.
+    """
+    from playpen.marshal.turn_rewards import resolve_turn_reward_extractor
+
+    if not marshal_config.turn_rewards:
+        print("[turn_rewards] off (terminal reward only: SUCCESS +1 / FAILURE 0 / ABORTED -1)")
+        return
+
+    game = getattr(env, "resolved_game_name", None) or env.game_name
+    extractor, spec = resolve_turn_reward_extractor(game, marshal_config)
+    if extractor is None:
+        print(f"[turn_rewards] WARNING: no extractor for game {game!r} under "
+              f"source={marshal_config.turn_reward_source!r} -- turn rewards are INERT "
+              f"for this run. Use --turn-reward-source auto for the generic "
+              f"format-compliance fallback.")
+        return
+
+    active = spec.components or extractor.components
+    print(f"[turn_rewards] ON game={game} extractor={type(extractor).__name__} "
+          f"components={list(active)} scale={spec.scale} budget={spec.budget}")
+    print(f"[turn_rewards] a maximally-shaped turn contributes {spec.scale:+.3f}; an "
+          f"episode's total is capped at +-{spec.budget:.3f} against a +-1 outcome"
+          + ("" if spec.budget else " (UNCAPPED)"))
+    if not marshal_config.turn_reward_budget_is_safe:
+        print("[turn_rewards] WARNING: budget >= 0.5 (or 0 = uncapped). Below 0.5 the "
+              "worst-case shaping swing (2 x budget) stays under the smallest gap "
+              "between two clembench outcomes (1.0), so shaping cannot make a loss "
+              "out-score a win. Above it, it can.")
+    if marshal_config.marshal_exact:
+        print("[turn_rewards] NOTE: fidelity_mode='marshal_exact' subtracts a mean over "
+              "all turn-boundary slots before the cumulative sum, which already biases "
+              "by turn count; a denser reward field enlarges that term. Prefer "
+              "--fidelity-mode paper_correct for runs that use turn rewards.")
+    if not marshal_config.turn_level_rewards:
+        print("[turn_rewards] NOTE: turn_level_rewards is off, so every turn's shaping "
+              "is summed into ONE terminal scalar -- the signal still counts, but none "
+              "of its per-turn credit survives.")
+    if not marshal_config.enabled:
+        print("[turn_rewards] NOTE: --no-marshal is set. TRL consumes one scalar per "
+              "row, so the episode's shaping total is added to the terminal reward "
+              "rather than attributed per turn. marshal/turn_rewards/terminal_mean "
+              "still logs the unshaped outcome.")
 
 
 def main() -> None:
@@ -521,6 +610,11 @@ def main() -> None:
     # 2. Self-play env (persistent across rollout calls) + dataset from packaged instances.
     env = SelfPlayEnv(args.game)
     print(f"[env] game={args.game} num_players={env.num_players}")
+
+    # Dense per-turn rewards. Resolved here, before the model loads, so a bad
+    # component name or an unregistered game fails in the first seconds rather than
+    # after vLLM has come up.
+    _report_turn_rewards(marshal_config, env)
     dataset = build_selfplay_dataset(
         args.game,
         num_players=env.num_players,

@@ -175,6 +175,21 @@ def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
     if _env("LP_COEF"):
         overrides["length_penalty_coef"] = float(_env("LP_COEF"))
 
+    # Dense per-turn rewards, same story as LP_*: train.sh turns these env vars into
+    # CLI flags directly (not via EXTRA_TRAIN_ARGS), so the argv parser below cannot
+    # see them and the manifest would otherwise report the YAML's values for a run
+    # that overrode them. TR_ENABLE is tri-state: "" leaves the YAML alone.
+    if _env("TR_ENABLE") in ("0", "1"):
+        overrides["turn_rewards"] = _env("TR_ENABLE") == "1"
+    if _env("TR_SOURCE"):
+        overrides["turn_reward_source"] = _env("TR_SOURCE")
+    if _env("TR_SCALE"):
+        overrides["turn_reward_scale"] = float(_env("TR_SCALE"))
+    if _env("TR_BUDGET"):
+        overrides["turn_reward_budget"] = float(_env("TR_BUDGET"))
+    if _env("TR_COMPONENTS"):
+        overrides["turn_reward_components"] = _env("TR_COMPONENTS")
+
     # EXTRA_TRAIN_ARGS is how a run varies the algorithm (EXTRA_TRAIN_ARGS=
     # "--no-length-penalty --gamma 0.95"). Those flags override the YAML at train
     # time, so a manifest that ignored them would report the OPPOSITE of what ran --
@@ -271,6 +286,38 @@ def _length_penalty_summary(cfg: dict) -> dict:
     return out
 
 
+def _turn_reward_summary(cfg: dict) -> dict:
+    """What the dense per-turn reward channel is worth, in reward units.
+
+    Same motivation as :func:`_length_penalty_summary` -- a reward term that is easy
+    to enable and hard to notice doing nothing -- but the numbers here are analytic
+    rather than estimated: extractors normalize every component to ``[-1, 1]``, so a
+    turn is worth at most ``turn_reward_scale`` and an episode at most
+    ``turn_reward_budget``, whatever the game or the turn count turns out to be.
+    """
+    if not cfg.get("turn_rewards"):
+        return {"enabled": False}
+    out = {
+        "enabled": True,
+        "source": cfg.get("turn_reward_source"),
+        "max_per_turn": round(float(cfg.get("turn_reward_scale", 0.0)), 5),
+        "max_per_episode": round(float(cfg.get("turn_reward_budget", 0.0)), 5),
+        "components": cfg.get("turn_reward_components") or "<all>",
+    }
+    try:
+        from playpen.marshal.turn_rewards import resolve_extractor_class
+
+        cls = resolve_extractor_class(_env("GAME"))
+        out["extractor"] = cls.__name__ if cls else "FormatComplianceExtractor (fallback)"
+    except Exception:
+        pass
+    budget = out["max_per_episode"]
+    # 0.5 is where 2 x budget stops being smaller than the 1.0 gap between two
+    # clembench outcomes; 0 means no cap at all.
+    out["preserves_outcome_ordering"] = bool(0.0 < budget < 0.5)
+    return out
+
+
 def main() -> None:
     exp_dir = sys.argv[1] if len(sys.argv) > 1 else _env("EXP_DIR")
     if not exp_dir:
@@ -303,6 +350,7 @@ def main() -> None:
         "marshal_config": marshal_cfg,
         "marshal_config_source": _env("MARSHAL_CONFIG"),
         "length_penalty_effect": _length_penalty_summary(marshal_cfg),
+        "turn_reward_effect": _turn_reward_summary(marshal_cfg),
         "wandb": _wandb_summary(),
         "evaluation": {
             "tasks": _env("EVAL_TASKS"),
@@ -374,6 +422,31 @@ def main() -> None:
                     "           Raise LP_MAX_LEN or lower LP_COEF so the episode total "
                     "stays under ~0.5."
                 )
+
+    tre = manifest["turn_reward_effect"]
+    if tre.get("enabled"):
+        lines += [
+            "",
+            "-- turn rewards, in reward units (game outcome is +1 / 0 / -1) -------",
+            f"  extractor                    {tre.get('extractor', '?')} "
+            f"(source={tre.get('source')})",
+            f"  components                   {tre.get('components')}",
+            f"  most a single turn is worth  {tre['max_per_turn']:+.4f}",
+            f"  most an episode is worth     +-{tre['max_per_episode']:.4f}"
+            + ("" if tre["max_per_episode"] else "   (UNCAPPED)"),
+        ]
+        if tre["preserves_outcome_ordering"]:
+            lines.append(
+                "  bound OK: 2 x budget < 1.0, the smallest gap between two clembench\n"
+                "           outcomes, so shaping cannot make a loss out-score a win."
+            )
+        else:
+            lines.append(
+                "  WARNING: the per-episode budget is >= 0.5 (or uncapped), so shaping\n"
+                "           can swing an episode by more than the gap between two\n"
+                "           outcomes -- a well-shaped loss can beat a bare win.\n"
+                "           Lower TR_BUDGET below 0.5 to restore the guarantee."
+            )
 
     wb = manifest["wandb"]
     lines += ["", "-- weights & biases -------------------------------------------------"]

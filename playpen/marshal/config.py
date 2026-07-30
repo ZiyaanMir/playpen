@@ -29,6 +29,15 @@ ADVANTAGE_NORM_MODES = ("mean", "mean_std")
 FIDELITY_MODES = ("paper_correct", "marshal_exact")
 ROW_CONTEXT_MODES = ("exact", "spliced")
 EPISODE_PAIRING_MODES = ("shared", "replay")
+# Re-exported from turn_rewards so argparse `choices=` and the validation below
+# cannot drift from each other. turn_rewards.py is stdlib-only, like this module.
+TURN_REWARD_SOURCES = ("auto", "game", "generic")
+
+# Above this episode-shaping budget, turn rewards can swing an episode's total by
+# more than the gap between two clembench outcomes (SUCCESS +1 / FAILURE 0 /
+# ABORTED -1, i.e. a gap of 1.0), so a well-shaped loss could out-score a bare win.
+# See MarshalConfig.turn_reward_budget.
+TURN_REWARD_SAFE_BUDGET = 0.5
 
 
 @dataclass
@@ -217,6 +226,76 @@ class MarshalConfig:
             This is a mitigation, not the cure -- the root cause is running without a KL
             term, which MARSHAL's own shipped ``*_selfplay.yaml`` never does
             (``use_kl_loss: true``, ``kl_loss_coef: 0.20``).
+        turn_rewards: Master switch for the *dense per-turn reward* channel
+            (``playpen/marshal/turn_rewards.py``). Default ``False``, and with it off
+            nothing about a run changes: rollouts collect the same terminal-only
+            ``+1/0/-1`` team reward they always have, and none of the
+            ``turn_reward_*`` fields below have any effect.
+
+            When ``True``, after every turn the game's live ``GameState`` is read for
+            a small per-turn signal (wordle: how much of the target the guess
+            revealed; codenames: which words the board gave up; taboo/guesswhat/dond:
+            which seat's turn broke a rule), scaled by ``turn_reward_scale``, capped
+            by ``turn_reward_budget``, and *added to that turn's* reward before any
+            MARSHAL normalization.
+
+            Like ``row_context_mode`` and ``episode_pairing``, this applies
+            **regardless of** ``enabled``, because it governs rollout collection,
+            which the MARSHAL path and the plain-GRPO baseline share. On the MARSHAL
+            path the shaping lands at each turn boundary and gets full turn-level
+            credit; on the plain-GRPO path TRL only consumes one scalar per row, so
+            the episode's shaping total is added to it. Either way the *unshaped*
+            outcome is still logged separately as
+            ``marshal/turn_rewards/terminal_mean``, so an arm with turn rewards on
+            stays comparable with one that has them off.
+
+            Two things worth knowing before turning it on:
+
+            * It is what makes ``agent_specific_normalization`` do real work here.
+              clembench gives both self-play seats the *same* team outcome, so
+              per-seat pooling currently mean-centers two identical distributions.
+              A per-turn reward is attributed to the seat that acted, which is the
+              only mechanism in this pipeline that makes the seats' advantages differ.
+            * Prefer ``fidelity_mode="paper_correct"``. Under ``marshal_exact`` the
+              pre-sum normalization subtracts a mean over *all* turn-boundary slots,
+              which already biases by turn count; a denser reward field makes that
+              term larger, not smaller.
+        turn_reward_source: Which extractor supplies the signal. ``"auto"`` (default)
+            uses the game's own extractor when one is registered and falls back to
+            generic format compliance otherwise; ``"game"`` refuses the fallback
+            (turn rewards are simply off for an unregistered game, with a warning),
+            which is the honest setting when a result depends on the game-specific
+            signal; ``"generic"`` forces format compliance even for a game that has
+            a richer extractor, as a "compliance only" ablation.
+        turn_reward_scale: Multiplier on each turn's combined signal, which the
+            extractors normalize to ``[-1, 1]``. So this is the *maximum* magnitude a
+            single turn can contribute. Default ``0.05``: against a ``+-1`` outcome,
+            a seat would need 20 maximally-shaped turns to accumulate the outcome's
+            magnitude, and no shipped preset plays that many.
+        turn_reward_budget: Hard cap on ``|sum of one seat's shaping over one
+            episode|``, applied as a proportional rescale of the whole episode's
+            shaping vector (so relative credit between turns survives and no sign
+            flips). This is the knob that makes "cannot overwhelm the terminal
+            reward" a *guarantee* rather than a hope: the backward cumulative return
+            means the episode total is what competes with the outcome, so with
+            ``budget < 0.5`` the worst-case swing between two episodes is
+            ``2 * budget < 1.0``, smaller than the gap between any two distinct
+            clembench outcomes -- shaping can reorder episodes *within* an outcome
+            class but never across one. Default ``0.3``. ``0`` disables the cap and
+            gives up that guarantee. Values ``>= 0.5``
+            (``TURN_REWARD_SAFE_BUDGET``) are allowed but warned about by the launch
+            script.
+
+            It is a safety net, not the operating point -- tune ``turn_reward_scale``
+            so a typical episode lands under it, and watch
+            ``marshal/turn_rewards/budget_clip_rate``: near 1.0 means the cap binds
+            every episode, so only the *shape* of the signal survives and its
+            magnitude is being set by this field instead of by the game.
+        turn_reward_components: Comma-separated allowlist of component names to keep
+            (e.g. ``"closeness"`` to run wordle's progress signal without its format
+            penalty). Empty (default) keeps every component the extractor emits.
+            Unknown names are rejected at build time against the resolved extractor's
+            component list, so a typo cannot silently disable the signal.
         sampling_top_k: Top-k cutoff for generation, mapped onto ``GRPOConfig.top_k``.
             ``0`` disables it (TRL's default). Default ``50``.
 
@@ -253,6 +332,11 @@ class MarshalConfig:
     episode_pairing: str = "shared"
     sampling_top_p: float = 0.95
     sampling_top_k: int = 50
+    turn_rewards: bool = False
+    turn_reward_source: str = "auto"
+    turn_reward_scale: float = 0.05
+    turn_reward_budget: float = 0.3
+    turn_reward_components: str = ""
 
     def __post_init__(self) -> None:
         if self.advantage_norm_mode not in ADVANTAGE_NORM_MODES:
@@ -303,6 +387,27 @@ class MarshalConfig:
                 "length_penalty_max_len must be greater than length_penalty_min_len, got "
                 f"{self.length_penalty_max_len} <= {self.length_penalty_min_len}"
             )
+        if self.turn_reward_source not in TURN_REWARD_SOURCES:
+            raise ValueError(
+                f"turn_reward_source must be one of {TURN_REWARD_SOURCES}, "
+                f"got {self.turn_reward_source!r}"
+            )
+        self.turn_reward_scale = float(self.turn_reward_scale)
+        self.turn_reward_budget = float(self.turn_reward_budget)
+        self.turn_reward_components = str(self.turn_reward_components or "")
+        # A negative scale silently inverts every component (rewarding what the
+        # extractor meant to penalize); a negative budget would make the rescale
+        # factor negative and do the same. Neither is a thing anyone means.
+        if self.turn_reward_scale < 0.0:
+            raise ValueError(
+                f"turn_reward_scale must be >= 0, got {self.turn_reward_scale}. Use 0 to "
+                "make the shaping inert, or turn_rewards: false to switch it off."
+            )
+        if self.turn_reward_budget < 0.0:
+            raise ValueError(
+                f"turn_reward_budget must be >= 0, got {self.turn_reward_budget}. "
+                "Use 0 to disable the per-episode cap."
+            )
 
     def length_penalty_kwargs(self) -> Dict[str, Any] | None:
         """Kwargs for ``advantage.LengthPenaltySpec``, or ``None`` when disabled.
@@ -319,6 +424,38 @@ class MarshalConfig:
             "max_len": self.length_penalty_max_len,
             "offset": self.length_penalty_offset,
         }
+
+    def turn_reward_component_list(self) -> tuple:
+        """``turn_reward_components`` parsed into a tuple; empty means "all"."""
+        return tuple(
+            name.strip() for name in self.turn_reward_components.split(",") if name.strip()
+        )
+
+    def turn_reward_kwargs(self) -> Dict[str, Any] | None:
+        """Kwargs for ``turn_rewards.TurnRewardSpec``, or ``None`` when disabled.
+
+        A plain dict rather than the dataclass so this module keeps its stdlib-only
+        import profile (same contract as :meth:`length_penalty_kwargs`).
+        """
+        if not self.turn_rewards:
+            return None
+        return {
+            "scale": self.turn_reward_scale,
+            "budget": self.turn_reward_budget,
+            "components": self.turn_reward_component_list(),
+        }
+
+    @property
+    def turn_reward_budget_is_safe(self) -> bool:
+        """Whether the budget still guarantees shaping cannot reorder two outcomes.
+
+        See ``turn_reward_budget``: the worst-case swing is ``2 * budget``, and the
+        smallest gap between two distinct clembench outcomes is 1.0. A disabled cap
+        (``0``) is *not* safe -- there is then no bound at all.
+        """
+        if not self.turn_rewards:
+            return True
+        return 0.0 < self.turn_reward_budget < TURN_REWARD_SAFE_BUDGET
 
     @property
     def marshal_exact(self) -> bool:

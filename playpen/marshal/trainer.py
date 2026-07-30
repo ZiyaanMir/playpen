@@ -38,6 +38,7 @@ from playpen.marshal.advantage import (
 from playpen.marshal.config import MarshalConfig
 from playpen.marshal.selfplay_agent import play_selfplay_episode
 from playpen.marshal.selfplay_env import SelfPlayEnv, list_instance_indices
+from playpen.marshal.turn_rewards import TurnRewardTracker, resolve_turn_reward_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +134,11 @@ def _paired_slot_start(prompts: List[str], index: int, num_players: int) -> Opti
 def build_reward_func(config: MarshalConfig) -> Callable[..., List[float]]:
     """Return a TRL reward function that echoes the per-row terminal reward.
 
-    Terminal rewards from clembench: SUCCESS +1, FAILURE 0, ABORTED -1.
+    Terminal rewards from clembench: SUCCESS +1, FAILURE 0, ABORTED -1. With
+    ``turn_rewards`` on, the row's bounded per-episode shaping total is already
+    included in the ``rewards`` value the rollout emits (see
+    :func:`build_selfplay_rollout_func`); this function just passes through whatever
+    it is handed.
 
     When MARSHAL is disabled, TRL's stock group-relative normalization consumes
     this scalar, and we apply the Wordle-example degenerate-all-abort shaping
@@ -188,12 +193,29 @@ def build_selfplay_rollout_func(
     mask), ``owner_mask`` (a copy that survives into ``inputs`` for our use),
     ``turn_end_positions``, ``turn_rewards``, ``seat`` and the scalar ``rewards``.
 
-    ``config.row_context_mode`` and ``config.episode_pairing`` are both read here (not
-    behind ``config.enabled``) because rollout collection is shared by the MARSHAL path
-    and the plain-GRPO baseline alike.
+    ``config.row_context_mode``, ``config.episode_pairing`` and ``config.turn_rewards``
+    are all read here (not behind ``config.enabled``) because rollout collection is
+    shared by the MARSHAL path and the plain-GRPO baseline alike.
+
+    With ``turn_rewards`` on, each episode gets a fresh
+    :class:`~playpen.marshal.turn_rewards.TurnRewardTracker`, its bounded per-turn
+    shaping is folded into ``turn_rewards`` (where the MARSHAL path gives it
+    turn-level credit), and the episode total is *also* added to the scalar
+    ``rewards`` -- because that scalar is the only thing the plain-GRPO path
+    consumes, and a feature that silently does nothing on one of the two arms is
+    worse than no feature. ``terminal_reward`` keeps the unshaped outcome so both
+    arms can still be compared on game outcome alone.
     """
     paired = config.episode_pairing == "shared"
     num_players = int(env.num_players)
+    # Both names read defensively: an env stub that only implements what a rollout
+    # needs carries neither, and with turn rewards off the name is never consulted.
+    game_name = getattr(env, "resolved_game_name", None) or getattr(env, "game_name", "")
+    extractor, turn_reward_spec = resolve_turn_reward_extractor(game_name, config)
+    # Component keys are fixed at build time and emitted for EVERY row (0.0 when a
+    # component did not fire), so the extra-field lists TRL zips into `inputs` stay
+    # rectangular across a batch.
+    component_keys = tuple(extractor.components) if extractor is not None else ()
 
     def rollout_func(prompts: List[str], trainer: "trl.GRPOTrainer") -> Dict[str, list]:
         tokenizer = trainer.processing_class
@@ -212,8 +234,21 @@ def build_selfplay_rollout_func(
             "rewards": [],
             "drifted": [],
         }
+        # Only when the feature is on: with it off the rollout dict -- and therefore
+        # everything TRL merges into `inputs` -- is exactly what it was before.
+        if extractor is not None:
+            out["terminal_reward"] = []
+            out["turn_reward_sum"] = []
+            out["turn_reward_clipped"] = []
+            for key in component_keys:
+                out[f"turn_reward_component_{key}"] = []
 
         def play(instance_idx: int):
+            # A fresh tracker per episode: extractors carry episode state (wordle's
+            # best closeness, the codenames board) that must not leak between games.
+            tracker = (
+                TurnRewardTracker(extractor, turn_reward_spec) if extractor is not None else None
+            )
             return play_selfplay_episode(
                 env,
                 trainer,
@@ -223,6 +258,7 @@ def build_selfplay_rollout_func(
                 max_turns=max_turns,
                 strip_think=strip_think,
                 row_context_mode=config.row_context_mode,
+                turn_reward_tracker=tracker,
             )
 
         # slot start index -> that slot's episode, held only until its last seat is
@@ -257,7 +293,15 @@ def build_selfplay_rollout_func(
             out["turn_end_positions"].append(list(row.turn_end_positions))
             out["turn_rewards"].append(list(row.turn_rewards))
             out["seat"].append(int(row.seat))
-            out["rewards"].append(float(row.terminal_reward))
+            shaping = float(getattr(row, "shaping_reward", 0.0))
+            out["rewards"].append(float(row.terminal_reward) + shaping)
+            if extractor is not None:
+                out["terminal_reward"].append(float(row.terminal_reward))
+                out["turn_reward_sum"].append(shaping)
+                out["turn_reward_clipped"].append(bool(getattr(row, "shaping_clipped", False)))
+                components = getattr(row, "shaping_components", None) or {}
+                for key in component_keys:
+                    out[f"turn_reward_component_{key}"].append(float(components.get(key, 0.0)))
             out["drifted"].append(bool(getattr(row, "drifted", False)))
         return out
 
@@ -316,6 +360,9 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         # they harm the MARSHAL path, so gating them on `enabled` would hide the two
         # failures most likely to be mistaken for "the model just isn't learning".
         self._log_rollout_health(inputs, output)
+        # Also on both paths: turn rewards are a rollout-collection feature, so they
+        # are live for the plain-GRPO baseline too and must be observable there.
+        self._log_turn_reward_stats(inputs)
         if not self.marshal_config.enabled:
             return output
         output["advantages"] = self._compute_marshal_advantages(inputs, output)
@@ -406,6 +453,58 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
                         self.IS_RATIO_WARN_THRESHOLD,
                         1.0 / max(mean_ratio, 1e-12),
                     )
+        except Exception:
+            # Metrics logging must never break training.
+            pass
+
+    #: Prefix under which the rollout emits one column per turn-reward component.
+    _COMPONENT_PREFIX = "turn_reward_component_"
+
+    def _log_turn_reward_stats(self, inputs) -> None:
+        """Log the dense per-turn reward channel: magnitude, saturation, components.
+
+        Nothing is logged when the feature is off, so a run without it keeps exactly
+        the metric set it had before.
+
+        The three that matter for calibration:
+
+        * ``turn_rewards/sum_mean`` / ``sum_abs_mean`` -- how much shaping an episode
+          actually accumulates, against a ``+-1`` outcome. If this is ~0 the signal is
+          inert for this game (which is a real finding for e.g. taboo, whose only
+          per-turn signal is compliance), not necessarily a wiring bug -- the
+          component columns tell the two apart.
+        * ``turn_rewards/budget_clip_rate`` -- how often the per-episode budget had to
+          rescale. Near 1.0 means ``turn_reward_scale`` is too large for this game's
+          turn count and the budget, not the game, is setting the magnitude.
+        * ``turn_rewards/terminal_mean`` -- the UNSHAPED outcome. TRL's own ``reward``
+          metric includes the shaping once this is on, so this is the column that
+          stays comparable with a turn-rewards-off arm.
+        """
+        try:
+            # The rollout emits this column only when turn rewards are on, so its
+            # absence -- not a zero total -- is what means "feature off". An episode
+            # that genuinely scored 0 shaping still gets logged as a 0.
+            if not inputs or "turn_reward_sum" not in inputs[0]:
+                return
+            metrics = self._metrics["train"]
+            sums = [float(inp.get("turn_reward_sum", 0.0)) for inp in inputs]
+            n = len(sums)
+            metrics["marshal/turn_rewards/sum_mean"].append(sum(sums) / n)
+            metrics["marshal/turn_rewards/sum_abs_mean"].append(
+                sum(abs(value) for value in sums) / n
+            )
+            metrics["marshal/turn_rewards/sum_max_abs"].append(max(abs(value) for value in sums))
+            clipped = [bool(inp.get("turn_reward_clipped", False)) for inp in inputs]
+            metrics["marshal/turn_rewards/budget_clip_rate"].append(sum(clipped) / n)
+            metrics["marshal/turn_rewards/nonzero_rate"].append(
+                sum(1 for value in sums if value) / n
+            )
+            terminal = [float(inp.get("terminal_reward", 0.0)) for inp in inputs]
+            metrics["marshal/turn_rewards/terminal_mean"].append(sum(terminal) / n)
+            for key in {k for inp in inputs for k in inp if k.startswith(self._COMPONENT_PREFIX)}:
+                name = key[len(self._COMPONENT_PREFIX):]
+                values = [float(inp.get(key, 0.0)) for inp in inputs]
+                metrics[f"marshal/turn_rewards/component/{name}"].append(sum(values) / n)
         except Exception:
             # Metrics logging must never break training.
             pass

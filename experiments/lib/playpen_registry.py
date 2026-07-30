@@ -144,8 +144,48 @@ def build_spec(model_name: str, base_model: str, adapter: str | None, repo: str)
         model_config["peft_model"] = adapter
     else:
         model_config.pop("peft_model", None)
+
+    extra = _fix_thinking_mode(model_config)
     spec["model_config"] = model_config
-    return spec, note
+    return spec, note + extra
+
+
+def _fix_thinking_mode(model_config: dict) -> str:
+    """Move a top-level ``enable_thinking`` into ``chat_template_kwargs``.
+
+    THE BUG THIS FIXES, and it is expensive. ``model_registry.json`` writes
+
+        "model_config": {"enable_thinking": false, ...}
+
+    but clemcore 3.7.2 only ever reads ``model_config["chat_template_kwargs"]``
+    (``huggingface_local_api.py:284``) and passes *that* to ``apply_chat_template``. A
+    top-level ``enable_thinking`` is therefore **silently ignored** -- no warning, no
+    error -- and Qwen3's template falls back to thinking ON. Verified on the tokenizer:
+
+        no kwargs                          -> "<|im_start|>assistant\\n"
+        chat_template_kwargs enable_thinking=False
+                                           -> "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n"
+
+    Without the pre-filled empty block the model opens a real ``<think>`` block,
+    clembench parses that as a malformed move, and the episode is scored ABORTED. The
+    result is a whole benchmark at 0 % played -- which reads as "the model cannot play"
+    rather than "the harness asked it to think out loud". That is exactly what the
+    2026-07-30 Isambard run produced: 13 of 14 games at 0 % played, identically across
+    all 7 checkpoints.
+
+    Fixed here rather than in ``model_registry.json`` so evaluation is correct without
+    editing a shared, committed file that training also reads. ``check_chat_template_kwargs``
+    only logs, so passing the key to a model whose template lacks it is harmless.
+    """
+    thinking = model_config.pop("enable_thinking", None)
+    if thinking is None:
+        return ""
+    kwargs = dict(model_config.get("chat_template_kwargs") or {})
+    kwargs.setdefault("enable_thinking", thinking)      # an explicit one already wins
+    model_config["chat_template_kwargs"] = kwargs
+    return (f"\n[registry] moved enable_thinking={thinking} into chat_template_kwargs "
+            f"-- clemcore ignores it at the top level, which leaves Qwen3 thinking out "
+            f"loud and every episode ABORTED")
 
 
 def main() -> None:

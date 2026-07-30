@@ -68,6 +68,7 @@ exp_load_preset() {
               NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
               VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
+              TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
               PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
               PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT \
@@ -108,6 +109,17 @@ exp_load_preset() {
     # value stands. See experiments/README.md for how these were calibrated.
     LP_MAX_LEN="${LP_MAX_LEN:-}"
     LP_COEF="${LP_COEF:-}"
+
+    # Dense per-turn rewards (playpen/marshal/turn_rewards.py). Same convention as
+    # LP_*: empty => don't pass the flag at all, so the YAML value stands. Set
+    # TR_ENABLE=1 to force them on for a run, TR_ENABLE=0 to force them off.
+    # TR_SCALE/TR_BUDGET are the calibration knobs -- see the marshal_config.yaml
+    # block and experiments/README.md.
+    TR_ENABLE="${TR_ENABLE:-}"
+    TR_SOURCE="${TR_SOURCE:-}"
+    TR_SCALE="${TR_SCALE:-}"
+    TR_BUDGET="${TR_BUDGET:-}"
+    TR_COMPONENTS="${TR_COMPONENTS:-}"
 
     # --- Weights & Biases ----------------------------------------------------
     # Named WB_* rather than WANDB_* on purpose: WANDB_MODE, WANDB_PROJECT and
@@ -159,6 +171,7 @@ exp_load_preset() {
            NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
            VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
+           TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
            PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
            PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT \
@@ -501,6 +514,8 @@ exp_banner() {
 "${NUM_GENERATIONS:-?} generations"
         echo "max_compl   = ${MAX_COMPLETION_LENGTH:-?} tokens/turn"
         echo "len_penalty = max_len=${LP_MAX_LEN:-<yaml>} coef=${LP_COEF:-<yaml>}"
+        echo "turn_rewards= ${TR_ENABLE:-<yaml>} scale=${TR_SCALE:-<yaml>} "\
+"budget=${TR_BUDGET:-<yaml>} source=${TR_SOURCE:-<yaml>}"
         if [ "${WB_ENABLE:-1}" = "1" ] && [ "${WB_MODE:-auto}" != "disabled" ]; then
             echo "wandb       = ${WB_PROJECT:-playpen-marshal}${WB_ENTITY:+ ($WB_ENTITY)} "\
 "mode=${WB_MODE:-auto} run=${EXP_ID:-?}"

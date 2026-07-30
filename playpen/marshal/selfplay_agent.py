@@ -255,6 +255,19 @@ class SeatRollout:
     turn_rewards: List[float] = field(default_factory=list)
     terminal_reward: float = 0.0
     drifted: bool = False
+    # Dense per-turn shaping (``playpen/marshal/turn_rewards.py``), already folded
+    # into ``turn_rewards``. Kept as a separate total so the trainer can log it, and
+    # so the plain-GRPO path -- which only ever sees one scalar per row -- can add it
+    # to the terminal reward without having to re-derive it. 0.0 when the feature is
+    # off, which is the default.
+    shaping_reward: float = 0.0
+    # Whether the per-episode budget had to rescale this seat's shaping (see
+    # ``TurnRewardTracker.finalize``). Logged as a calibration signal: a rate near 1
+    # means ``turn_reward_scale`` is set too high for the game's turn count.
+    shaping_clipped: bool = False
+    # Unscaled per-component sums, for the ``marshal/turn_rewards/component/*``
+    # metrics. Empty when the feature is off.
+    shaping_components: Dict[str, float] = field(default_factory=dict)
 
     @property
     def has_model_tokens(self) -> bool:
@@ -348,7 +361,31 @@ class _SeatBuilder:
         if self.turn_rewards:
             self.turn_rewards[-1] += float(reward)
 
-    def build(self, terminal_reward: float) -> SeatRollout:
+    def add_turn_shaping(self, values: Sequence[float]) -> float:
+        """Fold a seat's per-turn shaping into its turn rewards; return the total.
+
+        ``values`` is aligned with ``turn_end_positions`` (one entry per turn, in
+        order). Anything past this seat's recorded turns is dropped rather than
+        summed onto the last one -- a shaping value with no turn boundary to sit at
+        has no place in the return, and silently relocating it would put reward on a
+        turn that did not earn it.
+        """
+        total = 0.0
+        for index, value in enumerate(values):
+            if index >= len(self.turn_rewards):
+                break
+            self.turn_rewards[index] += float(value)
+            total += float(value)
+        return total
+
+    def build(
+        self,
+        terminal_reward: float,
+        *,
+        shaping_reward: float = 0.0,
+        shaping_clipped: bool = False,
+        shaping_components: Optional[Dict[str, float]] = None,
+    ) -> SeatRollout:
         return SeatRollout(
             seat=self.seat,
             prompt_ids=self.prompt_ids,
@@ -358,7 +395,31 @@ class _SeatBuilder:
             turn_end_positions=self.turn_end_positions,
             turn_rewards=self.turn_rewards,
             terminal_reward=float(terminal_reward),
+            shaping_reward=float(shaping_reward),
+            shaping_clipped=bool(shaping_clipped),
+            shaping_components=dict(shaping_components or {}),
         )
+
+
+def _turn_context(env: SelfPlayEnv, seat: int, turn_index: int, response: str):
+    """Bundle what a turn-reward extractor may inspect for one completed turn.
+
+    Everything is read through ``getattr`` with a default: the scripted envs in the
+    test suite implement only what a rollout needs (``step``/``observe``/rewards) and
+    carry no game master at all, and they must keep working unchanged.
+    """
+    from playpen.marshal.turn_rewards import TurnContext
+
+    game_state = getattr(env, "game_state", None)
+    info_for_seat = getattr(env, "info_for_seat", None)
+    return TurnContext(
+        seat=seat,
+        turn_index=turn_index,
+        state=game_state,
+        info=info_for_seat(seat) if callable(info_for_seat) else {},
+        response=response,
+        done=bool(getattr(env, "done", False)),
+    )
 
 
 def play_selfplay_episode(
@@ -371,6 +432,7 @@ def play_selfplay_episode(
     max_turns: int = 100,
     strip_think: bool = True,
     row_context_mode: str = "exact",
+    turn_reward_tracker=None,
 ) -> Dict[int, SeatRollout]:
     """Play one full self-play episode and return each seat's rollout.
 
@@ -393,6 +455,15 @@ def play_selfplay_episode(
     * ``"spliced"`` -- legacy: generate from a freshly re-rendered chat template while
       the row splices in raw environment text. Reproduces pre-fix runs; the trained
       sequence does not match the generated one from turn 2 onward.
+
+    ``turn_reward_tracker`` (``None`` = off, the default, and byte-identical to
+    before this parameter existed) is a
+    ``playpen.marshal.turn_rewards.TurnRewardTracker``. When given, it is asked for a
+    per-turn signal after every step, and at episode end its scaled, budget-capped
+    values are added to each seat's ``turn_rewards`` -- *on top of* the env's terminal
+    reward, never instead of it. It reads the game's live state through
+    ``SelfPlayEnv.game_state``, so an env that does not expose one (a stubbed test
+    env) simply produces no shaping.
 
     ``strip_think`` (default on, and a no-op for non-reasoning models) removes the
     ``<think>`` block from the utterance handed to the game and to clemcore's
@@ -494,6 +565,15 @@ def play_selfplay_episode(
         cum = env.cumulative_rewards
         builder.set_last_turn_reward(cum[seat] - prev_cum[seat])
         prev_cum[seat] = cum[seat]
+
+        # Dense per-turn signal, collected raw here and scaled/capped at episode end
+        # (a running cap would make early turns worth more than late ones). Recorded
+        # against this seat's own turn index so it lands on the boundary it earned.
+        if turn_reward_tracker is not None:
+            turn_reward_tracker.on_turn(
+                _turn_context(env, seat, len(builder.turn_rewards) - 1, game_response)
+            )
+
         turn += 1
 
     # Reconcile the terminal team reward: any seat whose cumulative reward moved
@@ -505,6 +585,19 @@ def play_selfplay_episode(
         if residual != 0.0 and builder.has_turns:
             builder.add_to_last_turn_reward(residual)
 
+    # Scale + budget-cap the episode's shaping and fold it into the turn rewards.
+    # After the terminal reconciliation above, so the two channels compose rather
+    # than one overwriting the other.
+    shaping: Dict[int, List[float]] = (
+        turn_reward_tracker.finalize() if turn_reward_tracker is not None else {}
+    )
+    shaping_totals: Dict[int, float] = {}
+    for seat, values in shaping.items():
+        builder = builders.get(seat)
+        if builder is None:
+            continue
+        shaping_totals[seat] = builder.add_turn_shaping(values)
+
     env.finalize()
 
     pad_id = getattr(tokenizer, "pad_token_id", None)
@@ -515,7 +608,18 @@ def play_selfplay_episode(
     for seat, builder in builders.items():
         rollout = None
         if builder.has_turns and not builder.invalid:
-            rollout = builder.build(terminal_reward=final_cum[seat])
+            rollout = builder.build(
+                terminal_reward=final_cum[seat],
+                shaping_reward=shaping_totals.get(seat, 0.0),
+                shaping_clipped=(
+                    turn_reward_tracker is not None and turn_reward_tracker.was_clipped(seat)
+                ),
+                shaping_components=(
+                    turn_reward_tracker.component_totals(seat)
+                    if turn_reward_tracker is not None
+                    else None
+                ),
+            )
         if rollout is not None and rollout.has_model_tokens:
             rollouts[seat] = rollout
         else:

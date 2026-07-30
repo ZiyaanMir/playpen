@@ -131,6 +131,88 @@ whiten_advantages: true
 dr_grpo: false
 
 # ---------------------------------------------------------------------------
+# Dense PER-TURN REWARDS (playpen/marshal/turn_rewards.py).
+#
+# Playpen is terminal-only out of the box: clemcore scores an episode SUCCESS +1 /
+# FAILURE 0 / ABORTED -1 and hands that one team scalar to every seat's last turn.
+# Turning this on adds a second, bounded reward channel read off the game's own live
+# GameState after each step -- the route clemcore itself suggests for game-specific
+# rewards (see the reward_func docstring in its pettingzoo master).
+#
+# Like row_context_mode / episode_pairing / dr_grpo, this applies REGARDLESS of
+# `enabled`: it governs rollout collection, which the MARSHAL path and the
+# --no-marshal baseline share. On the MARSHAL path the signal lands at each turn
+# boundary and gets full turn-level credit; on the plain-GRPO path (which sees only
+# one scalar per row) the episode total is added to the terminal reward instead.
+# Either way marshal/turn_rewards/terminal_mean logs the UNSHAPED outcome, so an arm
+# with this on stays comparable with one that has it off.
+#
+# WHAT EACH GAME SUPPLIES (mirroring that game's own scorer definitions):
+#   wordle     closeness -- how much of the target the guess revealed (clembench's
+#              turns_closeness weights: green 5, yellow 3), rewarded as the gain over
+#              the best guess so far, so repeating a guess earns nothing; plus format.
+#   codenames  board     -- words revealed this turn, weighted +1 team / -0.5 innocent
+#              / -1 opponent / -2 assassin, normalized by the board's team count;
+#              plus format.
+#   taboo      format, clue -- which seat's turn broke the format or used a forbidden
+#              word. No progress signal exists in this game.
+#   guesswhat  format    -- malformed or disallowed question/answer.
+#   dond       proposal, format -- committing a well-formed secret proposal; aborting.
+#   (any other game)     -- generic format compliance, read from whichever validation
+#              flags its GameState carries.
+#
+# WHY IT IS WORTH TURNING ON, beyond denser credit across turns: clembench gives BOTH
+# self-play seats the same team outcome, so agent_specific_normalization currently
+# mean-centers two identical distributions and the per-seat split is a metric
+# artifact. A per-turn reward is attributed to the seat that ACTED -- it is the only
+# thing here that makes the two seats' advantages genuinely differ.
+#
+# CLI: --turn-rewards / --no-turn-rewards, --turn-reward-scale, --turn-reward-budget,
+# --turn-reward-source, --turn-reward-components.
+turn_rewards: false
+
+# Which extractor supplies the signal.
+#   "auto"    (default) the game's own extractor if registered, else generic format
+#             compliance.
+#   "game"    game-specific only; for an unregistered game turn rewards are simply
+#             off (with a warning) rather than quietly falling back. Use this when a
+#             result depends on the game-specific signal.
+#   "generic" force format compliance even where a richer extractor exists -- the
+#             "compliance only" ablation arm.
+turn_reward_source: auto
+
+# Multiplier on each turn's combined signal. Extractors normalize every component to
+# [-1, 1], so this IS the most a single turn can contribute. At 0.05 a seat would
+# need 20 maximally-shaped turns to match the magnitude of the game outcome, and no
+# shipped preset plays that many.
+turn_reward_scale: 0.05
+
+# Cap on |sum of one seat's shaping over one episode|, applied as a PROPORTIONAL
+# rescale of the whole episode's shaping vector (relative credit between turns
+# survives; no sign flips).
+#
+# THIS IS THE KNOB THAT MAKES "CANNOT OVERWHELM THE TERMINAL REWARD" A GUARANTEE.
+# The MARSHAL return is a backward cumulative sum, so what competes with the +-1
+# outcome is the episode TOTAL, not the per-turn number. With budget < 0.5 the
+# worst-case difference in shaping between two episodes is 2 x budget < 1.0, which is
+# smaller than the gap between any two distinct clembench outcomes (SUCCESS-FAILURE =
+# 1, FAILURE-ABORTED = 1). Shaping can therefore reorder episodes WITHIN an outcome
+# class but never across one: a shaped loss can never out-score a bare win.
+# 0 disables the cap and gives up that guarantee.
+#
+# It is a safety net, not the operating point. Tune turn_reward_scale so a typical
+# episode lands under it and watch marshal/turn_rewards/budget_clip_rate: near 1.0
+# means the cap binds every episode, i.e. this field -- not the game -- is setting
+# your signal's magnitude and only its shape survives.
+turn_reward_budget: 0.3
+
+# Comma-separated allowlist of component names, e.g. "closeness" to run wordle's
+# progress signal without its format penalty, or "format" for a compliance-only arm.
+# Empty keeps every component the extractor emits. An unknown name is an error at
+# startup (checked against the resolved extractor), not a silent no-op.
+turn_reward_components: ""
+
+# ---------------------------------------------------------------------------
 # Per-turn length penalty (MARSHAL's Kimi-1.5-style compute_length_penalty,
 # roll/agentic/rollout/env_manager.py:276-294). Added to each turn's reward
 # BEFORE any normalization, so the pre-sum pass, whitening, the backward
