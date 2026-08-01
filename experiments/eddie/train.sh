@@ -12,6 +12,14 @@
 #$ -pe sharedmem 12
 #$ -l h_rss=12G
 #
+# h_rt is already Eddie's MAXIMUM for the gpu queue (48 h) and stays there:
+# train_selfplay.py has no --resume-from-checkpoint, so a run killed at the walltime
+# can only be redone, not continued. Confirm the cap on your queue with
+#   qconf -sq gpu | grep -E 'h_rt|s_rt'
+# -- a request past it leaves the job sitting in `qw` forever rather than failing.
+# Unlike Slurm, Grid Engine does not reserve anything against h_rt, so asking for the
+# cap costs nothing when the job finishes early.
+#
 # GPU choice: H200 (141 GB). For an A100 instead, submit with
 #   TRAIN_QSUB_OPTS='-l a100=true' experiments/eddie/run_experiment.sh <game>
 # and drop PER_DEVICE_BATCH -- see experiments/presets/*.env for why the fp32

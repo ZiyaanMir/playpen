@@ -38,6 +38,7 @@ import glob
 import json
 import os
 import sys
+import tempfile
 
 # Columns clemeval writes into results.csv. The leading key is the model name.
 CLEMSCORE_COL = "-, clemscore"
@@ -45,6 +46,31 @@ AVG_PLAYED_COL = "all, Average % Played"
 AVG_QUALITY_COL = "all, Average Quality Score"
 PLAYED_SUFFIX = ", % Played"
 QUALITY_SUFFIX = ", Quality Score"
+
+
+def _write_atomic(path: str, text: str) -> None:
+    """Replace ``path`` with ``text`` in one step, never leaving it half-written.
+
+    Same reasoning as ``summarize_eval.py``'s copy: gameplay evaluation is sharded
+    into CONCURRENT jobs and each one runs this script when it finishes, so two
+    summarizers can be writing PLAYPEN_RESULTS.md at the same moment. A plain
+    ``open(path, "w")`` truncates first and fills in after, so the loser of that race
+    can be read as an empty or half-built table. ``os.replace`` onto a temp file in
+    the same directory is atomic on POSIX: a reader sees the old table or the new
+    one, never a partial one.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".{}.".format(os.path.basename(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _float(text: str | None) -> float | None:
@@ -251,15 +277,14 @@ def main() -> None:
     for game in games:
         columns += [game + PLAYED_SUFFIX, game + QUALITY_SUFFIX]
 
-    with open(os.path.join(exp_dir, "PLAYPEN_RESULTS.md"), "w", encoding="utf-8") as fh:
-        fh.write("\n".join(md) + "\n")
+    _write_atomic(os.path.join(exp_dir, "PLAYPEN_RESULTS.md"), "\n".join(md) + "\n")
 
-    with open(os.path.join(exp_dir, "playpen_results.tsv"), "w", encoding="utf-8") as fh:
-        fh.write("\t".join(["checkpoint", *columns]) + "\n")
-        for name, scores in rows:
-            fh.write("\t".join(
-                [name] + ["" if scores.get(c) is None else f"{scores[c]:.6f}" for c in columns]
-            ) + "\n")
+    tsv = ["\t".join(["checkpoint", *columns])]
+    for name, scores in rows:
+        tsv.append("\t".join(
+            [name] + ["" if scores.get(c) is None else f"{scores[c]:.6f}" for c in columns]
+        ))
+    _write_atomic(os.path.join(exp_dir, "playpen_results.tsv"), "\n".join(tsv) + "\n")
 
     print(f"[playpen-summary] {len(rows)} row(s), {len(games)} game(s) "
           f"-> {exp_dir}/PLAYPEN_RESULTS.md and playpen_results.tsv")

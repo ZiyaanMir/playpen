@@ -61,6 +61,13 @@ pp_layout() {
     # played. PPEVAL_GAMES=dond,guesswhat,taboo
     PPEVAL_GAMES="${PPEVAL_GAMES:-}"
     PPEVAL_BASE="${PPEVAL_BASE:-1}"            # also play the untrained model
+    # Only shard 1 plays the untrained baseline. It does not depend on the checkpoint,
+    # and it is the single most expensive row in the job -- a full pass over 14 games.
+    # (It is cached across experiments too, so after the first run on a model this is a
+    # copy rather than gameplay; the shard rule is what stops N concurrent shards racing
+    # to populate that cache on the first run.) Decided HERE, before pp_banner runs, so
+    # the banner's "base row" line agrees with what the job actually does.
+    exp_owns_base_row || PPEVAL_BASE=0
     PPEVAL_CKPTS="${PPEVAL_CKPTS:-}"           # "" = every checkpoint; "last"; "100,200"
     # playpen eval's own defaults, which is what the LEADERBOARD numbers were produced
     # with. Deliberately NOT the training run's max_completion_length: a checkpoint
@@ -290,9 +297,24 @@ pp_run_all() {
     fi
     echo "[ppeval] run dir = $run_dir"
 
-    local checkpoints=()
-    mapfile -t checkpoints < <(exp_list_checkpoints "$run_dir" | pp_filter_checkpoints)
-    echo "[ppeval] ${#checkpoints[@]} checkpoint(s) to play${PPEVAL_CKPTS:+ (PPEVAL_CKPTS=$PPEVAL_CKPTS)}"
+    # PPEVAL_CKPTS narrows WHICH checkpoints this experiment plays at all; the shard
+    # filter then splits what survives across the concurrent gameplay jobs. Order
+    # matters -- sharding the unfiltered list would leave `PPEVAL_CKPTS=last` in one
+    # arbitrary shard and the rest idle.
+    local checkpoints=() selected=()
+    mapfile -t selected < <(exp_list_checkpoints "$run_dir" | pp_filter_checkpoints)
+    mapfile -t checkpoints < <(exp_list_checkpoints "$run_dir" | pp_filter_checkpoints \
+                                   | exp_shard_filter)
+    if [ -n "${EVAL_SHARD:-}" ]; then
+        echo "[ppeval] $(exp_shard_label): ${#checkpoints[@]} of ${#selected[@]}" \
+             "checkpoint(s)${PPEVAL_CKPTS:+ (PPEVAL_CKPTS=$PPEVAL_CKPTS)}"
+    else
+        echo "[ppeval] ${#checkpoints[@]} checkpoint(s) to play${PPEVAL_CKPTS:+ (PPEVAL_CKPTS=$PPEVAL_CKPTS)}"
+    fi
+
+    # pp_layout already set PPEVAL_BASE=0 for every shard but the first; say so, so a
+    # log read on its own does not look like the baseline was silently dropped.
+    exp_owns_base_row || echo "[ppeval] base row skipped -- shard 1 owns it."
 
     pp_select_args
     echo "[ppeval] games   : ${PP_SELECT[*]}"
@@ -389,6 +411,7 @@ pp_banner() {
     echo "generation  = max_tokens=${PPEVAL_MAX_TOKENS:-?} temperature=${PPEVAL_TEMPERATURE:-?}"
     echo "base row    = ${PPEVAL_BASE:-1}"
     echo "checkpoints = ${PPEVAL_CKPTS:-all}"
+    [ -n "${EVAL_SHARD:-}" ] && echo "shard       = $(exp_shard_label)"
     echo "cluster     = ${EXP_CLUSTER:-?}"
     echo "host        = $(hostname)"
     echo "job         = ${JOB_ID:-${SLURM_JOB_ID:-interactive}}"

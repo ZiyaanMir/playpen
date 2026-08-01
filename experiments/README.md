@@ -13,17 +13,24 @@ module load brics/userenv
 experiments/isambard/run_experiment.sh dond
 ```
 
-That is the whole interface. It queues three jobs, each held until the previous one
-leaves the queue, and prints where everything will land:
+That is the whole interface. It queues the training job, both evaluations behind it,
+and a final job that writes the score tables, then prints where everything will land:
 
 | # | job | what it answers |
 |---|---|---|
 | 1 | **train** | — |
 | 2 | **eval** (lm-eval: logiglue, logicbench) | did self-play change the model's *reasoning*? |
 | 3 | **playpen eval** (clembench gameplay, clemscore) | did it get better at *playing*, including the 13 games it never trained on? |
+| 4 | **summary** | writes the complete `RESULTS.md` / `PLAYPEN_RESULTS.md` |
 
 Job 3 is the one that produces the number the shared task is scored on. Turn it off
 for a run with `PPEVAL_ENABLE=0`.
+
+**Jobs 2 and 3 are each split into shards of five checkpoints, and every shard runs
+at the same time.** With the presets' `MAX_STEPS=1000` / `SAVE_STEPS=100` that is ten
+checkpoints, so a run is 1 train + 2 lm-eval + 2 gameplay + 1 summary = six jobs. All
+four evaluation jobs are held on the *training* job, not on each other, so they start
+together the moment training finishes. See [Sharded evaluation](#sharded-evaluation).
 
 Replaces the older split workflow (`slurm/`, `slurm_eddie/` for training; a separate
 `lm_eval_jobs/` tree writing into a shared `Results/`), where a checkpoint and its score
@@ -46,8 +53,11 @@ $MARSHAL_RUNS/dond_Qwen3-4B_lp384_20260723-142530/
 ├── playpen_results.tsv     the same numbers for pandas
 ├── logs/
 │   ├── train.<jobid>.out/.err
-│   ├── eval.<jobid>.out/.err
-│   └── ppeval.<jobid>.out/.err
+│   ├── eval1.<jobid>.out/.err     one per shard
+│   ├── eval2.<jobid>.out/.err
+│   ├── ppeval1.<jobid>.out/.err
+│   ├── ppeval2.<jobid>.out/.err
+│   └── summary.<jobid>.out/.err
 ├── train/<timestamp>/
 │   ├── checkpoint-50/ … checkpoint-200/
 │   ├── completions/*.parquet
@@ -146,6 +156,67 @@ one-line command to fetch it), and **`scikit-learn` must be in the venv** —
 `clembench/privateshared` imports it. Nothing else: unlike lm-eval, this runs in the
 repo's own `.venv` (clemcore + playpen + peft are all there), so there is no second
 environment to build and the job is the same on both clusters.
+
+### Sharded evaluation
+
+Both evaluations are submitted as **one job per five checkpoints**, and every one of
+those jobs is held on the *training* job rather than on the previous evaluation — so
+they all start together and run concurrently.
+
+```
+train ──┬─▶ lm-eval  shard 1 (base + checkpoints 100–500)  ──┐
+        ├─▶ lm-eval  shard 2 (checkpoints 600–1000)         ├─▶ summary
+        ├─▶ gameplay shard 1 (base + checkpoints 100–500)   │
+        └─▶ gameplay shard 2 (checkpoints 600–1000)         ─┘
+```
+
+**Why.** The gameplay eval is generation, not loglikelihood scoring — hours per
+checkpoint. Ten checkpoints do not fit one walltime on either cluster (Isambard's cap
+is 24 h, and it is hard), and the previous answer was to trim the work with
+`PPEVAL_CKPTS=last`. Sharding turns a walltime problem into a queue-width problem
+instead, and evaluates every checkpoint.
+
+**What it costs.** An experiment now asks for up to four GPUs at once instead of one.
+On Isambard, Slurm reserves credits against each job's `--time` at submission. If that
+is not wanted:
+
+| variable | default | what it does |
+|---|---|---|
+| `EVAL_SHARD_SIZE` | `5` | checkpoints per evaluation job. `999` = one job per evaluation, i.e. the pre-sharding behaviour |
+| `PPEVAL_SERIAL` | `0` | `1` holds the gameplay shards behind the lm-eval shards — one experiment, one GPU at a time |
+
+**How a shard knows which checkpoints are its own.** `EVAL_SHARD` (1-based) is passed
+per job through `-v` / `--export`, *not* through `experiment.env` — that file is
+shared by every shard, so the index cannot live in it. Each job then takes its slice
+of `exp_list_checkpoints`, which is sorted by step number and filtered to complete
+adapters, so the slices tile the list exactly: no checkpoint is evaluated twice and
+none is skipped.
+
+Three details that are load-bearing rather than incidental:
+
+* **Shard 1 owns the `base` row.** The untrained model's score does not depend on the
+  checkpoint, and on the gameplay side it is a full pass over 14 games. Every other
+  shard skips it. (It is also cached across experiments — the shard rule is what stops
+  N concurrent shards racing to populate that cache the first time.)
+* **A shard with an empty slice exits cleanly in seconds.** The shard count is decided
+  at submit time, before training has written anything, by predicting
+  `MAX_STEPS/SAVE_STEPS`; a run killed early leaves the last shard with nothing to do.
+  Over-predicting is free, so the prediction is deliberately the optimistic one.
+* **Each shard writes a partial table when it finishes**, so `RESULTS.md` is readable
+  while the rest are still going — and the writes are atomic (`os.replace`), so two
+  shards finishing together cannot leave a half-written file. The **summary job**
+  writes the complete tables once the last shard has left the queue.
+
+`TMPDIR` is per *job* (`$EXP_DIR/tmp/<jobid>`), not per experiment, for the same
+reason: the cleanup trap would otherwise delete a sibling shard's torch/triton/vLLM
+caches out from under it mid-run.
+
+To rebuild the tables at any time without re-running anything:
+
+```bash
+EXP_ENV_FILE=<EXP_DIR>/experiment.env experiments/eddie/summarize.sh
+EXP_ENV_FILE=<EXP_DIR>/experiment.env experiments/isambard/summarize.sh
+```
 
 ### Recovering scores without replaying
 
@@ -298,11 +369,13 @@ Scheduler options pass through too:
 | `MODEL` | `Qwen/Qwen3-4B` | policy to train |
 | `EXP_TAG` | — | goes in the directory name; set it for every variant |
 | `EXTRA_TRAIN_ARGS` | — | extra `train_selfplay.py` flags, verbatim |
-| `MAX_STEPS` / `SAVE_STEPS` | `200` / `50` | schedule and checkpoint cadence |
+| `MAX_STEPS` / `SAVE_STEPS` | `1000` / `100` in every preset | schedule and checkpoint cadence |
 | `EVAL_TASKS` | `logiglue,logicbench` | lm-eval tasks (comma-separated) |
 | `EVAL_BASE` | `1` | also score the untrained model |
 | `EVAL_LIMIT` | — | `--limit N`, smoke tests only |
 | `EVAL_EXTRA` | — | extra lm-eval flags, applied to **every** row |
+| `EVAL_SHARD_SIZE` | `5` | checkpoints per evaluation job (see [Sharded evaluation](#sharded-evaluation)) |
+| `PPEVAL_SERIAL` | `0` | `1` = gameplay held behind lm-eval, one GPU at a time |
 | `WB_PROJECT` | `playpen-marshal` | Weights & Biases project |
 | `WB_ENABLE` | `1` | `0` turns W&B off for this run |
 | `WB_MODE` | `auto` | `auto` \| `online` \| `offline` \| `disabled` |
@@ -352,8 +425,11 @@ variables still works — `train_selfplay.py` falls back to them.
 
 ## The presets, and the length-penalty calibration
 
-`presets/{dond,guesswhat,taboo}.env` hold the memory sizing carried over from the existing
-job scripts, plus **recalibrated length-penalty values**.
+There is a preset for **every text-only clembench game** — one `presets/<game>.env` per
+entry in a `clemgame.json` with `image: "none"`. Each holds the memory sizing and
+**recalibrated length-penalty values** for that game. See
+[Which games have presets](#which-games-have-presets) for the full list and for the
+three that carry warnings.
 
 The old setting (`max_len 500`, `coef 0.1`) was numerically inert on guesswhat: generation
 is hard-capped **per turn** at `max_completion_length`, so with a 512-token cap the largest
@@ -377,6 +453,13 @@ competes with the ±1 outcome is `turns × per-turn`, not the per-turn number.
 | guesswhat | 512 | 8 | 256 | 0.05 | −0.052 | **−0.42** |
 | taboo | 256 | 3 | 128 | 0.15 | −0.077 | **−0.23** |
 
+Only those three were calibrated against observed turn lengths. Every other preset
+applies the same rule to the game's *packaged* turn limit and says `UNVERIFIED` in the
+file — check `marshal/length_penalty/mean` on the first run before reading anything
+into an ablation. On the short-move games (textmapworld, adventuregame, imagegame,
+wordle) the penalty is expected to sit at **exactly zero**, which is the honest result
+for a game whose turns are five tokens long, not a wiring bug.
+
 Target −0.4 to −0.5: enough to matter, structurally unable to exceed 1.0, so "stay silent"
 can never beat "win the game."
 
@@ -395,6 +478,80 @@ mean is the honest signal.
 > algorithms and the gradient direction is unchanged, but an on/off length-penalty ablation
 > at `marshal_exact` also silently switches pooling rule — pin `fidelity_mode` consistently
 > across arms, and don't describe such a run as reproducing MARSHAL's shipped normalization.
+
+---
+
+## Which games have presets
+
+Every text-only clembench game (`image: "none"`). The multimodal ones — `matchit`,
+`mm_mapworld*`, `multimodal_referencegame`, `mm_clean_up`, `st_clean_up`,
+`hybrid_clean_up` — have none, and neither do the five `static` benchmarks
+(`bbh`, `cladder`, `eqbench`, `ifeval`, `mmlu_pro`): those are single-turn
+multiple-choice tasks, not games, and job 3 already scores them via `PPEVAL_SUITE`.
+
+**"Learner seats" is the column that matters**, and it is not always what
+`clemgame.json` says. `SelfPlayEnv` takes `num_players` from the `GameSpec` and marks
+every seat as the learner, while the game master decides how many clemcore players
+actually exist and which of them are programmatic. Where the two disagree, the
+consequence is in the notes column, and it is spelled out at the top of the preset.
+
+| game | learner seats | turns/seat | notes |
+|---|---|---|---|
+| `taboo` | 2 | 3 | calibrated |
+| `guesswhat` | 2 | 8 | calibrated |
+| `dond` | 2 | 5 | calibrated; **not** in the `clem` suite (benchmark 3.0) |
+| `codenames` | 2 | ~4 | turn count estimated |
+| `referencegame` | 2 | **1** | one round only — turn-level credit has nothing to spread |
+| `matchit_ascii` | 2 | ~5 | `decision_turn = 3` in every instance |
+| `wordle` | 1 | 6 | single-player: per-seat pooling inert |
+| `wordle_withclue` | 1 *(spec says 2)* | 6 | ⚠ only one clemcore player exists — **half of every batch is an inert seat-1 placeholder** |
+| `wordle_withcritic` | 2 | 12 / 6 | genuinely two models; the seats take *different* turn counts |
+| `hot_air_balloon` | 2 | unbounded | ⚠ **no built-in round cap** — `MAX_TURNS` is a real cap, and hitting it truncates before the ±1 reward |
+| `textmapworld` | 1 *(2 agents)* | 20 | describer is programmatic and correctly auto-stepped |
+| `textmapworld_graphreasoning` | 1 *(2 agents)* | 20 | as above; free-text answers, so the penalty may not be inert |
+| `textmapworld_specificroom` | 1 *(2 agents)* | 20 | as above |
+| `clean_up` | 2 | 12–28 | ⚠ **needs `matplotlib` in the venv** or the game cannot be imported |
+| `imagegame` | 2 | up to 50 | `max_rounds = grid²×2 = 50`; text-only despite the name |
+| `adventuregame` | 1 | 50 (100 on `potion_brewing`) | longest episodes in clembench; `PER_DEVICE_BATCH=1`, expect slow steps |
+| `privateshared` | — | — | 🚫 **do not train on this** — see below |
+
+### `privateshared` is documented, not usable for training
+
+Its preset exists so `run_experiment.sh privateshared` fails informatively rather than
+with "no preset for game". Two independent problems, both read out of
+`clembench/privateshared/master.py`, make a training run there meaningless:
+
+* its **Questioner is programmatic** (`CustomResponseModel`, replaying a fixed
+  `request_order`) but `clemgame.json` declares `players: 2`, so the port marks it a
+  learner seat and the policy is asked to generate the scripted questions;
+* the **probing — the mechanic the game actually scores — bypasses the agent loop**:
+  `_probing_loop` calls `self.answerer(context, memorize=False)` directly, which under
+  the learner marker model falls through to `Answerer._custom_response` and returns a
+  random `"<tag>yes, placeholder."` string. Every probe would be scored against a mock.
+
+None of this affects **evaluation** — `playpen eval` gives the answerer a real backend,
+so privateshared is scored normally as part of the `clem` suite. It also needs
+`scikit-learn`, which job 3 needs anyway (see the recovery section above).
+
+### Where a preset deviates from the shared block
+
+Most presets carry the same memory block (`PER_DEVICE_BATCH=4`, `GRAD_ACCUM=16`,
+`VLLM_MAX_MODEL_LEN=16384`, `MAX_COMPLETION_LENGTH=1024`). A rollout row is the *whole
+flattened episode for one seat*, so `seq_len ≈ turns × MAX_COMPLETION_LENGTH` — and on
+the long-episode games that block does not fit. Those files say
+`DEVIATES FROM THE SHARED BLOCK` at the top of the section and show the arithmetic. The
+rule used throughout: keep the per-forward token budget near where guesswhat verified it
+(`4 × 8192 ≈ 32k`), and keep `PER_DEVICE_BATCH × GRAD_ACCUM = 64` so the MARSHAL
+advantage pool is identical across every game.
+
+| game | `MAX_COMPLETION_LENGTH` | batch × accum | `VLLM_MAX_MODEL_LEN` | why |
+|---|---|---|---|---|
+| most games | 1024 | 4 × 16 | 16384 | — |
+| `wordle_withcritic`, `hot_air_balloon` | 1024 | 2 × 32 | 24576 | ~12–20 turns/seat |
+| `textmapworld*` | 512 | 2 × 32 | 24576 | 20 turns/seat of five-token moves |
+| `clean_up` | 512 | 2 × 32 | 24576 | up to 28 rounds |
+| `imagegame` | 256 | 2 × 32 | 32768 | up to 50 rounds of one-line commands |
+| `adventuregame` | 256 | **1 × 64** | 32768 | up to 100 turns — a single ~26k-token row |
 
 ---
 
@@ -462,12 +619,26 @@ to fetch it.
 (lm-eval + peft, not trl + vllm), different walltime, different GPU needs. Chaining also
 means a failed eval can be re-run without redoing 20 h of training.
 
-**Why the playpen eval is a third job rather than part of the second.** It needs the
-opposite environment from lm-eval: the repo's own venv rather than the lm-eval one,
-and it is generation rather than loglikelihood scoring, so its walltime is an order
-of magnitude larger. Chaining it behind lm-eval rather than beside it keeps one
-experiment to one GPU at a time, and `afterany`/`-hold_jid` means a failed lm-eval
-does not silently cancel the gameplay scores.
+**Why the playpen eval is a separate job rather than part of the lm-eval one.** It
+needs the opposite environment: the repo's own venv rather than the lm-eval one, and
+it is generation rather than loglikelihood scoring, so its walltime is an order of
+magnitude larger.
+
+**Why it now runs beside lm-eval rather than behind it.** It used to be chained, which
+kept one experiment to one GPU at a time. That stopped being the right trade at
+`MAX_STEPS=1000`: ten checkpoints of gameplay do not fit one walltime at all, so the
+jobs had to be split anyway — and once they are split, holding them in a chain only
+adds queue latency to a set of jobs that are already independent (they write to
+disjoint `playpen-eval/<checkpoint>/` directories). `PPEVAL_SERIAL=1` restores the
+chain when the queue cannot take the width.
+
+**Why the tables are written by a fifth job rather than by the last shard.** "The last
+shard" is not knowable from inside a shard — each one only sees its own slice — and
+having every shard write the table would mean the final one silently decides what the
+table says. A job held on all of them runs exactly once, after all of them, and reads
+the whole directory. It is seconds of CPU, so a dedicated job costs nothing; shards
+still write partial tables as they go, atomically, so there is something to read in the
+meantime.
 
 **A checkpoint is made addressable by a generated registry, not by merging.**
 `playpen eval` takes a registered model *name*; a checkpoint is a LoRA adapter
@@ -486,7 +657,19 @@ ABORTED.
 non-zero but has still written `checkpoint-150`; `afterok` would silently skip evaluating
 it. `eval.sh` instead checks for real checkpoints and exits cleanly with a message when
 there genuinely are none. Grid Engine's `-hold_jid` has the same semantics, so both
-clusters behave identically.
+clusters behave identically. The same reasoning is why the summary job is `afterany` on
+every shard: one shard that OOMs must not cost the table for the rest.
+
+**Walltimes are at the cluster maximum for training, and deliberately not for
+evaluation.** `train_selfplay.py` has no `--resume-from-checkpoint`, so a training job
+killed at the walltime can only be redone — hence 48 h on Eddie and 24 h (the hard cap)
+on Isambard. Evaluation has the opposite property: a shard that dies leaves the
+checkpoints it already scored on disk, the rest can be re-submitted with
+`run_eval.sh` / `run_playpen_eval.sh`, and gameplay that was played but not scored is
+recoverable with `rescore_playpen_eval.py`. Sharding, not a longer walltime, is what
+makes the evaluation fit. On Isambard this also matters for cost: Slurm reserves
+credits against `--time` at submission, so asking every eval shard for 24 h would book
+four times the run's credits up front.
 
 **Why the run directory is discovered, not chosen.** `train_selfplay.py` always appends its
 own timestamp to `--output-dir`, which the submitting shell cannot predict. Since `EXP_DIR`

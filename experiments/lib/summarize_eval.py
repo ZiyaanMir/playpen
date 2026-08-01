@@ -21,10 +21,36 @@ import glob
 import json
 import os
 import sys
+import tempfile
 
 # lm-eval suffixes every metric with its filter name; ",none" is the unfiltered
 # default. Stderr columns double the table width without adding signal.
 METRIC_SUFFIX = ",none"
+
+
+def _write_atomic(path: str, text: str) -> None:
+    """Replace ``path`` with ``text`` in one step, never leaving it half-written.
+
+    Evaluation is sharded into CONCURRENT jobs and each one runs this script when it
+    finishes, so two summarizers can be writing the same table at the same moment.
+    A plain ``open(path, "w")`` truncates first and fills in after, so the loser of
+    that race can be read as an empty or half-built table -- and RESULTS.md is
+    exactly the file someone tails while the run is going. Writing a temp file in
+    the same directory and ``os.replace``-ing it is atomic on POSIX: a reader sees
+    either the old table or the new one, never a partial one.
+    """
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".{}.".format(os.path.basename(path)))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _newest_results_json(eval_subdir: str) -> str | None:
@@ -142,15 +168,14 @@ def main() -> None:
         md += ["", f"**Incomplete:** no results file for {', '.join(f'`{m}`' for m in missing)} "
                    "(eval failed, was killed, or is still running)."]
 
-    with open(os.path.join(exp_dir, "RESULTS.md"), "w") as fh:
-        fh.write("\n".join(md) + "\n")
+    _write_atomic(os.path.join(exp_dir, "RESULTS.md"), "\n".join(md) + "\n")
 
-    with open(os.path.join(exp_dir, "results.tsv"), "w") as fh:
-        fh.write("\t".join(["checkpoint", *columns]) + "\n")
-        for name, scores in rows:
-            fh.write("\t".join(
-                [name] + [f"{scores[c]:.6f}" if c in scores else "" for c in columns]
-            ) + "\n")
+    tsv = ["\t".join(["checkpoint", *columns])]
+    for name, scores in rows:
+        tsv.append("\t".join(
+            [name] + [f"{scores[c]:.6f}" if c in scores else "" for c in columns]
+        ))
+    _write_atomic(os.path.join(exp_dir, "results.tsv"), "\n".join(tsv) + "\n")
 
     print(f"[summary] {len(rows)} row(s), {len(columns)} metric(s) "
           f"-> {exp_dir}/RESULTS.md and results.tsv")

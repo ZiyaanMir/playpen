@@ -5,12 +5,26 @@
 #SBATCH --job-name=marshal_train
 #SBATCH --nodes=1
 #SBATCH --gpus=1
-#SBATCH --time=07:00:00
+#SBATCH --time=24:00:00
 #SBATCH --no-requeue
 #
-# --time stays under the 24 h cap with margin, and Slurm reserves credits against
-# it. --no-requeue because a requeue restarts training from step 0: 5 h of GPU
-# silently redone. Override with TRAIN_SBATCH_OPTS='--time=08:00:00' for short runs.
+# --time is Isambard's HARD MAXIMUM (workq_qos caps every job at 24 h; asking for
+# more is rejected with PartitionTimeLimit). Set to the cap because
+# train_selfplay.py has NO --resume-from-checkpoint: a run killed at the walltime
+# cannot be continued, only redone, so the only lever against a long game is to ask
+# for every hour available. With MAX_STEPS=1000 in the presets, the long-episode
+# games (adventuregame, imagegame, clean_up) will use most of it.
+#
+# TWO CONSEQUENCES OF ASKING FOR THE CAP.
+#   * Slurm reserves credits against --time, not against what the job uses, so a
+#     short run books 24 h of GH200 up front. Trim it per submission for anything
+#     you know is short:  TRAIN_SBATCH_OPTS='--time=06:00:00'
+#   * A 24 h request backfills less readily than a 7 h one, so the job may sit in the
+#     queue longer. `--time-min` (see notes/ISAMBARD_GUIDE.md) is the escape hatch if
+#     that becomes the bottleneck.
+#
+# --no-requeue because a requeue restarts training from step 0: hours of GPU
+# silently redone.
 
 set -euo pipefail
 

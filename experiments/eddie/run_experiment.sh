@@ -9,12 +9,16 @@
 #   MODEL=Qwen/Qwen3-0.6B MAX_STEPS=20 SAVE_STEPS=10 EXP_TAG=smoke \
 #     experiments/eddie/run_experiment.sh guesswhat
 #
-# Creates the experiment directory, writes the manifest, then queues three jobs,
-# each held until the one before it leaves the queue:
+# Creates the experiment directory, writes the manifest, then queues:
 #   1. training
-#   2. lm-eval        (logiglue/logicbench -- did reasoning transfer?)
-#   3. playpen eval   (clembench gameplay across all the games -- did it learn to play?)
-# Prints the paths and job ids; nothing else to remember.
+#   2. lm-eval      (logiglue/logicbench -- did reasoning transfer?)   } N shards each,
+#   3. playpen eval (clembench gameplay -- did it learn to play?)      } held on job 1,
+#                                                                     } run CONCURRENTLY
+#   4. summary      (the complete RESULTS.md / PLAYPEN_RESULTS.md, held on 2 and 3)
+#
+# Both evaluations are split into shards of EVAL_SHARD_SIZE (5) checkpoints so no
+# single job has to fit ten checkpoints of generation into one walltime. Prints the
+# paths and job ids; nothing else to remember.
 #
 # Job 3 off:  PPEVAL_ENABLE=0 experiments/eddie/run_experiment.sh dond
 #
@@ -26,7 +30,7 @@ set -euo pipefail
 
 GAME_ARG="${1:-}"
 [ -n "$GAME_ARG" ] || {
-    echo "usage: $0 <game>   (dond | guesswhat | taboo)" >&2
+    echo "usage: $0 <game>   (any name in experiments/presets/, e.g. dond guesswhat taboo)" >&2
     echo "       optional env: MODEL EXP_TAG MAX_STEPS EVAL_TASKS EXTRA_TRAIN_ARGS ..." >&2
     exit 2
 }
@@ -50,6 +54,17 @@ export EXP_DIR="$MARSHAL_RUNS/$EXP_ID"
 exp_layout
 mkdir -p "$EXP_DIR" "$TRAIN_BASE" "$EVAL_DIR" "$LOG_DIR"
 
+# --- how many evaluation jobs -------------------------------------------------
+# Training has not run yet, so the checkpoint count is PREDICTED from the schedule
+# (MAX_STEPS/SAVE_STEPS); see exp_expected_checkpoints for why over-predicting is
+# safe and under-predicting is not. Both evaluations are then split into that many
+# shards of EVAL_SHARD_SIZE checkpoints, and all of them are queued now.
+N_CKPTS="$(exp_expected_checkpoints)"
+EVAL_SHARD_TOTAL="$(exp_shard_count "$N_CKPTS")"
+export EVAL_SHARD_TOTAL
+echo "[plan] ${MAX_STEPS} steps / ${SAVE_STEPS} save-steps => ~${N_CKPTS} checkpoints"
+echo "[plan] ${EVAL_SHARD_TOTAL} eval shard(s) of ${EVAL_SHARD_SIZE} checkpoint(s) each"
+
 # --- manifest, written before submission -------------------------------------
 # So a job that dies in the queue still leaves a record of what it was going to be.
 # Uses the training venv because it imports playpen.marshal.config (stdlib + PyYAML;
@@ -71,8 +86,10 @@ ENV_FILE="$EXP_DIR/experiment.env"
                VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF EXTRA_TRAIN_ARGS \
                WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
                EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE LMEVAL_CONDA_ENV \
+               EVAL_SHARD_SIZE EVAL_SHARD_TOTAL \
                PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
-               PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_CACHE PPEVAL_HF_OFFLINE; do
+               PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_CACHE PPEVAL_HF_OFFLINE \
+               PPEVAL_SERIAL; do
         printf '%s=%q\n' "$var" "${!var-}"
     done
 } > "$ENV_FILE"
@@ -92,38 +109,84 @@ TRAIN_ID="$(qsub -terse \
     "$HERE/train.sh" | tr -d '[:space:]')"
 echo "[submit] training  job $TRAIN_ID"
 
-# -hold_jid waits for the training job to LEAVE THE QUEUE, whatever its exit status
+# --- the evaluation shards ----------------------------------------------------
+# One job per shard of EVAL_SHARD_SIZE checkpoints, for BOTH evaluations, all held on
+# the TRAINING job -- so they start together the moment training leaves the queue and
+# run concurrently. Each shard learns which slice is its own from EVAL_SHARD, passed
+# as its own -v (the env file is shared by every shard, so the index cannot live in
+# it) and never written by the sourced file, so it survives.
+#
+# -hold_jid waits for the held-on job to LEAVE THE QUEUE, whatever its exit status
 # (Grid Engine has no afterok equivalent). That is what we want: a run killed at the
-# walltime after writing checkpoint-150 should still be evaluated. eval.sh handles
-# the genuinely-empty case by exiting cleanly with a message.
-EVAL_ID="$(qsub -terse \
-    -N "ev_${GAME}_$(basename "$MODEL")" \
-    -hold_jid "$TRAIN_ID" \
-    -o "$LOG_DIR/eval_${EXP_ID}_\$JOB_ID.out" \
-    -e "$LOG_DIR/eval_${EXP_ID}_\$JOB_ID.err" \
-    -v "EXP_ENV_FILE=$ENV_FILE" \
-    ${EVAL_QSUB_OPTS:-} \
-    "$HERE/eval.sh" | tr -d '[:space:]')"
-echo "[submit] eval      job $EVAL_ID  (held until $TRAIN_ID finishes)"
+# walltime after writing checkpoint-150 should still be evaluated. Every eval job
+# handles the genuinely-empty case by exiting cleanly with a message.
+#
+# THE COST OF RUNNING THEM TOGETHER: an experiment now asks for up to
+# 2 x EVAL_SHARD_TOTAL GPUs at once instead of one. That is the trade -- wall-clock
+# for queue width. PPEVAL_SERIAL=1 restores the old chain (gameplay held behind
+# lm-eval, one GPU per experiment at a time) if the queue cannot take it.
+ALL_EVAL_IDS=()
 
-# Third job: play the clembench games. Held behind the LM-EVAL job, not the training
-# job, because both want the whole GPU -- chaining them keeps one experiment to one
-# GPU at a time. -hold_jid again waits for it to leave the queue whatever its exit
-# status, so a failed lm-eval does not cancel the gameplay scores.
-PPEVAL_ID=""
-if [ "${PPEVAL_ENABLE:-1}" = "1" ]; then
-    PPEVAL_ID="$(qsub -terse \
-        -N "pp_${GAME}_$(basename "$MODEL")" \
-        -hold_jid "$EVAL_ID" \
-        -o "$LOG_DIR/ppeval_${EXP_ID}_\$JOB_ID.out" \
-        -e "$LOG_DIR/ppeval_${EXP_ID}_\$JOB_ID.err" \
+EVAL_IDS=()
+for SHARD in $(seq 1 "$EVAL_SHARD_TOTAL"); do
+    ID="$(qsub -terse \
+        -N "ev${SHARD}_${GAME}_$(basename "$MODEL")" \
+        -hold_jid "$TRAIN_ID" \
+        -o "$LOG_DIR/eval${SHARD}_${EXP_ID}_\$JOB_ID.out" \
+        -e "$LOG_DIR/eval${SHARD}_${EXP_ID}_\$JOB_ID.err" \
         -v "EXP_ENV_FILE=$ENV_FILE" \
-        ${PPEVAL_QSUB_OPTS:-} \
-        "$HERE/playpen_eval.sh" | tr -d '[:space:]')"
-    echo "[submit] playpen   job $PPEVAL_ID  (held until $EVAL_ID finishes)"
+        -v "EVAL_SHARD=$SHARD" \
+        ${EVAL_QSUB_OPTS:-} \
+        "$HERE/eval.sh" | tr -d '[:space:]')"
+    EVAL_IDS+=("$ID")
+    ALL_EVAL_IDS+=("$ID")
+    echo "[submit] eval      job $ID  shard $SHARD/$EVAL_SHARD_TOTAL (held until $TRAIN_ID finishes)"
+done
+
+# The gameplay shards. Held on the training job like the lm-eval ones, so all four
+# run side by side -- unless PPEVAL_SERIAL=1, which holds them behind every lm-eval
+# shard instead.
+PPEVAL_IDS=()
+if [ "${PPEVAL_ENABLE:-1}" = "1" ]; then
+    if [ "${PPEVAL_SERIAL:-0}" = "1" ]; then
+        PP_HOLD="$(IFS=,; echo "${EVAL_IDS[*]}")"
+        PP_HOLD_DESC="held until the lm-eval shards finish"
+    else
+        PP_HOLD="$TRAIN_ID"
+        PP_HOLD_DESC="held until $TRAIN_ID finishes"
+    fi
+    for SHARD in $(seq 1 "$EVAL_SHARD_TOTAL"); do
+        ID="$(qsub -terse \
+            -N "pp${SHARD}_${GAME}_$(basename "$MODEL")" \
+            -hold_jid "$PP_HOLD" \
+            -o "$LOG_DIR/ppeval${SHARD}_${EXP_ID}_\$JOB_ID.out" \
+            -e "$LOG_DIR/ppeval${SHARD}_${EXP_ID}_\$JOB_ID.err" \
+            -v "EXP_ENV_FILE=$ENV_FILE" \
+            -v "EVAL_SHARD=$SHARD" \
+            ${PPEVAL_QSUB_OPTS:-} \
+            "$HERE/playpen_eval.sh" | tr -d '[:space:]')"
+        PPEVAL_IDS+=("$ID")
+        ALL_EVAL_IDS+=("$ID")
+        echo "[submit] playpen   job $ID  shard $SHARD/$EVAL_SHARD_TOTAL ($PP_HOLD_DESC)"
+    done
 else
     echo "[submit] playpen   skipped (PPEVAL_ENABLE=0)"
 fi
+
+# --- the final tables ---------------------------------------------------------
+# Every shard writes a partial RESULTS.md / PLAYPEN_RESULTS.md when it finishes, so
+# there is always something to read; this job writes the COMPLETE ones, once, after
+# the last shard has left the queue. CPU-only and seconds long -- it just re-reads
+# the result files the eval jobs wrote.
+SUMMARY_ID="$(qsub -terse \
+    -N "sum_${GAME}_$(basename "$MODEL")" \
+    -hold_jid "$(IFS=,; echo "${ALL_EVAL_IDS[*]}")" \
+    -o "$LOG_DIR/summary_${EXP_ID}_\$JOB_ID.out" \
+    -e "$LOG_DIR/summary_${EXP_ID}_\$JOB_ID.err" \
+    -v "EXP_ENV_FILE=$ENV_FILE" \
+    ${SUMMARY_QSUB_OPTS:-} \
+    "$HERE/summarize.sh" | tr -d '[:space:]')"
+echo "[submit] summary   job $SUMMARY_ID  (held until all ${#ALL_EVAL_IDS[@]} eval job(s) finish)"
 
 cat <<EOF
 
@@ -134,12 +197,15 @@ directory  : $EXP_DIR
   logs/               job output                tail -f $LOG_DIR/train_${EXP_ID}_$TRAIN_ID.out
   train/              checkpoints (checkpoint-<step>/)
   eval/               lm-eval output per checkpoint
-  RESULTS.md          lm-eval score table       (written when eval finishes)
+  RESULTS.md          lm-eval score table       (each shard writes a partial one; the
+                                                 summary job writes the complete one)
   playpen-eval/       clembench gameplay per checkpoint
-  PLAYPEN_RESULTS.md  clemscore + per-game table (written when playpen eval finishes)
+  PLAYPEN_RESULTS.md  clemscore + per-game table (same)
   wandb/              W&B run data ($([ "${WB_ENABLE:-1}" = "1" ] && echo "project ${WB_PROJECT:-playpen-marshal}, mode ${WB_MODE:-auto}" || echo "disabled"))
                       offline runs upload with  experiments/lib/wandb_sync.sh $EXP_DIR
 
+jobs       : 1 train + ${#ALL_EVAL_IDS[@]} eval (${EVAL_SHARD_TOTAL} shard(s) x $([ "${PPEVAL_ENABLE:-1}" = "1" ] && echo 2 || echo 1) evaluation(s)) + 1 summary
+
   qstat -u $USER            # watch the jobs
-  qdel $TRAIN_ID $EVAL_ID${PPEVAL_ID:+ $PPEVAL_ID}   # cancel the experiment
+  qdel $TRAIN_ID ${ALL_EVAL_IDS[*]} $SUMMARY_ID   # cancel the experiment
 EOF

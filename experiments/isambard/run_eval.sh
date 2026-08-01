@@ -46,7 +46,7 @@ ENV_FILE="$EXP_DIR_ARG/experiment.env"
 # run_eval.sh <dir>` would silently run the experiment's original task list instead --
 # the same precedence trap the presets have.
 _OV_NAMES=(); _OV_VALS=()
-for _v in EVAL_TASKS EVAL_BATCH EVAL_LIMIT EVAL_BASE EVAL_EXTRA \
+for _v in EVAL_TASKS EVAL_BATCH EVAL_LIMIT EVAL_BASE EVAL_EXTRA EVAL_SHARD_SIZE \
           BASE_EVAL_CACHE VENV_LMEVAL HF_HUB_OFFLINE HF_HOME; do
     if [ -n "${!_v+set}" ]; then _OV_NAMES+=("$_v"); _OV_VALS+=("${!_v}"); fi
 done
@@ -56,6 +56,15 @@ source "$ENV_FILE"
 source "$HERE/../lib/experiment.sh"
 EXP_DIR="$EXP_DIR_ARG"
 exp_layout
+
+# Put the caller's overrides back on top IN THIS SHELL as well, not only in the copy
+# of the env file the job reads. The submitter now does arithmetic of its own --
+# EVAL_SHARD_SIZE decides how many jobs to queue -- and it has to use the same value
+# the job will.
+for _i in "${!_OV_NAMES[@]}"; do
+    printf -v "${_OV_NAMES[$_i]}" '%s' "${_OV_VALS[$_i]}"
+done
+EVAL_SHARD_SIZE="${EVAL_SHARD_SIZE:-5}"
 
 # Say up front what will be scored -- cheaper to notice here than in the queue.
 RUN_DIR="$(exp_find_run_dir || true)"
@@ -72,6 +81,11 @@ mapfile -t CKS < <(exp_list_checkpoints "$RUN_DIR")
 echo "[eval-only] experiment : $EXP_ID"
 echo "[eval-only] checkpoints: ${#CKS[@]} ($(basename "${CKS[0]}") .. $(basename "${CKS[-1]}"))"
 
+# Training has already finished here, so the checkpoint count is EXACT rather than
+# predicted from the schedule -- one shard per EVAL_SHARD_SIZE of them, no more.
+EVAL_SHARD_TOTAL="$(exp_shard_count "${#CKS[@]}")"
+echo "[eval-only] shards     : $EVAL_SHARD_TOTAL x $EVAL_SHARD_SIZE checkpoint(s), submitted to run concurrently"
+
 # Overrides go in a COPY of the env file, appended at the end. eval.sh sources that
 # file top to bottom, so a later assignment wins -- which is why appending works and
 # why exporting the variable here would not (the source would overwrite it).
@@ -83,6 +97,9 @@ cp "$ENV_FILE" "$EVAL_ENV_FILE"
     for _i in "${!_OV_NAMES[@]}"; do
         printf '%s=%q\nexport %s\n' "${_OV_NAMES[$_i]}" "${_OV_VALS[$_i]}" "${_OV_NAMES[$_i]}"
     done
+    # Not an override -- the shard COUNT this submission decided on, so each job's
+    # banner can say "shard 2 of 3" rather than "shard 2 of ?".
+    printf 'EVAL_SHARD_TOTAL=%q\nexport EVAL_SHARD_TOTAL\n' "$EVAL_SHARD_TOTAL"
 } >> "$EVAL_ENV_FILE"
 
 if [ "${#_OV_NAMES[@]}" -eq 0 ]; then
@@ -95,18 +112,36 @@ fi
 
 cd "$REPO"
 
-EVAL_ID="$(sbatch --parsable \
-    --job-name="ev_${GAME}_$(basename "$MODEL")" \
-    --output="$LOG_DIR/eval_${EXP_ID}_%j.out" \
-    --error="$LOG_DIR/eval_${EXP_ID}_%j.err" \
+EVAL_IDS=()
+for SHARD in $(seq 1 "$EVAL_SHARD_TOTAL"); do
+    ID="$(sbatch --parsable \
+        --job-name="ev${SHARD}_${GAME}_$(basename "$MODEL")" \
+        --output="$LOG_DIR/eval${SHARD}_${EXP_ID}_%j.out" \
+        --error="$LOG_DIR/eval${SHARD}_${EXP_ID}_%j.err" \
+        --export="ALL,EXP_ENV_FILE=$EVAL_ENV_FILE,EVAL_SHARD=$SHARD" \
+        ${EVAL_SBATCH_OPTS:-} \
+        "$HERE/eval.sh")"
+    EVAL_IDS+=("$ID")
+    echo "[eval-only] submitted job $ID  shard $SHARD/$EVAL_SHARD_TOTAL"
+done
+
+# The complete table, once every shard is done. Each shard also writes a partial one
+# as it finishes, so there is something to read in the meantime.
+SUMMARY_ID="$(sbatch --parsable \
+    --job-name="sum_${GAME}_$(basename "$MODEL")" \
+    --dependency="afterany:$(IFS=:; echo "${EVAL_IDS[*]}")" \
+    --output="$LOG_DIR/summary_${EXP_ID}_%j.out" \
+    --error="$LOG_DIR/summary_${EXP_ID}_%j.err" \
     --export="ALL,EXP_ENV_FILE=$EVAL_ENV_FILE" \
-    ${EVAL_SBATCH_OPTS:-} \
-    "$HERE/eval.sh")"
+    ${SUMMARY_SBATCH_OPTS:-} \
+    "$HERE/summarize.sh")"
 
 cat <<EOF
-[eval-only] submitted job $EVAL_ID (no dependency -- runs as soon as a GPU is free)
+[eval-only] ${#EVAL_IDS[@]} eval job(s) + summary job $SUMMARY_ID queued.
+            The eval jobs have no dependency -- they start as soon as GPUs are free,
+            and run at the same time as each other.
 
-  tail -f $LOG_DIR/eval_${EXP_ID}_$EVAL_ID.out
-  cat    $EXP_DIR/RESULTS.md      # written when it finishes
-  scancel $EVAL_ID                # cancel
+  tail -f $LOG_DIR/eval1_${EXP_ID}_${EVAL_IDS[0]}.out
+  cat    $EXP_DIR/RESULTS.md      # complete once job $SUMMARY_ID has run
+  scancel ${EVAL_IDS[*]} $SUMMARY_ID   # cancel
 EOF

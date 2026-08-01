@@ -19,6 +19,12 @@
 #
 # Because each job wants a whole GPU for hours, --limit is worth using on a busy
 # queue -- run it again tomorrow and it picks up where it left off.
+#
+# NOTE --limit counts EXPERIMENTS, not jobs. Each one is now submitted as
+# ceil(checkpoints / EVAL_SHARD_SIZE) concurrent gameplay jobs plus a summary job, so
+# a 10-checkpoint experiment is 3 jobs and asks for 2 GPUs at once. On a busy queue,
+# EVAL_SHARD_SIZE=999 (one job per experiment, the pre-sharding behaviour) or a
+# smaller --limit is the lever.
 
 set -euo pipefail
 

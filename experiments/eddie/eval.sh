@@ -61,8 +61,32 @@ if [ -z "$RUN_DIR" ]; then
 fi
 echo "[eval] run dir = $RUN_DIR"
 
-mapfile -t CHECKPOINTS < <(exp_list_checkpoints "$RUN_DIR")
-echo "[eval] ${#CHECKPOINTS[@]} checkpoint(s) to score"
+# This job scores only ITS shard of the checkpoints (see exp_shard_filter). The
+# other shards are separate jobs running at the same time; each writes to its own
+# eval/<checkpoint>/ directory, so they never touch the same file.
+mapfile -t ALL_CHECKPOINTS < <(exp_list_checkpoints "$RUN_DIR")
+# Re-read from the source rather than piping the array back through printf: with an
+# empty array, `printf '%s\n' "${arr[@]}"` emits one BLANK line, which would come
+# back as a checkpoint path of "".
+mapfile -t CHECKPOINTS < <(exp_list_checkpoints "$RUN_DIR" | exp_shard_filter)
+if [ -n "${EVAL_SHARD:-}" ]; then
+    echo "[eval] $(exp_shard_label): ${#CHECKPOINTS[@]} of ${#ALL_CHECKPOINTS[@]} checkpoint(s)"
+else
+    echo "[eval] ${#CHECKPOINTS[@]} checkpoint(s) to score"
+fi
+if [ "${#CHECKPOINTS[@]}" -eq 0 ]; then
+    # A shard past the end of a short run (training was killed before it wrote as
+    # many checkpoints as the schedule predicted). Nothing to do, and not an error.
+    echo "[eval] this shard has no checkpoints -- nothing to do."
+    exit 0
+fi
+
+# Only shard 1 scores the untrained baseline: it does not depend on the checkpoint,
+# so every other shard would be re-running (or re-copying) the identical row.
+if ! exp_owns_base_row; then
+    echo "[eval] base row skipped -- shard 1 owns it."
+    EVAL_BASE=0
+fi
 
 # Shared lm-eval flags. --log_samples keeps the per-example outputs, which is the
 # only way to tell a real score from a formatting failure after the fact.

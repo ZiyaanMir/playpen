@@ -69,9 +69,9 @@ exp_load_preset() {
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
               VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
-              EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
+              EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
               PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
-              PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT \
+              PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_SERIAL \
               WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
               EXTRA_TRAIN_ARGS EXP_TAG; do
         if [ -n "${!_v+set}" ]; then
@@ -147,6 +147,20 @@ exp_load_preset() {
     EVAL_LIMIT="${EVAL_LIMIT:-}"         # smoke tests only
     EVAL_EXTRA="${EVAL_EXTRA:-}"         # verbatim extra lm-eval flags
 
+    # --- how many checkpoints one evaluation job takes -----------------------
+    # BOTH evaluations (lm-eval and the playpen games eval) are submitted as one job
+    # per shard of this many checkpoints, all of them held on the training job and
+    # therefore running CONCURRENTLY. With the presets' MAX_STEPS=1000 /
+    # SAVE_STEPS=100 that is 10 checkpoints -> 2 lm-eval jobs + 2 gameplay jobs.
+    #
+    # Why shard at all: the gameplay eval is generation, hours per checkpoint, and a
+    # 10-checkpoint run does not fit one walltime on either cluster. Sharding turns a
+    # walltime problem into a queue-width problem.
+    #
+    # Set it larger than the checkpoint count for the old single-job behaviour
+    # (EVAL_SHARD_SIZE=999), or smaller for more, shorter jobs.
+    EVAL_SHARD_SIZE="${EVAL_SHARD_SIZE:-5}"
+
     # --- playpen games eval (the third job) ----------------------------------
     # Plays every checkpoint through clembench and reports the clemscore. Game
     # independent on purpose: the point is to score the 13 games the run was NOT
@@ -160,6 +174,10 @@ exp_load_preset() {
     PPEVAL_MAX_TOKENS="${PPEVAL_MAX_TOKENS:-300}"
     PPEVAL_TEMPERATURE="${PPEVAL_TEMPERATURE:-0.0}"
     PPEVAL_TIMEOUT="${PPEVAL_TIMEOUT:-}"         # per-row ceiling, e.g. 3h
+    # 1 => hold the gameplay shards behind the lm-eval shards instead of beside them,
+    # i.e. the old one-GPU-per-experiment chain. Default 0 runs everything the moment
+    # training finishes, which is faster in wall-clock and wider in the queue.
+    PPEVAL_SERIAL="${PPEVAL_SERIAL:-0}"
 
     EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"
     EXP_TAG="${EXP_TAG:-}"
@@ -172,9 +190,9 @@ exp_load_preset() {
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
            VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
            TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
-           EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA \
+           EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
            PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
-           PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT \
+           PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_SERIAL \
            WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
            EXTRA_TRAIN_ARGS EXP_TAG
 }
@@ -273,6 +291,93 @@ exp_list_checkpoints() {
     done | sort -n -k1,1 | cut -f2-
 }
 
+# --- evaluation sharding -----------------------------------------------------
+# Both evaluations are submitted as N concurrent jobs, each taking EVAL_SHARD_SIZE
+# checkpoints. A job learns which slice is its own from $EVAL_SHARD (1-based),
+# exported by the submitter through -v / --export rather than written into
+# experiment.env -- one env file is shared by every shard, so the index cannot live
+# in it.
+#
+# The slice is positional over exp_list_checkpoints' output, which is sorted by STEP
+# NUMBER and filtered to complete adapters. Both properties matter: every shard
+# enumerates the same list in the same order, so the slices tile it exactly, with no
+# checkpoint evaluated twice and none dropped.
+
+# How many checkpoints this experiment will have.
+#
+# Prefers what is actually on disk (the post-hoc re-run path: run_eval.sh and
+# run_playpen_eval.sh submit after training has finished, so the answer is exact).
+# Falls back to PREDICTING it from the schedule, because run_experiment.sh queues
+# every job up front -- before training has written a single checkpoint -- and the
+# shard count has to be decided then. train_selfplay.py saves every SAVE_STEPS up to
+# MAX_STEPS, so that prediction is MAX_STEPS/SAVE_STEPS.
+#
+# Over-predicting is harmless: a shard whose slice is empty (training was killed
+# early, so there are fewer checkpoints than planned) finds nothing to do and exits
+# cleanly in seconds. Under-predicting is not, which is why the disk is preferred
+# whenever it has something to say.
+exp_expected_checkpoints() {
+    local run_dir n
+    run_dir="$(exp_find_run_dir 2>/dev/null || true)"
+    if [ -n "$run_dir" ]; then
+        n="$(exp_list_checkpoints "$run_dir" 2>/dev/null | wc -l | tr -d '[:space:]')"
+        if [ "${n:-0}" -gt 0 ] 2>/dev/null; then printf '%d\n' "$n"; return 0; fi
+    fi
+    local steps="${MAX_STEPS:-0}" save="${SAVE_STEPS:-0}"
+    case "$steps$save" in ''|*[!0-9]*) steps=0; save=0 ;; esac
+    if [ "$save" -gt 0 ] && [ "$steps" -gt 0 ]; then
+        printf '%d\n' $(( steps / save > 0 ? steps / save : 1 ))
+    else
+        printf '1\n'
+    fi
+}
+
+# How many evaluation jobs are needed to cover $1 checkpoints.
+exp_shard_count() {
+    local n="${1:-1}" size="${EVAL_SHARD_SIZE:-5}"
+    case "$size" in ''|*[!0-9]*) size=5 ;; esac
+    [ "$size" -ge 1 ] || size=5
+    case "$n" in ''|*[!0-9]*) n=1 ;; esac
+    [ "$n" -ge 1 ] || n=1
+    printf '%d\n' $(( (n + size - 1) / size ))
+}
+
+# Keep only $EVAL_SHARD's slice. Reads checkpoint paths on stdin, writes the kept
+# ones to stdout in the same order.
+#
+# An unset or empty EVAL_SHARD passes everything through, so a hand re-run
+# (`source experiment.env && experiments/eddie/eval.sh`) still scores the whole run
+# exactly as it did before sharding existed.
+exp_shard_filter() {
+    local shard="${EVAL_SHARD:-}" size="${EVAL_SHARD_SIZE:-5}"
+    case "$shard" in ''|*[!0-9]*) cat; return 0 ;; esac
+    [ "$shard" -ge 1 ] || { cat; return 0; }
+    case "$size" in ''|*[!0-9]*) size=5 ;; esac
+    [ "$size" -ge 1 ] || size=5
+    awk -v s="$shard" -v n="$size" 'NR > (s - 1) * n && NR <= s * n'
+}
+
+# True when this job owns the shared, checkpoint-independent baseline row.
+#
+# The untrained base model is scored ONCE per experiment, not once per shard: it is
+# the same model and the same tasks whichever checkpoints a shard holds, and on the
+# gameplay side it is hours of generation. Shard 1 does it; the others skip it and
+# pick it up from the experiment directory when the summary is written. An unsharded
+# run (no EVAL_SHARD) owns it too.
+exp_owns_base_row() {
+    case "${EVAL_SHARD:-}" in
+        ''|1) return 0 ;;
+        *)    return 1 ;;
+    esac
+}
+
+# "shard 2 of 3" / "" -- for job banners.
+exp_shard_label() {
+    [ -n "${EVAL_SHARD:-}" ] || return 0
+    printf 'shard %s of %s (%s checkpoints each)' \
+        "$EVAL_SHARD" "${EVAL_SHARD_TOTAL:-?}" "${EVAL_SHARD_SIZE:-5}"
+}
+
 # Activate a venv and verify it really is the one we asked for.
 #
 # Compares the venv ROOT DIRECTORIES resolved to physical paths (`pwd -P`).
@@ -350,8 +455,16 @@ exp_activate_venv() {
 # Kept under $EXP_DIR/tmp rather than a shared directory so concurrent jobs cannot
 # fight over one torch.compile / vLLM cache, and so anything left behind is obvious
 # and belongs to a known experiment.
+#
+# PER JOB, not per experiment. The trap at the bottom `rm -rf`s this directory on
+# exit, and since evaluation is now sharded into jobs that run CONCURRENTLY within
+# one experiment, a single $EXP_DIR/tmp would mean the first shard to finish deleting
+# the inductor/triton/vLLM caches out from under its siblings mid-run. Naming it
+# after the scheduler's job id keeps the cleanup to what this job created; $$ is the
+# fallback for a hand re-run outside the queue.
 exp_setup_tmpdir() {
-    local base="${EXP_DIR:?exp_setup_tmpdir needs EXP_DIR}/tmp"
+    local root="${EXP_DIR:?exp_setup_tmpdir needs EXP_DIR}/tmp"
+    local base="$root/${SLURM_JOB_ID:-${JOB_ID:-$$}}"
     if ! mkdir -p "$base" 2>/dev/null || [ ! -w "$base" ]; then
         echo "ERROR: cannot create a temp directory at $base" >&2
         echo "       \$EXP_DIR must be writable -- check project storage quota." >&2
@@ -369,9 +482,10 @@ exp_setup_tmpdir() {
     # or get rsync'd home. The path is baked into the trap NOW rather than read from
     # $TMPDIR when it fires, so a later reassignment cannot redirect the rm. A SIGKILL
     # (walltime) skips the trap and leaves $EXP_DIR/tmp behind -- harmless, and
-    # obviously attributable to that experiment.
-    trap "rm -rf -- '$base'" EXIT
-    echo "[tmp] TMPDIR=$TMPDIR (torch/triton/vLLM caches inside it)"
+    # obviously attributable to that experiment. The parent is only removed when it
+    # is empty, i.e. when this was the last shard still holding a temp directory.
+    trap "rm -rf -- '$base'; rmdir -- '$root' 2>/dev/null || true" EXIT
+    echo "[tmp] TMPDIR=$TMPDIR (torch/triton/vLLM caches inside it, per job)"
 }
 
 # Pin torch.distributed / vLLM to a genuinely free port, and say so in the log.
@@ -526,6 +640,7 @@ exp_banner() {
     else
         echo "tasks       = ${EVAL_TASKS:-?} (batch ${EVAL_BATCH:-?})"
         echo "eval_base   = ${EVAL_BASE:-?}"
+        [ -n "${EVAL_SHARD:-}" ] && echo "shard       = $(exp_shard_label)"
     fi
     echo "cluster     = ${EXP_CLUSTER:-?}"
     echo "host        = $(hostname)"
