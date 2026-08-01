@@ -20,3 +20,4 @@ key.json
 model_registry.json
 CLAUDE.md
 .aider*
+/claude_notes
