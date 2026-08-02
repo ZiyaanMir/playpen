@@ -17,6 +17,12 @@ The two supported behaviors mirror ``MarshalConfig.fidelity_mode``:
 See ``PAPER_VS_CODE_DISCREPANCIES.md`` in the MARSHAL repo for the audit these
 two modes are derived from.
 
+Those two departures are separately switchable: ``marshal_exact`` selects both by
+default, and the ``unique_pooling`` argument threaded through this module can turn
+the second one off on its own (``MarshalConfig.marshal_exact_unique_pooling``),
+giving "MARSHAL's pre-sum pass with occurrence-weighted pooling". Leave it ``None``
+to follow ``marshal_exact``, which is the historical behavior.
+
 Token/turn indexing convention
 ------------------------------
 All positions are indices into a single rollout row's *completion* token
@@ -270,14 +276,14 @@ def _row_trajectory_return(returns_row: torch.Tensor, owner_mask_row: torch.Tens
 def _pool_offset_scale(
     row_scalars: torch.Tensor,
     *,
-    marshal_exact: bool,
+    unique_pooling: bool,
     norm_mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute the (mean, scale) to apply to a pool of trajectory-return scalars.
 
     Args:
         row_scalars: 1-D tensor of one scalar per row in the pool.
-        marshal_exact: if True, pool over the *set of distinct values* (MARSHAL's
+        unique_pooling: if True, pool over the *set of distinct values* (MARSHAL's
             ``normalize_unique_values`` behavior -- equal-weights rare and common
             outcomes). If False, occurrence-weighted mean/std over all rows.
         norm_mode: ``"mean"`` -> scale is 1 (mean-center only);
@@ -289,7 +295,7 @@ def _pool_offset_scale(
         that ``(x - mean) / scale`` collapses to 0 -- matching MARSHAL's guard of
         returning zeros when there is nothing to normalize against.
     """
-    values = torch.unique(row_scalars) if marshal_exact else row_scalars
+    values = torch.unique(row_scalars) if unique_pooling else row_scalars
     one = row_scalars.new_ones(())
 
     if values.numel() <= 1:
@@ -315,6 +321,7 @@ def normalize_returns_by_seat(
     agent_specific: bool,
     marshal_exact: bool,
     norm_mode: str,
+    unique_pooling: Optional[bool] = None,
 ) -> torch.Tensor:
     """Apply MARSHAL's (per-seat) advantage normalization to a ``(B, T)`` returns.
 
@@ -323,12 +330,18 @@ def normalize_returns_by_seat(
         owner_mask: ``(B, T)`` 1 for model tokens, 0 elsewhere.
         seats: ``(B,)`` long tensor of seat ids (0/1).
         agent_specific: if True, pool each seat separately; else one batch-wide pool.
-        marshal_exact: see ``_pool_offset_scale``.
+        marshal_exact: default for ``unique_pooling`` (this stage is the only place
+            ``marshal_exact`` acts here; the pre-sum pass lives in
+            :func:`compute_marshal_advantages`).
         norm_mode: ``"mean"`` or ``"mean_std"``.
+        unique_pooling: override for the distinct-value pooling rule, see
+            ``_pool_offset_scale``. ``None`` (the default) follows ``marshal_exact``.
 
     Returns:
         ``(B, T)`` normalized advantages, zeroed at non-model-token positions.
     """
+    if unique_pooling is None:
+        unique_pooling = marshal_exact
     row_scalars = torch.stack(
         [_row_trajectory_return(returns[i], owner_mask[i]) for i in range(returns.shape[0])]
     )
@@ -352,7 +365,7 @@ def normalize_returns_by_seat(
         if not stat_member.any():
             continue  # pool holds only placeholders; leave mean 0 / scale 1
         mean, scale = _pool_offset_scale(
-            row_scalars[stat_member], marshal_exact=marshal_exact, norm_mode=norm_mode
+            row_scalars[stat_member], unique_pooling=unique_pooling, norm_mode=norm_mode
         )
         means[member] = mean
         scales[member] = scale
@@ -401,6 +414,7 @@ def compute_marshal_advantages(
     turn_level: bool = True,
     agent_specific: bool = True,
     marshal_exact: bool = False,
+    unique_pooling: Optional[bool] = None,
     norm_mode: str = "mean",
     whiten_rewards: bool = False,
     whiten_advantages: bool = False,
@@ -415,6 +429,13 @@ def compute_marshal_advantages(
     mode) apply a biasing pre-sum reward normalization, (optionally) whiten the
     reward field, take the backward cumulative return. Then normalize the ``(B, T)``
     returns per seat and (optionally) whiten the result.
+
+    ``marshal_exact`` selects *both* of MARSHAL's shipped departures: the pre-sum
+    reward normalization and the distinct-value ("unique") pooling of trajectory
+    returns. ``unique_pooling`` splits the second one out -- ``None`` (the default)
+    follows ``marshal_exact``, ``False`` keeps the pre-sum pass but pools
+    occurrence-weighted like ``paper_correct``, ``True`` forces distinct-value
+    pooling. Only the pooling rule changes; nothing else about the mode moves.
 
     ``length_penalty`` (``None`` = off, the default) is a :class:`LengthPenaltySpec`
     applied to each turn's reward before anything else, matching where MARSHAL adds
@@ -493,6 +514,7 @@ def compute_marshal_advantages(
         agent_specific=agent_specific,
         marshal_exact=marshal_exact,
         norm_mode=norm_mode,
+        unique_pooling=unique_pooling,
     )
 
     if whiten_advantages:

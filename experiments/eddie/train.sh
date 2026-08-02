@@ -90,6 +90,12 @@ ARGS=(
 # Empty => don't pass the flag, so the YAML value stands (see presets/*.env).
 [ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )
 [ -n "${LP_COEF:-}"    ] && ARGS+=( --length-penalty-coef "$LP_COEF" )
+# marshal_exact's torch.unique distinct-value pooling. Tri-state like TR_ENABLE
+# below; only has an effect under fidelity_mode: marshal_exact.
+case "${UNIQUE_POOL:-}" in
+    1) ARGS+=( --marshal-exact-unique-pooling ) ;;
+    0) ARGS+=( --no-marshal-exact-unique-pooling ) ;;
+esac
 # Dense per-turn rewards. Same convention: empty => leave the YAML alone. TR_ENABLE
 # is a tri-state (1 on / 0 off / empty = whatever the YAML says) because "on" and
 # "leave alone" must stay distinguishable, exactly as --turn-rewards/--no-turn-rewards

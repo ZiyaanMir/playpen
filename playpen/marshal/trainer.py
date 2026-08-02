@@ -544,6 +544,7 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
             turn_level=cfg.turn_level_rewards,
             agent_specific=cfg.agent_specific_normalization,
             marshal_exact=cfg.marshal_exact,
+            unique_pooling=cfg.unique_value_pooling,
             norm_mode=cfg.advantage_norm_mode,
             whiten_rewards=cfg.whiten_rewards,
             whiten_advantages=cfg.whiten_advantages,

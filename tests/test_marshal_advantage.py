@@ -94,6 +94,52 @@ class TestSeatPooling(unittest.TestCase):
         self.assertAlmostEqual(adv[0, 0].item(), 1.0, places=5)
         self.assertAlmostEqual(adv[-1, 0].item(), -1.0, places=5)
 
+    def test_unique_pooling_off_reverts_to_occurrence_weighted(self):
+        """The sub-flag must undo the dedup, and nothing else about marshal_exact."""
+        rows = [_sparse_row(0, 1.0) for _ in range(9)] + [_sparse_row(0, -1.0)]
+        adv = compute_marshal_advantages(
+            rows, seq_len=2, agent_specific=True, marshal_exact=True,
+            unique_pooling=False, norm_mode="mean",
+        )
+        # Terminal-only rewards, so the pre-sum pass shifts every row by the same
+        # seat mean and the *pooling* rule is what is on trial: mean 0.8, as in
+        # test_paper_correct_is_occurrence_weighted rather than the uniqued 0.0.
+        self.assertAlmostEqual(adv[0, 0].item(), 0.2, places=5)
+        self.assertAlmostEqual(adv[-1, 0].item(), -1.8, places=5)
+
+    def test_unique_pooling_none_follows_marshal_exact(self):
+        """Omitting the flag must be byte-identical to before it existed."""
+        rows = [_sparse_row(0, 1.0) for _ in range(9)] + [_sparse_row(0, -1.0)]
+        for exact in (False, True):
+            legacy = compute_marshal_advantages(
+                rows, seq_len=2, agent_specific=True, marshal_exact=exact, norm_mode="mean"
+            )
+            explicit = compute_marshal_advantages(
+                rows, seq_len=2, agent_specific=True, marshal_exact=exact,
+                unique_pooling=exact, norm_mode="mean",
+            )
+            self.assertTrue(torch.allclose(legacy, explicit), f"marshal_exact={exact}")
+
+    def test_unique_pooling_off_keeps_the_pre_sum_pass(self):
+        """Only the pooling rule moves: the pre-sum bias must survive the flag."""
+        # A nonzero non-terminal reward is what the pre-sum pass acts on (see
+        # TestPreSumNormalizationDivergence), and distinct returns make unique
+        # pooling a no-op, so any remaining difference is the pre-sum pass alone.
+        row = RowRollout(
+            seat=0, completion_len=4, owner_mask=[1, 1, 1, 1],
+            turn_end_positions=[1, 3], turn_rewards=[0.5, 1.0],
+        )
+        other = RowRollout(
+            seat=0, completion_len=4, owner_mask=[1, 1, 1, 1],
+            turn_end_positions=[1, 3], turn_rewards=[0.0, 0.0],
+        )
+        kw = dict(seq_len=4, norm_mode="mean", turn_level=True)
+        paper = compute_marshal_advantages([row, other], marshal_exact=False, **kw)
+        no_unique = compute_marshal_advantages(
+            [row, other], marshal_exact=True, unique_pooling=False, **kw
+        )
+        self.assertFalse(torch.allclose(paper, no_unique))
+
     def test_agent_specific_vs_batchwide(self):
         # seat 0 all +1, seat 1 all -1.
         rows = [_sparse_row(0, 1.0), _sparse_row(0, 1.0), _sparse_row(1, -1.0), _sparse_row(1, -1.0)]
@@ -246,6 +292,23 @@ class TestConfig(unittest.TestCase):
 
     def test_marshal_exact_property(self):
         self.assertTrue(MarshalConfig(fidelity_mode="marshal_exact").marshal_exact)
+
+    def test_unique_pooling_defaults_to_following_fidelity_mode(self):
+        self.assertTrue(MarshalConfig().marshal_exact_unique_pooling)
+        self.assertTrue(MarshalConfig(fidelity_mode="marshal_exact").unique_value_pooling)
+        self.assertFalse(MarshalConfig(fidelity_mode="paper_correct").unique_value_pooling)
+
+    def test_unique_pooling_sub_flag_only_bites_under_marshal_exact(self):
+        off_exact = MarshalConfig(
+            fidelity_mode="marshal_exact", marshal_exact_unique_pooling=False
+        )
+        self.assertFalse(off_exact.unique_value_pooling)
+        self.assertTrue(off_exact.marshal_exact)  # the pre-sum pass is untouched
+        # Under paper_correct the sub-flag has nothing to disable, either way.
+        off_paper = MarshalConfig(
+            fidelity_mode="paper_correct", marshal_exact_unique_pooling=False
+        )
+        self.assertFalse(off_paper.unique_value_pooling)
 
 
 class TestSamplingTruncation(unittest.TestCase):

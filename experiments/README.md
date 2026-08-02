@@ -370,6 +370,7 @@ Scheduler options pass through too:
 | `EXP_TAG` | — | goes in the directory name; set it for every variant |
 | `EXTRA_TRAIN_ARGS` | — | extra `train_selfplay.py` flags, verbatim |
 | `MAX_STEPS` / `SAVE_STEPS` | `1000` / `100` in every preset | schedule and checkpoint cadence |
+| `UNIQUE_POOL` | — | tri-state `1`/`0`/empty for `marshal_exact`'s `torch.unique` pooling (see [below](#marshal_exacts-unique-pooling-unique_pool)) |
 | `EVAL_TASKS` | `logiglue,logicbench` | lm-eval tasks (comma-separated) |
 | `EVAL_BASE` | `1` | also score the untrained model |
 | `EVAL_LIMIT` | — | `--limit N`, smoke tests only |
@@ -389,8 +390,8 @@ Everything else lives in `presets/<game>.env` — that file is the per-game sour
 
 On by default. The run is **named after the experiment** (`EXP_ID`), grouped by
 `{game}_{model}`, and tagged with the switches that define the arm (`marshal` /
-`no-marshal`, `dr_grpo`, `length_penalty`, `paper_correct` / `marshal_exact`, the cluster,
-your `EXP_TAG`). Its config carries the *resolved* MARSHAL config plus every training
+`no-marshal`, `dr_grpo`, `length_penalty`, `paper_correct` / `marshal_exact`,
+`no-unique-pool`, the cluster, your `EXP_TAG`). Its config carries the *resolved* MARSHAL config plus every training
 hyperparameter, so two arms can be diffed in the UI without opening a manifest.
 
 `WB_MODE=auto` is what makes this safe to leave on: it uploads live only when a credential
@@ -478,6 +479,10 @@ mean is the honest signal.
 > algorithms and the gradient direction is unchanged, but an on/off length-penalty ablation
 > at `marshal_exact` also silently switches pooling rule — pin `fidelity_mode` consistently
 > across arms, and don't describe such a run as reproducing MARSHAL's shipped normalization.
+>
+> `UNIQUE_POOL=0` makes that switch *explicit* instead of incidental: both arms then pool
+> occurrence-weighted by construction, so the length penalty is the only thing varying.
+> See [`marshal_exact`'s unique pooling](#marshal_exacts-unique-pooling-unique_pool).
 
 ---
 
@@ -552,6 +557,46 @@ advantage pool is identical across every game.
 | `clean_up` | 512 | 2 × 32 | 24576 | up to 28 rounds |
 | `imagegame` | 256 | 2 × 32 | 32768 | up to 50 rounds of one-line commands |
 | `adventuregame` | 256 | **1 × 64** | 32768 | up to 100 turns — a single ~26k-token row |
+
+---
+
+## `marshal_exact`'s unique pooling (`UNIQUE_POOL`)
+
+`fidelity_mode: marshal_exact` bundles **two** departures from the MARSHAL paper: (a) a
+pre-sum reward normalization, and (b) `torch.unique` distinct-value pooling of trajectory
+returns, which equal-weights rare and common outcomes. `UNIQUE_POOL` splits (b) out so an
+ablation can attribute a result to one of them rather than to both at once.
+
+```bash
+# marshal_exact as shipped (both departures) -- the default, no var needed
+EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact' EXP_TAG=exact ./run_experiment.sh guesswhat
+# its pre-sum pass, but occurrence-weighted pooling
+EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact' UNIQUE_POOL=0 EXP_TAG=exact_nounique \
+    ./run_experiment.sh guesswhat
+```
+
+| var | flag | meaning |
+|---|---|---|
+| `UNIQUE_POOL` | `--marshal-exact-unique-pooling` / `--no-...` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `TR_*` / `LP_*`) |
+
+**It only bites under `marshal_exact`.** `paper_correct` never pools over distinct values,
+so `UNIQUE_POOL=0` is a no-op there and `UNIQUE_POOL=1` cannot switch unique pooling on.
+`fidelity_mode` itself has no env var — set it in the YAML or via `EXTRA_TRAIN_ARGS`, as
+above. The resolved value is recorded in `manifest.json`, W&B tags a run that turned it
+off with `no-unique-pool`, and `status.sh -v` renders it as
+`fidelity=marshal_exact(no-unique-pool)`.
+
+Why it matters on clembench: returns only ever take the values `{-1, 0, +1}`, so uniquing
+makes the baseline the *midpoint of whichever outcomes occur* rather than the empirical
+mean — 9 wins and 1 loss give a baseline of `0.0` uniqued against `0.8`
+occurrence-weighted, i.e. the loss is charged 9× harder relative to the wins. Note that
+`length_penalty` or `TR_*` make returns near-continuous, at which point unique pooling
+already degenerates into occurrence-weighted pooling by itself and this var changes little
+(see the reporting caveat under
+[The presets, and the length-penalty calibration](#the-presets-and-the-length-penalty-calibration)).
+
+**Reporting.** A run with `UNIQUE_POOL=0` is not a reproduction of MARSHAL's shipped
+normalization; describe it as `marshal_exact` minus distinct-value pooling.
 
 ---
 

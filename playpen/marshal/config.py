@@ -91,8 +91,33 @@ class MarshalConfig:
             of MARSHAL's own runs. The pre-sum mean is taken over all
             ``turn_end_positions`` (zero-reward boundaries included), matching
             MARSHAL's ``score_normalize`` mask; see
-            ``advantage._marshal_pre_sum_normalize``. Consulted only when
+            ``advantage._marshal_pre_sum_normalize``. Departure (b) can be switched
+            off on its own with ``marshal_exact_unique_pooling``. Consulted only when
             ``enabled=True``.
+        marshal_exact_unique_pooling: Whether ``marshal_exact``'s departure (b) --
+            the ``torch.unique`` distinct-value pooling in
+            ``advantage._pool_offset_scale`` -- is applied. Default ``True``, i.e.
+            ``marshal_exact`` behaves exactly as it always has.
+
+            Set ``False`` to run ``marshal_exact``'s pre-sum reward normalization
+            (departure (a)) with ``paper_correct``'s occurrence-weighted pooling,
+            which isolates the two departures from each other in an ablation.
+            Nothing else about the mode moves.
+
+            **Inert unless ``fidelity_mode == "marshal_exact"``** -- ``paper_correct``
+            never pools over distinct values in the first place, so this field is a
+            no-op there rather than a way to turn unique pooling *on*.
+
+            Worth knowing before flipping it: on clembench, distinct-value pooling
+            makes the baseline the midpoint of *whichever outcomes occur* rather than
+            the empirical mean, because only ``{-1, 0, +1}`` are ever seen. That
+            matters most in small or lopsided pools -- e.g. 9 wins and 1 loss give a
+            baseline of ``0.0`` under unique pooling but ``0.8`` under
+            occurrence-weighted pooling. Note also that any per-turn signal which
+            makes returns continuous (``length_penalty``, ``turn_rewards``) already
+            renders nearly every return distinct, at which point unique pooling
+            collapses into occurrence-weighted pooling on its own and this flag
+            changes little.
         dr_grpo: When ``True``, run with the Dr. GRPO (arXiv:2503.20783) recipe by
             configuring TRL's underlying loss/scaling: ``loss_type="dr_grpo"`` (the
             summed loss is normalized by the constant ``max_completion_length``
@@ -319,6 +344,7 @@ class MarshalConfig:
     advantage_norm_mode: str = "mean"
     gamma: float = 1.0
     fidelity_mode: str = "paper_correct"
+    marshal_exact_unique_pooling: bool = True
     whiten_rewards: bool = False
     whiten_advantages: bool = False
     dr_grpo: bool = False
@@ -461,6 +487,18 @@ class MarshalConfig:
     def marshal_exact(self) -> bool:
         """Whether to reproduce MARSHAL's shipped (paper-divergent) behavior."""
         return self.fidelity_mode == "marshal_exact"
+
+    @property
+    def unique_value_pooling(self) -> bool:
+        """Whether pool statistics are taken over *distinct* trajectory returns.
+
+        The resolved answer for ``advantage._pool_offset_scale``'s ``torch.unique``:
+        true only when ``marshal_exact`` is selected *and*
+        ``marshal_exact_unique_pooling`` has not switched it off. Under
+        ``paper_correct`` this is always False -- pooling is occurrence-weighted
+        there by definition, so the sub-flag has nothing to disable.
+        """
+        return self.marshal_exact and self.marshal_exact_unique_pooling
 
     def trl_grpo_overrides(self) -> Dict[str, Any]:
         """TRL ``GRPOConfig`` kwargs implementing the Dr. GRPO recipe (or nothing).

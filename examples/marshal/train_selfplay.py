@@ -68,6 +68,7 @@ MARSHAL_CLI_FIELDS = (
     "advantage_norm_mode",
     "gamma",
     "fidelity_mode",
+    "marshal_exact_unique_pooling",
     "whiten_rewards",
     "whiten_advantages",
     "row_context_mode",
@@ -193,6 +194,14 @@ def parse_args() -> argparse.Namespace:
                    help="'paper_correct' = the algorithm the paper describes; "
                         "'marshal_exact' = MARSHAL's shipped code, incl. its distinct-value "
                         "pooling and pre-sum reward normalization.")
+    # Splits marshal_exact's two departures apart. Only meaningful under
+    # --fidelity-mode marshal_exact; paper_correct never uniques, so this cannot turn
+    # distinct-value pooling ON there.
+    _add_bool_override(
+        p, "marshal-exact-unique-pooling",
+        "Pool over the SET OF DISTINCT trajectory returns (marshal_exact's torch.unique, "
+        "the default). --no-... keeps marshal_exact's pre-sum reward normalization but "
+        "pools occurrence-weighted like paper_correct. No effect under paper_correct.")
     p.add_argument("--row-context-mode", choices=ROW_CONTEXT_MODES, default=None,
                    help="How a seat's row context is assembled.")
     p.add_argument("--episode-pairing", choices=EPISODE_PAIRING_MODES, default=None,
@@ -413,6 +422,10 @@ def wandb_tags(args: argparse.Namespace, marshal_config) -> list[str]:
         tags.append(f"turn_rewards_{marshal_config.turn_reward_source}")
     if not marshal_config.agent_specific_normalization:
         tags.append("no-seat-norm")
+    # Only when it actually changed the pooling rule -- under paper_correct the
+    # sub-flag is inert, and a tag there would make two identical runs look different.
+    if marshal_config.marshal_exact and not marshal_config.marshal_exact_unique_pooling:
+        tags.append("no-unique-pool")
     if args.kl_beta:
         tags.append("kl")
     # Set by experiments/*/run_experiment.sh; absent for a hand-launched run.
@@ -561,6 +574,7 @@ def main() -> None:
           f"turn_level={marshal_config.turn_level_rewards} "
           f"advantage_norm_mode={marshal_config.advantage_norm_mode} "
           f"fidelity={marshal_config.fidelity_mode} "
+          f"unique_pooling={marshal_config.unique_value_pooling} "
           f"whiten_rewards={marshal_config.whiten_rewards} "
           f"whiten_advantages={marshal_config.whiten_advantages} "
           f"row_context_mode={marshal_config.row_context_mode} "
@@ -576,6 +590,17 @@ def main() -> None:
               "trainer disagree by many nats on single tokens, which sequence-level "
               "importance sampling turns into dead rows. Watch "
               "sampling/importance_sampling_ratio/min and marshal/is_ratio/mean.")
+    if not marshal_config.marshal_exact_unique_pooling:
+        if marshal_config.marshal_exact:
+            print("[marshal] NOTE: marshal_exact_unique_pooling is OFF -- this run keeps "
+                  "marshal_exact's pre-sum reward normalization but pools advantages "
+                  "occurrence-weighted (paper_correct's rule) instead of over distinct "
+                  "trajectory returns. Do not report it as reproducing MARSHAL's shipped "
+                  "normalization.")
+        else:
+            print("[marshal] NOTE: marshal_exact_unique_pooling is OFF but has no effect "
+                  f"under fidelity_mode='{marshal_config.fidelity_mode}', which never pools "
+                  "over distinct values anyway.")
     if marshal_config.row_context_mode != "exact":
         print("[marshal] WARNING: row_context_mode='spliced' reproduces the pre-fix "
               "rollout assembly, where the trained token sequence is not the sequence "

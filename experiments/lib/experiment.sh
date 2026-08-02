@@ -67,7 +67,7 @@ exp_load_preset() {
     for _v in MODEL MARSHAL_CONFIG \
               NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
+              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
               PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
@@ -109,6 +109,15 @@ exp_load_preset() {
     # value stands. See experiments/README.md for how these were calibrated.
     LP_MAX_LEN="${LP_MAX_LEN:-}"
     LP_COEF="${LP_COEF:-}"
+
+    # marshal_exact's distinct-value (torch.unique) pooling, as a tri-state like
+    # TR_ENABLE: 1 = force it on, 0 = force it off (keeping marshal_exact's pre-sum
+    # reward normalization but pooling occurrence-weighted), empty = leave the YAML
+    # alone. Only bites when fidelity_mode is marshal_exact -- paper_correct never
+    # uniques, so UNIQUE_POOL=0 is a no-op there and UNIQUE_POOL=1 cannot turn it on.
+    # fidelity_mode itself has no env var; set it in the YAML or via
+    # EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact'.
+    UNIQUE_POOL="${UNIQUE_POOL:-}"
 
     # Dense per-turn rewards (playpen/marshal/turn_rewards.py). Same convention as
     # LP_*: empty => don't pass the flag at all, so the YAML value stands. Set
@@ -188,7 +197,7 @@ exp_load_preset() {
     export GAME MODEL MARSHAL_CONFIG \
            NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF \
+           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL \
            TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
            PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \

@@ -93,6 +93,18 @@ def best_metric(exp):
         parts.append(piece)
     return "  ".join(parts)
 
+def _fidelity(cfg):
+    """fidelity_mode, flagged when marshal_exact ran without its unique pooling.
+
+    Defaults to True for a manifest written before the sub-flag existed, so an old
+    experiment still renders as a plain 'marshal_exact'.
+    """
+    mode = cfg.get("fidelity_mode", "?")
+    if mode == "marshal_exact" and not cfg.get("marshal_exact_unique_pooling", True):
+        return mode + "(no-unique-pool)"
+    return mode
+
+
 rows = []
 for exp in sorted(glob.glob(os.path.join(runs, "*"))):
     if not os.path.isdir(exp):
@@ -132,7 +144,7 @@ for exp in sorted(glob.glob(os.path.join(runs, "*"))):
         "model": os.path.basename(str(train.get("model", "?"))),
         "steps": train.get("max_steps", "?"),
         "lp": lp_s,
-        "fidelity": man.get("marshal_config", {}).get("fidelity_mode", "?"),
+        "fidelity": _fidelity(man.get("marshal_config", {})),
         "state": state,
         "score": best_metric(exp),
         "dirty": man.get("code", {}).get("git_dirty", False),

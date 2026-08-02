@@ -59,6 +59,7 @@ Custom `rollout_func` generation requires vLLM (`use_vllm=True`).
 | `advantage_norm_mode` | `mean` (center) or `mean_std` (z-score). |
 | `gamma` | backward-return discount (MARSHAL uses `1.0`). |
 | `fidelity_mode` | `paper_correct` (default) vs. `marshal_exact` (bit-comparable reproduction of MARSHAL's *shipped* code, including two documented departures from its own paper). |
+| `marshal_exact_unique_pooling` | sub-flag for `marshal_exact`'s **second** departure only — the `torch.unique` distinct-value pooling. Default `true` (= `marshal_exact` unchanged); `false` keeps its pre-sum reward normalization but pools occurrence-weighted like `paper_correct`. **Inert under `paper_correct`**, which never uniques. |
 | `whiten_rewards` | z-score the token-level reward field batch-wide *before* the cumulative sum (mirrors ROLL's `whiten_rewards: true`, set in every shipped MARSHAL selfplay YAML; densifies sparse rewards with a length-dependent component). Default `false`. |
 | `whiten_advantages` | z-score the final advantages batch-wide *after* per-seat normalization (mirrors ROLL's `whiten_advantages: true`; scale stabilization). Default `false`. |
 | `dr_grpo` | run with the **Dr. GRPO** ([arXiv:2503.20783](https://arxiv.org/abs/2503.20783)) recipe: TRL `loss_type='dr_grpo'` (loss normalized by the constant `max_completion_length` ⇒ no length bias) + `scale_rewards='none'` (no std division ⇒ no difficulty bias). Default `false`. |
@@ -358,4 +359,8 @@ models/marshal/{game}/{model}/20260721-142233/
   shipped code that its own `PAPER_VS_CODE_DISCREPANCIES.md` flags as bugs (a
   biasing pre-sum reward normalization, and distinct-value pooling that
   equal-weights rare and common outcomes) — use it only to compare against
-  MARSHAL's own numbers.
+  MARSHAL's own numbers. The two departures are separately switchable:
+  `marshal_exact_unique_pooling: false` (CLI `--no-marshal-exact-unique-pooling`)
+  keeps the first and drops the second, which is what isolates them in an
+  ablation. A run with it off is not a reproduction of MARSHAL's shipped
+  normalization and should not be reported as one.

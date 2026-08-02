@@ -102,6 +102,20 @@ sampling_top_k: 50
 #   common outcomes). Use only for comparison against MARSHAL's own numbers.
 fidelity_mode: marshal_exact
 
+# Sub-flag for marshal_exact's SECOND departure only: the torch.unique distinct-value
+# pooling in advantage._pool_offset_scale. true (default) = marshal_exact unchanged.
+# false = keep marshal_exact's pre-sum reward normalization but pool occurrence-weighted
+# like paper_correct -- which separates the two departures in an ablation.
+# INERT under fidelity_mode: paper_correct (it never uniques, so there is nothing to
+# disable and this cannot switch unique pooling ON).
+# Why it matters on clembench: returns only ever take the values {-1, 0, +1}, so uniquing
+# makes the baseline the midpoint of whichever outcomes happen to occur rather than the
+# empirical mean -- 9 wins + 1 loss gives baseline 0.0 uniqued vs 0.8 occurrence-weighted.
+# Note that length_penalty or turn_rewards make returns near-continuous, at which point
+# unique pooling already degenerates into occurrence-weighted pooling by itself.
+# Quick CLI override: --marshal-exact-unique-pooling / --no-marshal-exact-unique-pooling.
+marshal_exact_unique_pooling: true
+
 # Z-score the token-level reward field over all model-token positions (batch-wide,
 # both seats pooled) BEFORE the backward cumulative sum. Mirrors ROLL's
 # `whiten_rewards: true`, which every shipped MARSHAL *_selfplay.yaml enables --

@@ -175,6 +175,12 @@ def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
     if _env("LP_COEF"):
         overrides["length_penalty_coef"] = float(_env("LP_COEF"))
 
+    # marshal_exact's distinct-value pooling, tri-state like TR_ENABLE below: "" leaves
+    # the YAML alone. Same reason it must be handled here -- train.sh turns it into a
+    # CLI flag directly, so the EXTRA_TRAIN_ARGS parser never sees it.
+    if _env("UNIQUE_POOL") in ("0", "1"):
+        overrides["marshal_exact_unique_pooling"] = _env("UNIQUE_POOL") == "1"
+
     # Dense per-turn rewards, same story as LP_*: train.sh turns these env vars into
     # CLI flags directly (not via EXTRA_TRAIN_ARGS), so the argv parser below cannot
     # see them and the manifest would otherwise report the YAML's values for a run
