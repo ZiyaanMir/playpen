@@ -122,7 +122,7 @@ marshal_exact_unique_pooling: true
 # a framework flag, not part of the paper's algorithm. NOTE: with sparse terminal
 # rewards this densifies the signal (every model token picks up -mean/std), adding
 # a response-length-dependent component to the returns.
-whiten_rewards: true
+whiten_rewards: false
 
 # Z-score the final advantages over all model-token positions (batch-wide) AFTER
 # the per-seat normalization. Mirrors ROLL's `whiten_advantages: true` (also set
