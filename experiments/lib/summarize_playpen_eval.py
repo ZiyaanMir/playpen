@@ -23,9 +23,37 @@ clemscore is recomputed here as ``% Played / 100 * Quality Score`` when clemeval
 left it blank but both components are present, so a partially-aborting run still
 gets a comparable headline number. That is clemeval's own definition, not a new one.
 
-Rows are ``base`` first, then by training step. Every checkpoint is reported as a
-delta against ``base`` -- an absolute clemscore is uninterpretable without the
-untrained model beside it.
+Rows are ``base`` first, then by training step.
+
+THE TWO POPULATIONS (why there are two headline tables)
+-------------------------------------------------------
+clemeval's two aggregates are means over *different* sets of games:
+
+* ``all, Average % Played`` averages over **every game scored**.
+* ``all, Average Quality Score`` averages over only the games that produced at
+  least one parseable episode -- a game the model aborted 100% of the time has no
+  quality to average, so clemeval leaves it blank and drops it from the mean.
+
+That is a sound definition for describing one model. It is **not** sound for
+subtracting two models. The set of quality-contributing games changes from
+checkpoint to checkpoint: a checkpoint that starts to play a game it used to abort
+adds that game to its own denominator, usually at a low score, so *improving* can
+lower the reported quality. Measured across the runs in this repo, correcting for
+it moves the reported quality delta by up to ~18 points and flips its sign on many
+checkpoints.
+
+So this file reports both, and only ever subtracts the comparable one:
+
+* **Headline (native)** -- clemeval's own numbers, verbatim, with the size of each
+  denominator shown and **no delta**, because a difference of two means over
+  different populations is not a difference.
+* **Like-for-like** -- the same three statistics recomputed over the *fixed* set of
+  games that every row in the table scored both components for
+  (:func:`_common_games`), which is the largest population on which the rows are
+  mutually comparable. Deltas are reported here, and only here.
+
+The like-for-like set is usually smaller than 14 games. That is the price of a
+delta that means what it says; the per-game table below still shows everything.
 
 Stdlib only, so it runs in the training venv, on a login node, or on a laptop
 after an rsync.
@@ -153,6 +181,55 @@ def _scores(eval_subdir: str) -> tuple[dict[str, float | None], list[str]]:
     return merged, games
 
 
+def _scored_games(scores: dict[str, float | None]) -> set[str]:
+    """Games this row has BOTH a ``% Played`` and a ``Quality Score`` for.
+
+    Both are required: a game with a ``% Played`` but a blank ``Quality Score`` is
+    one the model aborted entirely, and including it in a fixed population would
+    mean averaging a hole.
+    """
+    played = {c[: -len(PLAYED_SUFFIX)] for c in scores
+              if c.endswith(PLAYED_SUFFIX) and scores[c] is not None}
+    quality = {c[: -len(QUALITY_SUFFIX)] for c in scores
+               if c.endswith(QUALITY_SUFFIX) and scores[c] is not None}
+    return played & quality
+
+
+def _common_games(rows: list[tuple[str, dict[str, float | None]]]) -> list[str]:
+    """The games EVERY row scored -- the population the deltas are computed on.
+
+    The intersection, not the union: a mean is only comparable across rows when
+    every row contributed the same games to it. Returns ``[]`` when the rows share
+    no game, which is reported rather than papered over.
+    """
+    if not rows:
+        return []
+    common = _scored_games(rows[0][1])
+    for _, scores in rows[1:]:
+        common &= _scored_games(scores)
+    return sorted(common)
+
+
+def _fixed_population(
+    scores: dict[str, float | None], games: list[str]
+) -> tuple[float | None, float | None, float | None]:
+    """``(clemscore, avg % played, avg quality)`` over a fixed set of games.
+
+    Both means use the *same* denominator -- ``len(games)`` -- which is the whole
+    point, and clemscore stays clemeval's own ``played / 100 * quality`` so the
+    number is comparable in kind with the native one.
+    """
+    if not games:
+        return None, None, None
+    played = [scores.get(g + PLAYED_SUFFIX) for g in games]
+    quality = [scores.get(g + QUALITY_SUFFIX) for g in games]
+    if any(v is None for v in played) or any(v is None for v in quality):
+        return None, None, None
+    avg_played = sum(played) / len(games)
+    avg_quality = sum(quality) / len(games)
+    return avg_played / 100.0 * avg_quality, avg_played, avg_quality
+
+
 def _sort_key(name: str) -> tuple[int, int]:
     """base first, then checkpoints by step number."""
     if name == "base":
@@ -208,10 +285,20 @@ def main() -> None:
         return
 
     exp_id = os.path.basename(exp_dir.rstrip("/"))
-    baseline = dict(rows[0][1]) if rows[0][0] == "base" else {}
 
-    def base_of(col: str, name: str) -> float | None:
-        return baseline.get(col) if baseline and name != "base" else None
+    # The fixed population every delta below is computed on. Derived from the rows
+    # actually present, so a run whose eval is still in flight gets a table that is
+    # internally consistent now and simply widens when the remaining shards land.
+    common = _common_games(rows)
+    fixed = {name: _fixed_population(scores, common) for name, scores in rows}
+    base_fixed = fixed.get("base") if rows[0][0] == "base" else None
+    # An empty common set makes every entry None, which is not a usable baseline --
+    # collapse it so the "bracketed numbers" note cannot claim deltas that aren't there.
+    if base_fixed is not None and base_fixed[0] is None:
+        base_fixed = None
+
+    def fixed_base_of(index: int, name: str) -> float | None:
+        return base_fixed[index] if base_fixed and name != "base" else None
 
     md = [
         f"# Playpen game results: {exp_id}",
@@ -221,18 +308,75 @@ def main() -> None:
         "the game this run was TRAINED on, and its hyperparameters; `RESULTS.md` holds "
         "the separate lm-eval scores.",
         "",
-        "## Headline",
+        "## Headline (clemeval native -- NOT comparable between rows)",
         "",
-        "| checkpoint | clemscore | avg % played | avg quality |",
-        "|---|---|---|---|",
+        "| checkpoint | clemscore | avg % played | avg quality | games scored | quality games |",
+        "|---|---|---|---|---|---|",
     ]
     for name, scores in rows:
-        md.append("| `{}` | {} | {} | {} |".format(
+        n_played = len([c for c in scores if c.endswith(PLAYED_SUFFIX) and scores[c] is not None])
+        n_quality = len([c for c in scores if c.endswith(QUALITY_SUFFIX) and scores[c] is not None])
+        md.append("| `{}` | {} | {} | {} | {} | {} |".format(
             name,
-            _cell(scores.get(CLEMSCORE_COL), base_of(CLEMSCORE_COL, name)),
-            _cell(scores.get(AVG_PLAYED_COL), base_of(AVG_PLAYED_COL, name), 1),
-            _cell(scores.get(AVG_QUALITY_COL), base_of(AVG_QUALITY_COL, name), 1),
+            _cell(scores.get(CLEMSCORE_COL), None),
+            _cell(scores.get(AVG_PLAYED_COL), None, 1),
+            _cell(scores.get(AVG_QUALITY_COL), None, 1),
+            n_played,
+            n_quality,
         ))
+    md += [
+        "",
+        "These are clemeval's own aggregates, verbatim. **No delta is shown, because "
+        "these numbers are not comparable between rows.** `avg % played` averages over "
+        "every game scored; `avg quality` averages over only the games that produced at "
+        "least one parseable episode (`quality games`). When two rows differ in "
+        "`quality games`, their `avg quality` -- and the `clemscore` built from it -- are "
+        "means over different populations, so subtracting them measures the population "
+        "change as much as the model. Use the like-for-like table below for that.",
+    ]
+
+    if common:
+        md += [
+            "",
+            f"## Like-for-like (fixed population: the {len(common)} game(s) every row scored)",
+            "",
+            "| checkpoint | clemscore | avg % played | avg quality |",
+            "|---|---|---|---|",
+        ]
+        for name, scores in rows:
+            cs, played, quality = fixed[name]
+            md.append("| `{}` | {} | {} | {} |".format(
+                name,
+                _cell(cs, fixed_base_of(0, name)),
+                _cell(played, fixed_base_of(1, name), 1),
+                _cell(quality, fixed_base_of(2, name), 1),
+            ))
+        md += [
+            "",
+            "Every cell here is a mean over the **same** games, so the bracketed deltas "
+            "are like-for-like. `clemscore` is still clemeval's own definition "
+            "(`% played / 100 x quality`), applied to the fixed set. Games in this set: "
+            + ", ".join(f"`{g}`" for g in common) + ".",
+        ]
+        dropped = sorted(set(games) - set(common))
+        if dropped:
+            md += [
+                "",
+                "Excluded because at least one row has no quality score for them (the "
+                "model aborted every episode of that game at that checkpoint): "
+                + ", ".join(f"`{g}`" for g in dropped)
+                + ". They are still in the per-game table below -- and a game moving in "
+                "or out of this set is itself a result worth reading there.",
+            ]
+    else:
+        md += [
+            "",
+            "## Like-for-like",
+            "",
+            "**Not available:** no single game was scored by every row, so there is no "
+            "population on which these checkpoints can be compared. Read the per-game "
+            "table below directly.",
+        ]
 
     if games:
         md += [
@@ -262,18 +406,24 @@ def main() -> None:
                 ))
             md.append("| " + " | ".join(cells) + " |")
 
-    if baseline:
-        md += ["", "Bracketed numbers are the change from the untrained `base` row. A "
-                   "checkpoint identical to `base` everywhere means the adapter was not "
-                   "applied -- check the job log for the `peft_model` line."]
+    if base_fixed:
+        md += ["", "Bracketed numbers are the change from the untrained `base` row, on the "
+                   "like-for-like population only. A checkpoint identical to `base` "
+                   "everywhere means the adapter was not applied -- check the job log for "
+                   "the `peft_model` line."]
     if missing:
         md += ["", "**Incomplete:** no results for "
                    + ", ".join(f"`{m}`" for m in missing)
-                   + " (the run failed, was killed, or is still going)."]
+                   + " (the run failed, was killed, or is still going). The like-for-like "
+                     "population is the intersection over the rows that ARE present, so it "
+                     "may widen when the remaining ones land."]
     md += ["", "A blank clemscore with `% played` at 0 is not a score of zero: every "
                "episode aborted, so there was nothing to score."]
 
-    columns = [CLEMSCORE_COL, AVG_PLAYED_COL, AVG_QUALITY_COL]
+    # TSV: the native columns first (unchanged names, so anything already reading this
+    # file keeps working), then the like-for-like trio under distinct `fixed, ` names.
+    FIXED_COLS = ["fixed, clemscore", "fixed, Average % Played", "fixed, Average Quality Score"]
+    columns = [CLEMSCORE_COL, AVG_PLAYED_COL, AVG_QUALITY_COL] + FIXED_COLS + ["fixed, n games"]
     for game in games:
         columns += [game + PLAYED_SUFFIX, game + QUALITY_SUFFIX]
 
@@ -281,8 +431,12 @@ def main() -> None:
 
     tsv = ["\t".join(["checkpoint", *columns])]
     for name, scores in rows:
+        cells = dict(scores)
+        for col, value in zip(FIXED_COLS, fixed[name]):
+            cells[col] = value
+        cells["fixed, n games"] = float(len(common)) if common else 0.0
         tsv.append("\t".join(
-            [name] + ["" if scores.get(c) is None else f"{scores[c]:.6f}" for c in columns]
+            [name] + ["" if cells.get(c) is None else f"{cells[c]:.6f}" for c in columns]
         ))
     _write_atomic(os.path.join(exp_dir, "playpen_results.tsv"), "\n".join(tsv) + "\n")
 

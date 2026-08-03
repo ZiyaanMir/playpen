@@ -22,8 +22,6 @@ importable without it.
 from __future__ import annotations
 
 import logging
-import math
-import random
 from typing import Any, Callable, Dict, List, Optional
 
 import torch
@@ -140,28 +138,33 @@ def build_reward_func(config: MarshalConfig) -> Callable[..., List[float]]:
     :func:`build_selfplay_rollout_func`); this function just passes through whatever
     it is handed.
 
-    When MARSHAL is disabled, TRL's stock group-relative normalization consumes
-    this scalar, and we apply the Wordle-example degenerate-all-abort shaping
-    (replace an exact -1.0 abort with a small random negative) so an all-abort
-    group still has non-zero advantage variance. When MARSHAL is enabled these
-    scalars are only used for logging (the real signal is the ``(B, T)`` override),
-    so we pass them through unshaped.
+    The reward is passed through **unshaped on both paths**, so the only thing that
+    differs between a ``--marshal`` run and a ``--no-marshal`` run is the advantage
+    estimator -- which is what the ablation is supposed to isolate.
+
+    This used to replace an exact ``-1.0`` abort with ``-random.random()`` when
+    MARSHAL was disabled, borrowed from the Wordle example as a way to give an
+    all-abort group non-zero advantage variance. It was removed because it made the
+    baseline arm a different *experiment*, not just a different estimator:
+
+    * an all-abort group got eight different advantages for eight identical
+      outcomes, i.e. the policy was reinforced toward whichever abort drew the
+      higher random number -- noise, not signal;
+    * it moved the mean abort reward from ``-1.0`` to ``-0.5``, shrinking the
+      SUCCESS-vs-ABORT gap from 2.0 to ~1.5 on the baseline arm only;
+    * TRL logs the value this function returns as ``reward``, so the baseline arm's
+      reported mean reward was inflated relative to the MARSHAL arm's.
+
+    A group with no reward variance now yields zero advantage on both paths, which
+    is the honest representation of a batch that contains no information. TRL
+    already reports how often that happens, as ``frac_reward_zero_std``.
     """
-    shape_aborts = not config.enabled
 
     def reward_func(completions: List[str], **kwargs: Any) -> List[float]:
         rewards = kwargs.get("rewards")
         if rewards is None:
             return [0.0] * len(completions)
-        if not shape_aborts:
-            return [float(r) for r in rewards]
-        shaped = []
-        for r in rewards:
-            r = float(r)
-            if math.isclose(r, -1.0, abs_tol=1e-6):
-                r = -random.random()
-            shaped.append(r)
-        return shaped
+        return [float(r) for r in rewards]
 
     return reward_func
 
@@ -373,6 +376,7 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
     # 500-step run.
     _WARNED_IS_COLLAPSE = False
     _WARNED_DRIFT = False
+    _WARNED_ADV_FALLBACK = False
 
     # Below this mean vLLM importance-sampling ratio, the loss is being scaled down
     # by more than 10x and the run is not really training. Chosen well under the
@@ -519,8 +523,17 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         # The base class lays out output rows 1:1 with `inputs`. If that ever
         # fails to hold (e.g. an unexpected multi-process gather), fall back to
         # TRL's scalar advantages rather than misalign the tensor.
+        #
+        # This fallback silently turns a MARSHAL run into a plain-GRPO run, so it
+        # must never be quiet: a run that hits it every step would train, log and
+        # checkpoint exactly like a healthy MARSHAL run while implementing a
+        # different algorithm. Both a once-per-process warning and a per-step
+        # metric, because the warning can scroll past a 700-step log and the metric
+        # cannot.
         if len(inputs) != batch_size:
+            self._log_advantage_fallback(len(inputs), batch_size)
             return base_adv
+        self._log_advantage_fallback(len(inputs), batch_size, fired=False)
 
         rows: List[RowRollout] = []
         for inp in inputs:
@@ -560,6 +573,39 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
             self._log_length_penalty_stats(rows, length_penalty)
         self._relog_advantages(advantages)
         return advantages
+
+    def _log_advantage_fallback(self, n_inputs: int, batch_size: int, *, fired: bool = True) -> None:
+        """Record whether the MARSHAL advantage override ran or fell back to TRL's.
+
+        ``marshal/advantage/fallback_rate`` is appended on **every** step -- 0.0 when
+        the override ran, 1.0 when it did not -- so the metric distinguishes "never
+        fell back" from "the metric was never emitted". A rate that is anything but
+        0.0 means those steps trained on TRL's scalar group-relative advantages, i.e.
+        plain GRPO, regardless of what the run is labelled.
+
+        The warning is emitted outside the try/except on purpose. Every other logging
+        helper here swallows its exceptions because a broken metric must not kill a
+        run; this one reports that the run is *not doing what it says*, which is worth
+        more than the metric it sits beside.
+        """
+        if fired and not MarshalGRPOTrainer._WARNED_ADV_FALLBACK:
+            MarshalGRPOTrainer._WARNED_ADV_FALLBACK = True
+            logger.warning(
+                "MARSHAL: advantage override SKIPPED -- len(inputs)=%d but the batch has "
+                "%d rows, so the (B, T) tensor could not be aligned. These steps train on "
+                "TRL's scalar group-relative advantages, i.e. plain GRPO: the run is NOT "
+                "doing MARSHAL even though it is configured for it. Watch "
+                "marshal/advantage/fallback_rate.",
+                n_inputs,
+                batch_size,
+            )
+        try:
+            self._metrics["train"]["marshal/advantage/fallback_rate"].append(
+                1.0 if fired else 0.0
+            )
+        except Exception:
+            # Metrics logging must never break training; the warning above already fired.
+            pass
 
     def _relog_advantages(self, advantages: torch.Tensor) -> None:
         """Point the logged ``advantage`` column at the advantages we actually train on.
