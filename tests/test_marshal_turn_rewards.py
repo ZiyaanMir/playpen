@@ -464,6 +464,77 @@ class _ConstantExtractor:
         return {"fixed": self.value}
 
 
+class _OverflowingExtractor:
+    """Emits components that breach the ``[-1, 1]`` contract extractors are meant to keep.
+
+    Every shipped extractor normalizes to ``[-1, 1]``, but that is a convention, not
+    something the type system enforces: a new extractor, a clembench field that
+    changes units, or a game state that reports a count instead of a fraction all
+    produce out-of-range values. The tracker's per-turn clip is what stops that from
+    reaching the return.
+    """
+
+    components = ("a", "b", "c")
+
+    def __init__(self, value):
+        self.value = value
+
+    def reset(self):
+        pass
+
+    def extract(self, ctx):
+        return {name: self.value for name in self.components}
+
+
+class TestPerTurnClipBoundsASingleTurn(unittest.TestCase):
+    """A single turn can never contribute more than ``scale``, whatever an extractor returns.
+
+    Two independent clips protect the reward: each *component* is clipped to
+    ``[-1, 1]``, then their *sum* is clipped to ``[-1, 1]`` again, and only then is
+    ``scale`` applied. Without the second clip a three-component extractor would
+    make a turn worth ``3 * scale``, and with ``turn_reward_budget: 0`` -- which
+    disables the episode cap -- nothing downstream would bound it at all.
+
+    Tested with the budget off on purpose: with it on, the episode rescale would
+    mask a broken per-turn clip and the test would pass for the wrong reason.
+    """
+
+    def _finalize(self, value, turns=1, scale=0.05, budget=0.0):
+        tracker = TurnRewardTracker(
+            _OverflowingExtractor(value), TurnRewardSpec(scale=scale, budget=budget)
+        )
+        for index in range(turns):
+            tracker.on_turn(_ctx(None, seat=0, turn_index=index))
+        return tracker.finalize()[0]
+
+    def test_three_components_summing_above_one_are_clipped_to_scale(self):
+        # Each component is a legal 1.0; their sum is 3.0 and must clip to 1.0.
+        self.assertAlmostEqual(self._finalize(1.0)[0], 0.05)
+
+    def test_an_extractor_that_ignores_the_contract_cannot_escape_scale(self):
+        for value in (5.0, 1e6, float("inf")):
+            self.assertAlmostEqual(
+                self._finalize(value)[0], 0.05, msg=f"component value {value}"
+            )
+
+    def test_the_negative_side_is_bounded_too(self):
+        for value in (-1.0, -5.0, -1e6):
+            self.assertAlmostEqual(
+                self._finalize(value)[0], -0.05, msg=f"component value {value}"
+            )
+
+    def test_on_turn_returns_the_clipped_value_not_the_raw_sum(self):
+        tracker = TurnRewardTracker(
+            _OverflowingExtractor(4.0), TurnRewardSpec(scale=0.05, budget=0.0)
+        )
+        self.assertAlmostEqual(tracker.on_turn(_ctx(None, seat=0, turn_index=0)), 1.0)
+
+    def test_with_the_budget_off_the_episode_bound_is_scale_times_turns(self):
+        """The only bound left when budget=0, so the per-turn clip has to hold."""
+        values = self._finalize(1e6, turns=8, scale=0.05, budget=0.0)
+        self.assertAlmostEqual(sum(values), 0.4)
+
+
 class TestTrackerScaling(unittest.TestCase):
     def _track(self, turns, value=1.0, scale=0.05, budget=0.3, seat=0):
         tracker = TurnRewardTracker(

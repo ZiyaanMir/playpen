@@ -15,14 +15,17 @@ also documents precisely which trainer state each method depends on.
 Runnable via ``pytest`` or directly with ``.venv/bin/python``.
 """
 
+import logging
 import unittest
 from collections import defaultdict, deque
+from unittest import mock
 
 import torch
+import trl
 
 from playpen.marshal.advantage import RowRollout, compute_marshal_advantages
 from playpen.marshal.config import MarshalConfig
-from playpen.marshal.trainer import MarshalGRPOTrainer
+from playpen.marshal.trainer import MarshalGRPOTrainer, build_reward_func
 
 
 class _FakeAccelerator:
@@ -545,6 +548,276 @@ class TestTurnCountDoesNotSetTheAdvantage(unittest.TestCase):
             norm_mode="mean", whiten_rewards=True, whiten_advantages=True,
         )
         self.assertLess(self._spread(vals), 1e-6, f"expected no turn-count spread, got {vals}")
+
+
+def _stub_base_generate(output):
+    """Stand in for ``trl.GRPOTrainer._generate_and_score_completions``.
+
+    Patched onto the base *class*, so the subclass's ``super()`` call resolves to it
+    through the MRO exactly as it would to the real method. Returns the dict the real
+    one returns -- scalar ``(B,)`` advantages included -- and nothing else, which is
+    what lets these tests assert on what the subclass adds.
+    """
+
+    def _base(self, inputs):
+        return output
+
+    return _base
+
+
+class TestGenerateAndScoreInstallsMarshalAdvantages(unittest.TestCase):
+    """The override must actually reach TRL's output dict.
+
+    Every other test in this file calls ``_compute_marshal_advantages`` directly, so
+    all of them still pass if the one line that installs its result --
+    ``output["advantages"] = self._compute_marshal_advantages(...)`` -- is deleted.
+    A run would then train on TRL's scalar group-relative advantages, i.e. plain
+    GRPO, while logging, checkpointing and reporting as a MARSHAL run. This is the
+    seam that turns the subclass into a MARSHAL trainer, so it is pinned here.
+    """
+
+    def setUp(self):
+        self.masks = [[1, 1, 0, 1], [1, 1, 0, 1], [1, 1], [1, 1]]
+        self.inputs = [
+            _row(0, self.masks[0], [1, 3], [0.0, 1.0]),
+            _row(1, self.masks[1], [1, 3], [0.0, 1.0]),
+            _row(0, self.masks[2], [1], [-1.0]),
+            _row(1, self.masks[3], [1], [-1.0]),
+        ]
+        self.completion_ids = _padded_completions(self.masks)
+        # Deliberately non-zero and non-constant, so "the base tensor survived
+        # untouched" cannot be mistaken for "the override produced these".
+        self.base_adv = torch.tensor([0.25, -0.25, 0.5, -0.5])
+
+    def _output(self):
+        return {
+            "advantages": self.base_adv.clone(),
+            "completion_ids": self.completion_ids,
+            "num_items_in_batch": torch.tensor(12),
+        }
+
+    def _run(self, config):
+        trainer = _bare_trainer(config)
+        output = self._output()
+        with mock.patch.object(
+            trl.GRPOTrainer, "_generate_and_score_completions", _stub_base_generate(output)
+        ):
+            return trainer, trainer._generate_and_score_completions(self.inputs)
+
+    def test_enabled_replaces_the_scalar_advantages_with_the_b_by_t_tensor(self):
+        _, out = self._run(MarshalConfig(enabled=True))
+        self.assertEqual(
+            tuple(out["advantages"].shape),
+            tuple(self.completion_ids.shape),
+            "advantages must be the (B, T) MARSHAL tensor, not TRL's (B,) scalars",
+        )
+
+    def test_enabled_installs_exactly_what_compute_marshal_advantages_returns(self):
+        config = MarshalConfig(enabled=True)
+        _, out = self._run(config)
+        rows = [
+            RowRollout(
+                seat=inp["seat"],
+                completion_len=len(inp["owner_mask"]),
+                owner_mask=inp["owner_mask"],
+                turn_end_positions=inp["turn_end_positions"],
+                turn_rewards=inp["turn_rewards"],
+            )
+            for inp in self.inputs
+        ]
+        expected = compute_marshal_advantages(
+            rows,
+            self.completion_ids.shape[1],
+            gamma=config.gamma,
+            turn_level=config.turn_level_rewards,
+            agent_specific=config.agent_specific_normalization,
+            marshal_exact=config.marshal_exact,
+            unique_pooling=config.unique_value_pooling,
+            norm_mode=config.advantage_norm_mode,
+            whiten_rewards=config.whiten_rewards,
+            whiten_advantages=config.whiten_advantages,
+            dtype=self.base_adv.dtype,
+        )
+        self.assertTrue(
+            torch.allclose(out["advantages"], expected),
+            f"installed {out['advantages']} but the advantage module computes {expected}",
+        )
+        # Guards against a vacuous assertion: the tensor really did change.
+        self.assertFalse(torch.allclose(expected, torch.zeros_like(expected)))
+
+    def test_disabled_leaves_trls_scalar_advantages_exactly_as_they_were(self):
+        _, out = self._run(MarshalConfig(enabled=False))
+        self.assertEqual(tuple(out["advantages"].shape), (len(self.inputs),))
+        self.assertTrue(torch.allclose(out["advantages"], self.base_adv))
+
+    def test_the_dict_the_base_class_returned_is_the_one_handed_back(self):
+        """TRL keys off the returned dict; a copy would drop old_per_token_logps etc."""
+        trainer = _bare_trainer(MarshalConfig(enabled=True))
+        output = self._output()
+        output["ref_per_token_logps"] = torch.zeros(4, 4)
+        with mock.patch.object(
+            trl.GRPOTrainer, "_generate_and_score_completions", _stub_base_generate(output)
+        ):
+            out = trainer._generate_and_score_completions(self.inputs)
+        self.assertIs(out, output)
+        self.assertIn("ref_per_token_logps", out)
+
+
+class TestDegenerateBatchDoesNotProduceNaNLoss(unittest.TestCase):
+    """``num_items_in_batch`` is a divisor, so 0 is not a survivable value.
+
+    TRL's dapo and cispo losses (its default ``loss_type`` is dapo) normalize by
+    ``inputs["num_items_in_batch"] / num_processes`` (grpo_trainer.py:2236-2237).
+    That count is the number of *model* tokens, which is 0 when every row in the
+    step is a placeholder -- a real state on codenames, where the game can end
+    before the guesser seat ever moves. 0/0 is NaN, and one NaN loss poisons every
+    parameter through the optimizer.
+    """
+
+    def _output(self, num_items):
+        masks = [[0], [0]]
+        return [
+            _row(0, masks[0], [], []),
+            _row(1, masks[1], [], []),
+        ], {
+            "advantages": torch.zeros(2),
+            "completion_ids": _padded_completions(masks),
+            "num_items_in_batch": torch.tensor(num_items),
+        }
+
+    def _run(self, num_items):
+        inputs, output = self._output(num_items)
+        trainer = _bare_trainer(MarshalConfig(enabled=True))
+        with mock.patch.object(
+            trl.GRPOTrainer, "_generate_and_score_completions", _stub_base_generate(output)
+        ):
+            return trainer._generate_and_score_completions(inputs)
+
+    def test_an_all_placeholder_batch_cannot_divide_by_zero(self):
+        out = self._run(0)
+        self.assertGreaterEqual(
+            out["num_items_in_batch"].item(), 1,
+            "a zero normalizer makes the dapo/cispo loss NaN",
+        )
+
+    def test_the_loss_of_a_clamped_batch_is_zero_not_nan(self):
+        """Clamping is only safe because the numerator is 0 too -- pin that."""
+        out = self._run(0)
+        per_token_loss = torch.zeros(2, 1)  # every row masked out => zero numerator
+        loss = per_token_loss.sum() / out["num_items_in_batch"]
+        self.assertFalse(torch.isnan(loss).any())
+        self.assertEqual(loss.item(), 0.0)
+
+    def test_a_healthy_batch_normalizer_is_untouched(self):
+        out = self._run(37)
+        self.assertEqual(out["num_items_in_batch"].item(), 37)
+
+
+class TestRewardFuncIsUnshapedOnBothPaths(unittest.TestCase):
+    """The reward must be the game outcome, identically on both arms.
+
+    ``--no-marshal`` used to replace an exact ``-1.0`` (ABORTED) with
+    ``-random.random()``. That gave eight identical outcomes eight different
+    advantages, moved the mean abort reward from -1.0 to -0.5, and inflated the
+    baseline arm's logged ``reward`` -- so the ablation compared two different
+    reward functions, not two advantage estimators. These pin the removal.
+    """
+
+    OUTCOMES = [-1.0, -1.0, 0.0, 1.0, -0.9999999, -1.0000001]
+
+    def test_rewards_pass_through_unchanged_when_marshal_is_enabled(self):
+        func = build_reward_func(MarshalConfig(enabled=True))
+        self.assertEqual(func(completions=["x"] * 6, rewards=self.OUTCOMES), self.OUTCOMES)
+
+    def test_rewards_pass_through_unchanged_when_marshal_is_disabled(self):
+        func = build_reward_func(MarshalConfig(enabled=False))
+        self.assertEqual(func(completions=["x"] * 6, rewards=self.OUTCOMES), self.OUTCOMES)
+
+    def test_both_paths_agree(self):
+        on = build_reward_func(MarshalConfig(enabled=True))
+        off = build_reward_func(MarshalConfig(enabled=False))
+        self.assertEqual(
+            on(completions=["x"] * 6, rewards=self.OUTCOMES),
+            off(completions=["x"] * 6, rewards=self.OUTCOMES),
+        )
+
+    def test_an_all_abort_group_is_deterministic_and_has_no_variance(self):
+        """The honest representation of a batch containing no information."""
+        func = build_reward_func(MarshalConfig(enabled=False))
+        first = func(completions=["x"] * 8, rewards=[-1.0] * 8)
+        second = func(completions=["x"] * 8, rewards=[-1.0] * 8)
+        self.assertEqual(first, second, "the reward function must not be stochastic")
+        self.assertEqual(set(first), {-1.0})
+        self.assertEqual(torch.tensor(first).std().item(), 0.0)
+
+    def test_missing_rewards_kwarg_is_zero_not_a_crash(self):
+        func = build_reward_func(MarshalConfig(enabled=False))
+        self.assertEqual(func(completions=["a", "b"]), [0.0, 0.0])
+
+
+class TestAdvantageFallbackIsLoud(unittest.TestCase):
+    """Falling back to TRL's scalars silently would mislabel the whole run.
+
+    ``_compute_marshal_advantages`` returns the base advantages unchanged when
+    ``len(inputs) != batch_size``. Those steps are plain GRPO. It must be visible in
+    both the log and the metrics, because a warning can scroll past a 700-step job
+    and a metric cannot.
+    """
+
+    def setUp(self):
+        MarshalGRPOTrainer._WARNED_ADV_FALLBACK = False
+        self.masks = [[1, 1], [1, 1], [1, 1], [1, 1]]
+        self.completion_ids = _padded_completions(self.masks)
+        self.base_adv = torch.tensor([0.25, -0.25, 0.5, -0.5])
+
+    def tearDown(self):
+        MarshalGRPOTrainer._WARNED_ADV_FALLBACK = False
+
+    def _inputs(self, n):
+        return [_row(i % 2, self.masks[0], [1], [1.0]) for i in range(n)]
+
+    def _output(self):
+        return {"advantages": self.base_adv.clone(), "completion_ids": self.completion_ids}
+
+    def test_aligned_batch_records_a_zero_fallback_rate(self):
+        trainer = _bare_trainer()
+        trainer._compute_marshal_advantages(self._inputs(4), self._output())
+        self.assertEqual(
+            trainer._metrics["train"]["marshal/advantage/fallback_rate"], [0.0],
+            "the metric must be emitted on healthy steps too, or 'never fell back' "
+            "and 'never logged' look the same",
+        )
+
+    def test_misaligned_batch_records_a_one_and_returns_the_base_tensor(self):
+        trainer = _bare_trainer()
+        out = trainer._compute_marshal_advantages(self._inputs(3), self._output())
+        self.assertEqual(trainer._metrics["train"]["marshal/advantage/fallback_rate"], [1.0])
+        self.assertTrue(torch.allclose(out, self.base_adv))
+        self.assertEqual(tuple(out.shape), (4,))
+
+    def test_every_step_appends_exactly_one_sample(self):
+        trainer = _bare_trainer()
+        trainer._compute_marshal_advantages(self._inputs(4), self._output())
+        trainer._compute_marshal_advantages(self._inputs(3), self._output())
+        trainer._compute_marshal_advantages(self._inputs(3), self._output())
+        self.assertEqual(
+            trainer._metrics["train"]["marshal/advantage/fallback_rate"], [0.0, 1.0, 1.0]
+        )
+
+    def test_it_warns_once_and_names_the_consequence(self):
+        trainer = _bare_trainer()
+        with self.assertLogs("playpen.marshal.trainer", level=logging.WARNING) as captured:
+            trainer._compute_marshal_advantages(self._inputs(3), self._output())
+            trainer._compute_marshal_advantages(self._inputs(3), self._output())
+        self.assertEqual(len(captured.records), 1, "warn once per process, not per step")
+        self.assertIn("plain GRPO", captured.output[0])
+
+    def test_a_healthy_run_never_warns(self):
+        trainer = _bare_trainer()
+        logger = logging.getLogger("playpen.marshal.trainer")
+        with mock.patch.object(logger, "warning") as warn:
+            trainer._compute_marshal_advantages(self._inputs(4), self._output())
+        warn.assert_not_called()
 
 
 if __name__ == "__main__":
