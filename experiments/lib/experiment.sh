@@ -69,6 +69,7 @@ exp_load_preset() {
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
               VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
+              TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
               PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
               PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_SERIAL \
@@ -86,6 +87,9 @@ exp_load_preset() {
     for _i in "${!_override_names[@]}"; do
         printf -v "${_override_names[$_i]}" '%s' "${_override_vals[$_i]}"
     done
+    # A caller's TRAIN_SEGMENTS must not be overruled by a preset's SEGMENT_STEPS
+    # (or vice versa). Runs here, where the caller-set names are still known.
+    exp_segment_override ${_override_names[@]+"${_override_names[@]}"}
 
     # GAME is deliberately NOT restorable: the positional argument is authoritative.
     GAME="${GAME:-$game}"
@@ -129,6 +133,44 @@ exp_load_preset() {
     TR_SCALE="${TR_SCALE:-}"
     TR_BUDGET="${TR_BUDGET:-}"
     TR_COMPONENTS="${TR_COMPONENTS:-}"
+
+    # --- splitting the training run across several chained jobs --------------
+    # MAX_STEPS is ALWAYS the total for the whole experiment, whatever these are set
+    # to. TRAIN_SEGMENTS only decides how many jobs those steps are handed out over;
+    # each one resumes the previous one's last checkpoint and stops at its own
+    # boundary. Defaults to 1, which submits exactly the single training job this
+    # directory has always submitted.
+    #
+    # WHAT IT IS FOR. Eddie's gpu queue caps h_rt at 48 h and Isambard's workq_qos caps
+    # --time at 24 h; neither can be raised, and until now a run that ran out of
+    # walltime could only be redone. TRAIN_SEGMENTS=3 turns a 1000-step run into three
+    # jobs of <=400 steps, each of which fits comfortably and backfills far better than
+    # one job asking for the cap.
+    #
+    #   TRAIN_SEGMENTS=3 experiments/eddie/run_experiment.sh guesswhat
+    #   TRAIN_SEGMENTS=4 TRAIN_SBATCH_OPTS='--time=08:00:00' \
+    #     experiments/isambard/run_experiment.sh guesswhat
+    #
+    # SEGMENT_STEPS overrides the derived size when you know the per-step cost and want
+    # to size a segment against the walltime directly; TRAIN_SEGMENTS is then
+    # recomputed from it. Set neither and there is one segment. See exp_plan_segments.
+    #
+    # The LR schedule does NOT change with the segment count -- --max-steps stays the
+    # total in every job and only --stop-at-step differs, so step 700 of a 3-segment
+    # run has the same learning rate as step 700 of a 1-segment run. That is what makes
+    # a segmented arm comparable with an unsegmented one; see playpen/marshal/resume.py.
+    TRAIN_SEGMENTS="${TRAIN_SEGMENTS:-1}"
+    SEGMENT_STEPS="${SEGMENT_STEPS:-}"
+
+    # What each training job passes to --resume-from-checkpoint. Segment 1 gets 'auto'
+    # (resume if there is something, else start at step 0) and later segments get
+    # 'latest' (an empty train/ is an error), so the submitter does not have to set
+    # this at all for a chained run.
+    #
+    # Set it by hand to restart a dead run in place -- RESUME_FROM=latest with the
+    # same EXP_DIR -- which is what experiments/*/resume_experiment.sh does for you.
+    # An explicit checkpoint path also works.
+    RESUME_FROM="${RESUME_FROM:-}"
 
     # --- Weights & Biases ----------------------------------------------------
     # Named WB_* rather than WANDB_* on purpose: WANDB_MODE, WANDB_PROJECT and
@@ -199,6 +241,7 @@ exp_load_preset() {
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
            VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL \
            TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
+           TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
            PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE PPEVAL_CKPTS \
            PPEVAL_MAX_TOKENS PPEVAL_TEMPERATURE PPEVAL_TIMEOUT PPEVAL_SERIAL \
@@ -298,6 +341,285 @@ exp_list_checkpoints() {
         esac
         printf '%s\t%s\n' "$step" "$ck"
     done | sort -n -k1,1 | cut -f2-
+}
+
+# --- training segmentation ---------------------------------------------------
+# The training half of the same idea as evaluation sharding below: one long run,
+# submitted as several chained jobs, because a cluster walltime cap cannot be raised.
+# The difference is that eval shards run CONCURRENTLY (they are independent) while
+# training segments run in SEQUENCE (each resumes the last one's checkpoint).
+#
+# The contract, which everything downstream depends on:
+#
+#   * MAX_STEPS is the total for the run, in every segment. Only --stop-at-step
+#     differs between them. That is what keeps the LR schedule -- which HF builds from
+#     max_steps -- identical to an uninterrupted run, so a segmented arm and an
+#     unsegmented arm of the same config are comparable. See playpen/marshal/resume.py.
+#   * Segment boundaries land on SAVE_STEPS multiples wherever possible, so a boundary
+#     writes a checkpoint the schedule was going to write anyway. The total checkpoint
+#     count stays MAX_STEPS/SAVE_STEPS, which is what exp_expected_checkpoints predicts
+#     and what the eval shard count is sized against.
+#   * Checkpoints from every segment land in the SAME train/ directory (the job scripts
+#     pass --no-run-subdir), so eval enumerates the whole run, not the last segment.
+
+# Keep TRAIN_SEGMENTS and SEGMENT_STEPS from fighting, given who set which.
+#
+# $@ = the names the CALLER set explicitly, this invocation. Call before
+# exp_plan_segments.
+#
+# They are two spellings of one decision, and exp_plan_segments gives SEGMENT_STEPS
+# priority because it is the more specific of the two. That is right when both come
+# from the same place and WRONG when they do not:
+#
+#   TRAIN_SEGMENTS=5 experiments/eddie/resume_experiment.sh <EXP_DIR>
+#
+# reads SEGMENT_STEPS=400 out of the original submission's experiment.env, hands it
+# to exp_plan_segments, and gets 3 segments of 400 back -- silently ignoring the 5 the
+# operator just asked for, and printing a plan that looks deliberate. Same shape as a
+# preset that pins SEGMENT_STEPS meeting a caller who passes TRAIN_SEGMENTS.
+#
+# The rule: what you set now beats what was stored. Only the unmentioned one is cleared.
+exp_segment_override() {
+    local set_segments=0 set_size=0 n
+    for n in "$@"; do
+        if [ "$n" = "TRAIN_SEGMENTS" ]; then set_segments=1; fi
+        if [ "$n" = "SEGMENT_STEPS" ]; then set_size=1; fi
+    done
+    if [ "$set_segments" = "1" ] && [ "$set_size" = "0" ] && [ -n "${SEGMENT_STEPS:-}" ]; then
+        echo "[plan] TRAIN_SEGMENTS=${TRAIN_SEGMENTS} was given explicitly, so the stored" \
+             "SEGMENT_STEPS=${SEGMENT_STEPS} is ignored and re-derived from it."
+        SEGMENT_STEPS=""
+        export SEGMENT_STEPS
+    fi
+    return 0
+}
+
+# Resolve TRAIN_SEGMENTS / SEGMENT_STEPS into a consistent pair, and export both.
+#
+# Callers may set either one. TRAIN_SEGMENTS is the natural knob ("split this into 3
+# jobs"); SEGMENT_STEPS is the one to reach for when you know the per-step cost and are
+# sizing a segment against a walltime directly. Whichever is given, the other is
+# derived, and TRAIN_SEGMENTS is always recomputed from the final size -- so the number
+# printed and recorded is the number of jobs that will actually be submitted, which is
+# not always the number that was asked for (10 checkpoints cannot be split into 6
+# whole-checkpoint groups; you get 5).
+exp_plan_segments() {
+    local total="${MAX_STEPS:-0}" save="${SAVE_STEPS:-0}"
+    local want="${TRAIN_SEGMENTS:-1}" size="${SEGMENT_STEPS:-}"
+
+    case "$total" in ''|*[!0-9]*) total=0 ;; esac
+    case "$save"  in ''|*[!0-9]*) save=0 ;; esac
+    case "$want"  in ''|*[!0-9]*) want=1 ;; esac
+    [ "$want" -ge 1 ] || want=1
+
+    if [ "$total" -le 0 ]; then
+        TRAIN_SEGMENTS=1
+        SEGMENT_STEPS=""
+        export TRAIN_SEGMENTS SEGMENT_STEPS
+        return 0
+    fi
+
+    if [ -n "$size" ]; then
+        case "$size" in
+            ''|*[!0-9]*)
+                echo "ERROR: SEGMENT_STEPS must be a positive integer, got '$size'." >&2
+                return 1 ;;
+        esac
+        [ "$size" -ge 1 ] || {
+            echo "ERROR: SEGMENT_STEPS must be >= 1, got '$size'." >&2
+            return 1
+        }
+        # An off-cadence size is allowed but not silent: the segment boundary saves a
+        # checkpoint wherever it lands, so the run ends with MORE checkpoints than
+        # MAX_STEPS/SAVE_STEPS -- while the eval shards were sized for that smaller
+        # number, and the surplus would go unscored.
+        if [ "$save" -gt 0 ] && [ $(( size % save )) -ne 0 ]; then
+            echo "[plan] WARNING: SEGMENT_STEPS=$size is not a multiple of SAVE_STEPS=$save." >&2
+            echo "[plan]          Every segment boundary saves a checkpoint wherever it lands," >&2
+            echo "[plan]          so this run gets extra off-cadence ones (checkpoint-$size, ...)" >&2
+            echo "[plan]          beyond the $(( (total + save - 1) / save )) the schedule plans," >&2
+            echo "[plan]          and the eval shards are sized for the planned count -- the" >&2
+            echo "[plan]          surplus goes unscored. Prefer a multiple of SAVE_STEPS, or" >&2
+            echo "[plan]          raise EVAL_SHARD_SIZE to absorb them." >&2
+        fi
+    elif [ "$want" -le 1 ]; then
+        size="$total"
+    elif [ "$save" -gt 0 ] && [ "$save" -lt "$total" ]; then
+        # Split the CHECKPOINTS evenly rather than the steps, so each boundary is a
+        # checkpoint the save schedule was going to write anyway and the run's
+        # checkpoint set is exactly what an unsegmented run would have produced.
+        local ckpts per
+        ckpts=$(( (total + save - 1) / save ))
+        per=$(( (ckpts + want - 1) / want ))
+        size=$(( per * save ))
+    else
+        size=$(( (total + want - 1) / want ))
+    fi
+
+    [ "$size" -ge 1 ] || size="$total"
+    [ "$size" -le "$total" ] || size="$total"
+    TRAIN_SEGMENTS=$(( (total + size - 1) / size ))
+    SEGMENT_STEPS="$size"
+    export TRAIN_SEGMENTS SEGMENT_STEPS
+}
+
+# Where segment $1 (1-based) stops. Always clamped to MAX_STEPS, so the last segment
+# ends exactly on the horizon the LR schedule was built for rather than past it.
+exp_segment_stop_at() {
+    local idx="${1:-1}" size="${SEGMENT_STEPS:-0}" total="${MAX_STEPS:-0}" stop
+    case "$idx$size$total" in ''|*[!0-9]*) printf '%s\n' "${MAX_STEPS:-0}"; return 0 ;; esac
+    [ "$size" -ge 1 ] || { printf '%s\n' "$total"; return 0; }
+    stop=$(( idx * size ))
+    [ "$stop" -le "$total" ] || stop="$total"
+    printf '%d\n' "$stop"
+}
+
+# What segment $1 passes to --resume-from-checkpoint.
+#
+# Segment 1 gets 'auto': an empty train/ is the normal case there, and starting at
+# step 0 is correct. Segments 2+ get 'latest', which makes an empty train/ an ERROR --
+# by then it means the previous job died before its first save, and silently
+# restarting from step 0 would spend a whole walltime on work the operator is about to
+# throw away.
+#
+# An explicitly-set RESUME_FROM applies to the FIRST segment only. It is how you point
+# a chain at an existing checkpoint (resume_experiment.sh sets it); letting it reach
+# segment 2 as well would make that segment resume the same checkpoint and redo
+# segment 1's work.
+exp_segment_resume_spec() {
+    local idx="${1:-1}"
+    if [ "$idx" = "1" ]; then
+        printf '%s\n' "${RESUME_FROM:-auto}"
+    else
+        printf '%s\n' "latest"
+    fi
+}
+
+# A stable W&B run id for this experiment, so every segment of a chain logs into ONE
+# W&B run instead of N runs each starting at a different step.
+#
+# Derived from EXP_ID rather than random, because it has to be reproducible from the
+# experiment directory alone -- resume_experiment.sh computes the same id months later
+# without reading anything the first submission wrote. W&B ids may not contain
+# '/ \ # ? % :' and are capped at 64 characters, so the name is flattened and, when
+# too long, truncated with a checksum of the full EXP_ID appended to keep two
+# long-tagged experiments from colliding on their shared prefix.
+exp_wandb_chain_id() {
+    local id="${EXP_ID:?exp_wandb_chain_id needs EXP_ID}" flat hash
+    flat="$(printf '%s' "$id" | tr -c 'A-Za-z0-9._-' '_')"
+    if [ "${#flat}" -le 60 ]; then
+        printf '%s\n' "$flat"
+        return 0
+    fi
+    hash="$(printf '%s' "$id" | cksum | cut -d' ' -f1)"
+    printf '%s-%s\n' "${flat:0:50}" "$hash"
+}
+
+# Point every segment of a chain at one W&B run. No-op for a single-segment run and
+# for a caller that set WB_ID itself.
+#
+# Without this each segment opens its own run, and the W&B UI shows a 1000-step
+# experiment as three unrelated 400/400/200-step curves -- exactly the runs an
+# ablation needs to compare, split three ways. Resume mode 'allow' rather than 'must'
+# so the FIRST segment (which has no run to resume) still starts normally.
+#
+# $1 = "force" to set it up even for a single segment -- what resume_experiment.sh
+# passes, because a resumed run is a second job continuing one W&B run whether or not
+# the original was chained.
+exp_wandb_chain_setup() {
+    [ "${1:-}" = "force" ] || [ "${TRAIN_SEGMENTS:-1}" -gt 1 ] 2>/dev/null || return 0
+    [ "${WB_ENABLE:-1}" = "1" ] || return 0
+    [ "${WB_MODE:-auto}" != "disabled" ] || return 0
+    [ -z "${WB_ID:-}" ] || return 0
+    WB_ID="$(exp_wandb_chain_id)"
+    WB_RESUME="${WB_RESUME:-allow}"
+    export WB_ID WB_RESUME
+    echo "[plan] W&B: all ${TRAIN_SEGMENTS} segments log into one run (id=$WB_ID, resume=$WB_RESUME)"
+}
+
+# The latest checkpoint that can actually be RESUMED from, as "<step><TAB><path>".
+# Prints nothing when there is none.
+#
+# Defers to playpen/marshal/resume.py rather than reimplementing the rule in shell.
+# The submitter and the training job have to agree on which directories count as
+# resumable -- a submitter that is more permissive queues a chain the trainer will
+# refuse, and one that is stricter reports "nothing to resume" for a run that could
+# have continued. Two implementations of that rule would drift apart eventually; this
+# one cannot. It also means the reported step is read from trainer_state.json, which
+# is what training will actually continue from, rather than guessed from the
+# directory name.
+#
+# Note this is STRICTER than exp_list_checkpoints, which only asks for an adapter:
+# eval can score a checkpoint whose optimizer state was never written, resume cannot.
+exp_last_resumable_checkpoint() {
+    : "${TRAIN_BASE:?exp_last_resumable_checkpoint needs TRAIN_BASE (call exp_layout)}"
+    local py="${REPO:-}/.venv/bin/python"
+    [ -x "$py" ] || py="$(command -v python3 || command -v python)"
+    [ -n "$py" ] || return 0
+    PYTHONPATH="${REPO:-}${PYTHONPATH:+:$PYTHONPATH}" "$py" - "$TRAIN_BASE" <<'PY' 2>/dev/null
+import contextlib
+import io
+import sys
+
+# Importing `playpen` prints a large ASCII-art banner to stdout. Harmless in a job
+# log; fatal here, because this function's stdout IS the answer -- the caller would
+# assign the banner to RESUME_DONE_STEPS and every later `[ "$stop" -gt ... ]` would
+# fail with "integer expression expected". Swallow anything the import prints so the
+# only thing on stdout is the one line we mean to send.
+with contextlib.redirect_stdout(io.StringIO()):
+    from playpen.marshal import resume
+
+path = resume.latest_checkpoint(sys.argv[1])
+if path:
+    print(f"{resume.resumed_global_step(path)}\t{path}")
+PY
+}
+
+# Where a resumed run picks up. Sets, and exports:
+#
+#   RESUME_DONE_STEPS     steps already on disk (0 when starting over)
+#   RESUME_CKPT           the checkpoint they are in ("" when there is none)
+#   RESUME_FIRST_SEGMENT  the first segment of the CURRENT plan still to run
+#
+# Segment boundaries come from the plan rather than from "what is left divided by
+# something": a run whose segment 2 of 3 died at step 500 of a 400/800/1000 plan
+# resumes as segments 2 and 3, and segment 2 covers 500 -> 800 as it always would
+# have. Recomputing boundaries from the remainder instead would silently move them,
+# and with them the checkpoint set the eval shards were sized for.
+#
+# Returns 1 when every boundary is already behind what is on disk, i.e. training is
+# finished and only the evaluation half can be re-run.
+exp_resume_plan() {
+    local line k stop
+    line="$(exp_last_resumable_checkpoint)"
+    RESUME_DONE_STEPS=0
+    RESUME_CKPT=""
+    if [ -n "$line" ]; then
+        RESUME_DONE_STEPS="${line%%	*}"
+        RESUME_CKPT="${line#*	}"
+    fi
+    # Belt and braces on a value that came from a subprocess: anything non-numeric
+    # here would make every comparison below fail with "integer expression expected"
+    # and silently pick segment 1, i.e. retrain the whole run.
+    case "$RESUME_DONE_STEPS" in
+        ''|*[!0-9]*)
+            echo "[resume] WARNING: could not read a step count from $TRAIN_BASE" >&2
+            echo "[resume]          (got: ${RESUME_DONE_STEPS:-<nothing>}). Treating the" >&2
+            echo "[resume]          run as unstarted." >&2
+            RESUME_DONE_STEPS=0
+            RESUME_CKPT=""
+            ;;
+    esac
+    RESUME_FIRST_SEGMENT=""
+    for k in $(seq 1 "${TRAIN_SEGMENTS:-1}"); do
+        stop="$(exp_segment_stop_at "$k")"
+        if [ "$stop" -gt "$RESUME_DONE_STEPS" ]; then
+            RESUME_FIRST_SEGMENT="$k"
+            break
+        fi
+    done
+    export RESUME_CKPT RESUME_DONE_STEPS RESUME_FIRST_SEGMENT
+    [ -n "$RESUME_FIRST_SEGMENT" ]
 }
 
 # --- evaluation sharding -----------------------------------------------------
@@ -633,6 +955,13 @@ exp_banner() {
     echo "model       = ${MODEL:-?}"
     if [ "$phase" = "train" ]; then
         echo "steps       = ${MAX_STEPS:-?} (checkpoint every ${SAVE_STEPS:-?})"
+        if [ "${TRAIN_SEGMENTS:-1}" -gt 1 ] 2>/dev/null; then
+            echo "segment     = ${TRAIN_SEGMENT:-?} of ${TRAIN_SEGMENTS} "\
+"(this job trains up to step ${SEGMENT_STOP_AT:-?} of ${MAX_STEPS:-?})"
+            echo "resume      = ${SEGMENT_RESUME:-none}"
+        elif [ -n "${RESUME_FROM:-}" ]; then
+            echo "resume      = ${RESUME_FROM}"
+        fi
         echo "batch       = ${PER_DEVICE_BATCH:-?} x ${GRAD_ACCUM:-?} accum, "\
 "${NUM_GENERATIONS:-?} generations"
         echo "max_compl   = ${MAX_COMPLETION_LENGTH:-?} tokens/turn"

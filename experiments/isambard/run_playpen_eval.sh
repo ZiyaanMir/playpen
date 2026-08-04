@@ -72,7 +72,7 @@ EVAL_SHARD_SIZE="${EVAL_SHARD_SIZE:-5}"
 RUN_DIR="$(exp_find_run_dir || true)"
 if [ -z "$RUN_DIR" ]; then
     echo "ERROR: no checkpoints under $TRAIN_BASE -- nothing to evaluate." >&2
-    echo "       Training either never ran or produced none; check logs/train_*.err." >&2
+    echo "       Training either never ran or produced none; check logs/train*.err." >&2
     exit 1
 fi
 mapfile -t CKS < <(exp_list_checkpoints "$RUN_DIR")

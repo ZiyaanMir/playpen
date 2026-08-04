@@ -12,13 +12,18 @@
 #$ -pe sharedmem 12
 #$ -l h_rss=12G
 #
-# h_rt is already Eddie's MAXIMUM for the gpu queue (48 h) and stays there:
-# train_selfplay.py has no --resume-from-checkpoint, so a run killed at the walltime
-# can only be redone, not continued. Confirm the cap on your queue with
+# h_rt is Eddie's MAXIMUM for the gpu queue (48 h) and stays there as the default.
+# Confirm the cap on your queue with
 #   qconf -sq gpu | grep -E 'h_rt|s_rt'
 # -- a request past it leaves the job sitting in `qw` forever rather than failing.
 # Unlike Slurm, Grid Engine does not reserve anything against h_rt, so asking for the
 # cap costs nothing when the job finishes early.
+#
+# A run too long for even 48 h is no longer a dead end: TRAIN_SEGMENTS=N splits it into
+# N chained jobs, each resuming the last one's checkpoint (see exp_plan_segments in
+# experiments/lib/experiment.sh). Shorter segments also schedule sooner, so
+#   TRAIN_SEGMENTS=3 TRAIN_QSUB_OPTS='-l h_rt=16:00:00'
+# is often faster end-to-end than one 48 h job even when the 48 h would have sufficed.
 #
 # GPU choice: H200 (141 GB). For an A100 instead, submit with
 #   TRAIN_QSUB_OPTS='-l a100=true' experiments/eddie/run_experiment.sh <game>
@@ -43,6 +48,13 @@ source "$REPO/slurm_eddie/_common.sh"
 
 source "$REPO/experiments/lib/experiment.sh"
 exp_layout
+
+# Which slice of the run this job trains. TRAIN_SEGMENT is passed per job with -v
+# (the env file is shared by every segment, so the index cannot live in it), exactly
+# like EVAL_SHARD. Unset => the single-job case, and everything below is unchanged.
+TRAIN_SEGMENT="${TRAIN_SEGMENT:-1}"
+SEGMENT_STOP_AT="$(exp_segment_stop_at "$TRAIN_SEGMENT")"
+SEGMENT_RESUME="$(exp_segment_resume_spec "$TRAIN_SEGMENT")"
 exp_banner train
 
 # Pin torch.distributed to an OS-assigned free port, so vLLM's init cannot collide
@@ -62,6 +74,11 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
     echo "  host                         $(hostname)"
     echo "  started                      $(date --iso-8601=seconds)"
     echo "  gpu                          $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null || echo '?')"
+    if [ "${TRAIN_SEGMENTS:-1}" -gt 1 ] 2>/dev/null || [ -n "${RESUME_FROM:-}" ]; then
+        echo "  segment                      ${TRAIN_SEGMENT} of ${TRAIN_SEGMENTS:-1}"\
+"  (up to step ${SEGMENT_STOP_AT} of ${MAX_STEPS})"
+        echo "  resume_from                  ${SEGMENT_RESUME}"
+    fi
 } >> "$EXP_DIR/manifest.txt"
 
 ARGS=(
@@ -86,6 +103,17 @@ ARGS=(
     # manifest and the results they belong to.
     --no-run-subdir
 )
+# Resume + segment. --max-steps above stays the TOTAL in every segment (it is what
+# HF builds the LR scheduler from, and scheduler.pt restores only the step counter,
+# never the decay curve) -- only --stop-at-step differs between jobs. See
+# playpen/marshal/resume.py.
+#
+# --resume-from-checkpoint is passed even for a single unchained job, where the spec
+# is 'auto' and resolves to "nothing to resume, start at step 0". That is deliberate:
+# it also means a re-qsub of a died job continues it instead of silently overwriting.
+ARGS+=( --resume-from-checkpoint "$SEGMENT_RESUME" )
+[ "${SEGMENT_STOP_AT:-0}" -lt "${MAX_STEPS:-0}" ] 2>/dev/null \
+    && ARGS+=( --stop-at-step "$SEGMENT_STOP_AT" )
 [ "${GRAD_CKPT:-1}" = "1" ] && ARGS+=( --gradient-checkpointing )
 # Empty => don't pass the flag, so the YAML value stands (see presets/*.env).
 [ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )

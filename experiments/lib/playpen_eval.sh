@@ -292,7 +292,7 @@ pp_run_all() {
     run_dir="$(exp_find_run_dir || true)"
     if [ -z "$run_dir" ]; then
         echo "[ppeval] no training run directory under $TRAIN_BASE." >&2
-        echo "[ppeval] training produced nothing to evaluate -- check $LOG_DIR/train_*.err" >&2
+        echo "[ppeval] training produced nothing to evaluate -- check $LOG_DIR/train*.err" >&2
         return 0
     fi
     echo "[ppeval] run dir = $run_dir"

@@ -397,6 +397,28 @@ def parse_args() -> argparse.Namespace:
                         "timestamped subfolder. Use ONLY when the caller already guarantees a "
                         "fresh directory per run (experiments/*/train.sh does); otherwise a "
                         "rerun overwrites the previous run's checkpoint-<step> dirs.")
+
+    # --- resuming, and splitting one run across several jobs ---------------------
+    # Both clusters cap a job's walltime (48 h Eddie, 24 h Isambard) and neither cap
+    # can be raised, so a long run has to be able to continue in a second job. See
+    # playpen/marshal/resume.py for the full rationale, including why --max-steps
+    # deliberately stays the TOTAL rather than being handed out per segment.
+    p.add_argument("--resume-from-checkpoint", default=None,
+                   help="Continue a previous run: 'auto' (resume the latest complete "
+                        "checkpoint in --output-dir, or start at step 0 if there is "
+                        "none), 'latest' (the same, but an ERROR when there is none), "
+                        "or a path to a checkpoint-<N> directory (or to a directory "
+                        "containing them). Restores the LoRA adapter, optimizer and "
+                        "scheduler state, RNG and the step counter. 'auto'/'latest' "
+                        "need --no-run-subdir, since they mean 'continue THIS directory'.")
+    p.add_argument("--stop-at-step", type=int, default=None,
+                   help="End this job once global step N is reached, saving a checkpoint "
+                        "first so the next job can resume from it. --max-steps stays the "
+                        "TOTAL horizon for the whole chain, which is what keeps the LR "
+                        "schedule identical to an uninterrupted run: HF builds the "
+                        "scheduler for max_steps, and scheduler.pt restores only the step "
+                        "counter, never the decay curve. Use with "
+                        "--resume-from-checkpoint auto.")
     return p.parse_args()
 
 
@@ -436,7 +458,8 @@ def wandb_tags(args: argparse.Namespace, marshal_config) -> list[str]:
     return tags
 
 
-def wandb_config(args: argparse.Namespace, marshal_config, output_dir: str) -> dict:
+def wandb_config(args: argparse.Namespace, marshal_config, output_dir: str,
+                 resume_path: str | None = None, stop_at: int | None = None) -> dict:
     """The run config: everything needed to tell two runs apart, in one place.
 
     Deliberately includes the *resolved* MARSHAL config (YAML merged with CLI
@@ -478,6 +501,14 @@ def wandb_config(args: argparse.Namespace, marshal_config, output_dir: str) -> d
         "run": {
             "output_dir": output_dir,
             "marshal_config_path": args.marshal_config,
+            # A chained run logs every segment into ONE W&B run (the job scripts pass a
+            # fixed --wandb-id + --wandb-resume allow), so without these two the UI
+            # would show a single continuous curve with no record that it was stitched.
+            # The last segment to write wins, which is the one you are looking at.
+            "resumed_from": resume_path,
+            "stop_at_step": stop_at,
+            "segment": os.environ.get("TRAIN_SEGMENT") or None,
+            "segments_total": os.environ.get("TRAIN_SEGMENTS") or None,
             "experiment_id": os.environ.get("EXP_ID") or None,
             "experiment_dir": os.environ.get("EXP_DIR") or None,
             "cluster": os.environ.get("EXP_CLUSTER") or None,
@@ -534,6 +565,80 @@ def _report_turn_rewards(marshal_config, env) -> None:
               "row, so the episode's shaping total is added to the terminal reward "
               "rather than attributed per turn. marshal/turn_rewards/terminal_mean "
               "still logs the unshaped outcome.")
+
+
+def _resolve_resume_and_stop(args: argparse.Namespace, output_dir: str):
+    """Work out what this job continues from and where it stops. ``(path, stop_at)``.
+
+    Returns ``(None, None)`` when neither flag was passed, which is the whole of the
+    pre-existing behaviour.
+
+    Everything that can be decided without a GPU is decided here, so the three ways a
+    chained segment can be wrong all fail (or exit) in the first seconds:
+
+    * a resume spec that cannot be satisfied -> ``ResumeError``, and the job dies with
+      a message naming the directory it searched;
+    * ``auto``/``latest`` without ``--no-run-subdir`` -> ``SystemExit``. Those specs mean
+      "continue THIS directory", and with the timestamp layer on there is a fresh
+      directory per job, so the chain's checkpoints would scatter across N of them and
+      ``exp_list_checkpoints`` (hence the whole eval + sharding path) would only ever
+      see the last segment's;
+    * a segment whose work is already done -> ``SystemExit(0)``. That happens whenever
+      the previous segment overran its own boundary, and exiting cleanly lets the rest
+      of the chain carry on rather than stalling on a job that has nothing to train.
+    """
+    from playpen.marshal import resume as resume_lib
+
+    spec = (args.resume_from_checkpoint or "").strip()
+    stop_at = args.stop_at_step
+
+    if spec.lower() in ("auto", "latest") and args.run_subdir:
+        raise SystemExit(
+            f"--resume-from-checkpoint {spec} needs --no-run-subdir.\n"
+            f"  Without it every job writes into a NEW timestamped subfolder of "
+            f"{output_dir!r},\n"
+            f"  so a chain's checkpoints would be split across one folder per segment.\n"
+            f"  Pass --no-run-subdir (experiments/*/train.sh always does), or give an "
+            f"explicit\n"
+            f"  checkpoint path to deliberately fork a new run directory from it."
+        )
+
+    resume_path = None
+    if spec:
+        try:
+            resume_path, explanation = resume_lib.resolve_resume(spec, output_dir)
+        except resume_lib.ResumeError as exc:
+            # A message, not a traceback. This one is read off a cluster log by
+            # someone working out why a chain stopped, and the stack above it is
+            # ours, not theirs -- it says nothing they can act on.
+            raise SystemExit(str(exc)) from None
+        print(f"[resume] {explanation}")
+
+    if stop_at is not None:
+        if stop_at <= 0:
+            raise SystemExit(f"--stop-at-step must be positive, got {stop_at}.")
+        if stop_at > args.max_steps:
+            print(f"[segment] NOTE: --stop-at-step {stop_at} is past --max-steps "
+                  f"{args.max_steps}; training ends at {args.max_steps} regardless.")
+            stop_at = None
+        elif stop_at == args.max_steps:
+            # The default flow callback already stops (and saves) there. Adding ours
+            # would be a second callback claiming credit for the same event in the log.
+            stop_at = None
+
+    done = resume_lib.resumed_global_step(resume_path) if resume_path else 0
+    target = stop_at or args.max_steps
+    if done >= target:
+        print(f"[segment] nothing to do: the checkpoint is already at step {done}, "
+              f"which is at or past this job's target of {target}. Exiting cleanly so "
+              f"the rest of the chain continues.")
+        raise SystemExit(0)
+
+    if stop_at is not None:
+        print(f"[segment] this job trains steps {done} -> {stop_at} of {args.max_steps}. "
+              f"The LR schedule spans all {args.max_steps}, so it is identical to an "
+              f"uninterrupted run.")
+    return resume_path, stop_at
 
 
 def main() -> None:
@@ -670,6 +775,16 @@ def main() -> None:
     # caller's directory. Safe only because the caller owns a fresh dir per run.
     output_dir = os.path.join(base_dir, run_id) if args.run_subdir else base_dir
 
+    # 3a-pre. Resume, and this job's slice of the run.
+    #
+    # Resolved HERE -- before W&B opens and long before the model loads -- for two
+    # reasons. A segment that has nothing left to do exits in seconds instead of
+    # spending minutes bringing up vLLM to discover it, and a bad --resume-from-checkpoint
+    # fails on a message rather than after the GPU has been claimed.
+    # With neither flag passed this returns (None, None) and every line below behaves
+    # exactly as it did before resuming existed.
+    resume_path, stop_at = _resolve_resume_and_stop(args, output_dir)
+
     # 3a. Weights & Biases. The run is opened HERE, before the trainer exists, for two
     # reasons: HF's WandbCallback only calls wandb.init when no run is open (so this is
     # what lets us set entity/group/tags/id/offline-dir at all), and a credential or
@@ -683,7 +798,9 @@ def main() -> None:
         extra_tags=wandb_tags(args, marshal_config),
     )
     print(wandb_settings.summary())
-    wandb_run = wandb_settings.start(config=wandb_config(args, marshal_config, output_dir))
+    wandb_run = wandb_settings.start(
+        config=wandb_config(args, marshal_config, output_dir, resume_path, stop_at)
+    )
     report_to = wandb_settings.report_to(args.report_to)
 
     grpo_config = trl.GRPOConfig(
@@ -741,7 +858,7 @@ def main() -> None:
     print(f"[mem] bf16={args.bf16} grad_ckpt={args.gradient_checkpointing} "
           f"modules_to_save={modules_to_save} vllm_util={args.vllm_gpu_memory_utilization}")
     print(f"[out] run dir={output_dir} (checkpoint every {args.save_steps} steps, "
-          f"plus a final one at step {args.max_steps})")
+          f"plus a final one at step {stop_at or args.max_steps})")
 
     trainer = MarshalGRPOTrainer(
         model=args.model,
@@ -752,6 +869,15 @@ def main() -> None:
         peft_config=peft_config,
         marshal_config=marshal_config,
     )
+
+    # Added AFTER construction, so it sits behind TRL's and HF's own callbacks in the
+    # handler's list. Each callback may only add flags to the shared TrainerControl,
+    # so ordering cannot make them fight -- when stop_at happens to land on a
+    # save_steps boundary both ask to save and exactly one checkpoint is written.
+    if stop_at is not None:
+        from playpen.marshal.resume import stop_at_step_callback
+
+        trainer.add_callback(stop_at_step_callback(stop_at))
 
     try:
         import torch
@@ -770,11 +896,32 @@ def main() -> None:
     wandb_utils.write_run_metadata(
         os.path.join(output_dir, "wandb_run.json"), wandb_run, wandb_settings
     )
+    if resume_path is not None:
+        # Some peft/transformers pairings cannot load a LoRA adapter back at all --
+        # and only find out here, after vLLM has come up. Installs a shim when that is
+        # the case and does nothing otherwise; see ensure_peft_resume_compat.
+        from playpen.marshal.resume import ensure_peft_resume_compat
+
+        _compat = ensure_peft_resume_compat()
+        if _compat:
+            print(f"[resume] NOTE: patched peft's tensor-parallel adapter-load path "
+                  f"({_compat}).\n"
+                  f"[resume]       This process is single-rank, where that path is a "
+                  f"no-op; without the patch every LoRA resume raises ImportError. "
+                  f"Upgrading peft/transformers to a compatible pair removes the need "
+                  f"for it.")
+
     try:
-        trainer.train()
+        # resume_from_checkpoint=None is TRL/HF's own default, so an unchained run
+        # takes exactly the path it always did.
+        trainer.train(resume_from_checkpoint=resume_path)
     finally:
         wandb_utils.finish(wandb_run, wandb_settings)
     print(f"[done] LoRA adapters saved under {output_dir}/checkpoint-<step>/")
+    if stop_at is not None:
+        print(f"[done] segment ended at step {trainer.state.global_step} of "
+              f"{args.max_steps}; the next job continues from "
+              f"{output_dir}/checkpoint-{trainer.state.global_step}/")
 
 
 if __name__ == "__main__":

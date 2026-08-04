@@ -10,9 +10,10 @@
 #     experiments/eddie/run_experiment.sh guesswhat
 #
 # Creates the experiment directory, writes the manifest, then queues:
-#   1. training
+#   1. training     (TRAIN_SEGMENTS chained jobs, each resuming the last)
 #   2. lm-eval      (logiglue/logicbench -- did reasoning transfer?)   } N shards each,
-#   3. playpen eval (clembench gameplay -- did it learn to play?)      } held on job 1,
+#   3. playpen eval (clembench gameplay -- did it learn to play?)      } held on the
+#                                                                     } LAST train job,
 #                                                                     } run CONCURRENTLY
 #   4. summary      (the complete RESULTS.md / PLAYPEN_RESULTS.md, held on 2 and 3)
 #
@@ -21,6 +22,16 @@
 # paths and job ids; nothing else to remember.
 #
 # Job 3 off:  PPEVAL_ENABLE=0 experiments/eddie/run_experiment.sh dond
+#
+# TRAINING TOO LONG FOR ONE WALLTIME (48 h is Eddie's gpu-queue cap and cannot be
+# raised): split it. MAX_STEPS stays the total; only the job count changes.
+#
+#   TRAIN_SEGMENTS=3 experiments/eddie/run_experiment.sh guesswhat
+#   TRAIN_SEGMENTS=3 TRAIN_QSUB_OPTS='-l h_rt=16:00:00' \
+#     experiments/eddie/run_experiment.sh guesswhat   # and schedule sooner too
+#
+# To rescue a run that already died, do not re-submit it here -- that starts a new
+# experiment directory. Use  experiments/eddie/resume_experiment.sh <EXP_DIR>.
 #
 # Any preset value can be overridden by exporting it first (see
 # experiments/presets/<game>.env for the full list). ALWAYS set EXP_TAG when a run
@@ -65,6 +76,22 @@ export EVAL_SHARD_TOTAL
 echo "[plan] ${MAX_STEPS} steps / ${SAVE_STEPS} save-steps => ~${N_CKPTS} checkpoints"
 echo "[plan] ${EVAL_SHARD_TOTAL} eval shard(s) of ${EVAL_SHARD_SIZE} checkpoint(s) each"
 
+# --- how many training jobs ---------------------------------------------------
+# Resolves TRAIN_SEGMENTS/SEGMENT_STEPS into a consistent pair (either one may be the
+# knob the caller set) and reports the boundaries. MAX_STEPS is unchanged by this: the
+# segments partition it, they do not extend it.
+exp_plan_segments || exit 1
+if [ "$TRAIN_SEGMENTS" -gt 1 ]; then
+    STOPS=""
+    for S in $(seq 1 "$TRAIN_SEGMENTS"); do STOPS="$STOPS $(exp_segment_stop_at "$S")"; done
+    echo "[plan] ${TRAIN_SEGMENTS} chained training job(s) of <= ${SEGMENT_STEPS} steps, ending at:${STOPS}"
+    echo "[plan] each resumes the previous one's last checkpoint; --max-steps stays"
+    echo "[plan] ${MAX_STEPS} in all of them, so the LR schedule matches a single-job run"
+    exp_wandb_chain_setup
+else
+    echo "[plan] 1 training job (set TRAIN_SEGMENTS=N to split it across N chained jobs)"
+fi
+
 # --- manifest, written before submission -------------------------------------
 # So a job that dies in the queue still leaves a record of what it was going to be.
 # Uses the training venv because it imports playpen.marshal.config (stdlib + PyYAML;
@@ -84,6 +111,7 @@ ENV_FILE="$EXP_DIR/experiment.env"
                NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
                LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
                VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL EXTRA_TRAIN_ARGS \
+               TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
                WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
                EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE LMEVAL_CONDA_ENV \
                EVAL_SHARD_SIZE EVAL_SHARD_TOTAL \
@@ -100,14 +128,43 @@ cd "$REPO"
 # -o/-e are given on the command line rather than as "#$" directives because the
 # log destination is only known now; command-line options win over directives.
 # Grid Engine expands $JOB_ID inside the path itself, so it is escaped from bash.
-TRAIN_ID="$(qsub -terse \
-    -N "tr_${GAME}_$(basename "$MODEL")" \
-    -o "$LOG_DIR/train_${EXP_ID}_\$JOB_ID.out" \
-    -e "$LOG_DIR/train_${EXP_ID}_\$JOB_ID.err" \
-    -v "EXP_ENV_FILE=$ENV_FILE" \
-    ${TRAIN_QSUB_OPTS:-} \
-    "$HERE/train.sh" | tr -d '[:space:]')"
-echo "[submit] training  job $TRAIN_ID"
+# TRAIN_SEGMENTS jobs in SEQUENCE, each held on the previous one and continuing from
+# its last checkpoint. Which slice a job owns comes from TRAIN_SEGMENT, passed as its
+# own -v exactly like EVAL_SHARD below -- the env file is shared by every segment, so
+# the index cannot live in it.
+#
+# -hold_jid, not a success condition: Grid Engine has no afterok, and we would not want
+# one here anyway. A segment killed at the walltime exits non-zero having written
+# checkpoint-350, and the whole point is for the next segment to pick that up. What
+# stops a broken chain from quietly retraining from scratch is on the other side:
+# segments 2+ pass --resume-from-checkpoint latest, which ERRORS when train/ holds no
+# resumable checkpoint (see exp_segment_resume_spec).
+TRAIN_IDS=()
+PREV_ID=""
+for SEGMENT in $(seq 1 "$TRAIN_SEGMENTS"); do
+    HOLD_OPTS=()
+    [ -n "$PREV_ID" ] && HOLD_OPTS=( -hold_jid "$PREV_ID" )
+    ID="$(qsub -terse \
+        -N "tr${SEGMENT}_${GAME}_$(basename "$MODEL")" \
+        -o "$LOG_DIR/train${SEGMENT}_${EXP_ID}_\$JOB_ID.out" \
+        -e "$LOG_DIR/train${SEGMENT}_${EXP_ID}_\$JOB_ID.err" \
+        -v "EXP_ENV_FILE=$ENV_FILE" \
+        -v "TRAIN_SEGMENT=$SEGMENT" \
+        "${HOLD_OPTS[@]}" \
+        ${TRAIN_QSUB_OPTS:-} \
+        "$HERE/train.sh" | tr -d '[:space:]')"
+    TRAIN_IDS+=("$ID")
+    if [ "$TRAIN_SEGMENTS" -gt 1 ]; then
+        echo "[submit] training  job $ID  segment $SEGMENT/$TRAIN_SEGMENTS" \
+             "(-> step $(exp_segment_stop_at "$SEGMENT")${PREV_ID:+, held until $PREV_ID finishes})"
+    else
+        echo "[submit] training  job $ID"
+    fi
+    PREV_ID="$ID"
+done
+# Everything downstream waits on the LAST segment: that is the job after which the run
+# is complete. Named TRAIN_ID so the eval/summary blocks below are unchanged.
+TRAIN_ID="$PREV_ID"
 
 # --- the evaluation shards ----------------------------------------------------
 # One job per shard of EVAL_SHARD_SIZE checkpoints, for BOTH evaluations, all held on
@@ -194,7 +251,7 @@ experiment : $EXP_ID
 directory  : $EXP_DIR
 
   manifest.txt        what this run is          cat $EXP_DIR/manifest.txt
-  logs/               job output                tail -f $LOG_DIR/train_${EXP_ID}_$TRAIN_ID.out
+  logs/               job output                tail -f $LOG_DIR/train1_${EXP_ID}_${TRAIN_IDS[0]}.out
   train/              checkpoints (checkpoint-<step>/)
   eval/               lm-eval output per checkpoint
   RESULTS.md          lm-eval score table       (each shard writes a partial one; the
@@ -204,8 +261,12 @@ directory  : $EXP_DIR
   wandb/              W&B run data ($([ "${WB_ENABLE:-1}" = "1" ] && echo "project ${WB_PROJECT:-playpen-marshal}, mode ${WB_MODE:-auto}" || echo "disabled"))
                       offline runs upload with  experiments/lib/wandb_sync.sh $EXP_DIR
 
-jobs       : 1 train + ${#ALL_EVAL_IDS[@]} eval (${EVAL_SHARD_TOTAL} shard(s) x $([ "${PPEVAL_ENABLE:-1}" = "1" ] && echo 2 || echo 1) evaluation(s)) + 1 summary
+jobs       : ${TRAIN_SEGMENTS} train$([ "$TRAIN_SEGMENTS" -gt 1 ] && echo " (chained, <= ${SEGMENT_STEPS} steps each)") + ${#ALL_EVAL_IDS[@]} eval (${EVAL_SHARD_TOTAL} shard(s) x $([ "${PPEVAL_ENABLE:-1}" = "1" ] && echo 2 || echo 1) evaluation(s)) + 1 summary
 
   qstat -u $USER            # watch the jobs
-  qdel $TRAIN_ID ${ALL_EVAL_IDS[*]} $SUMMARY_ID   # cancel the experiment
+  qdel ${TRAIN_IDS[*]} ${ALL_EVAL_IDS[*]} $SUMMARY_ID   # cancel the experiment
+
+If a training segment dies, the rest of the chain still runs and picks up from its
+last checkpoint. To restart a chain that stopped short:
+  experiments/eddie/resume_experiment.sh $EXP_DIR
 EOF

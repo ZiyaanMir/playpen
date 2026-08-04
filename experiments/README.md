@@ -18,13 +18,18 @@ and a final job that writes the score tables, then prints where everything will 
 
 | # | job | what it answers |
 |---|---|---|
-| 1 | **train** | — |
+| 1 | **train** (one job, or `TRAIN_SEGMENTS` chained ones) | — |
 | 2 | **eval** (lm-eval: logiglue, logicbench) | did self-play change the model's *reasoning*? |
 | 3 | **playpen eval** (clembench gameplay, clemscore) | did it get better at *playing*, including the 13 games it never trained on? |
 | 4 | **summary** | writes the complete `RESULTS.md` / `PLAYPEN_RESULTS.md` |
 
 Job 3 is the one that produces the number the shared task is scored on. Turn it off
 for a run with `PPEVAL_ENABLE=0`.
+
+A run too long for one walltime is not a dead end: `TRAIN_SEGMENTS=3` splits job 1
+into three chained jobs, each continuing the last one's checkpoint, and
+`resume_experiment.sh` restarts a run that already died. See
+[Long runs: segments and resuming](#long-runs-segments-and-resuming).
 
 **Jobs 2 and 3 are each split into shards of five checkpoints, and every shard runs
 at the same time.** With the presets' `MAX_STEPS=1000` / `SAVE_STEPS=100` that is ten
@@ -47,12 +52,14 @@ $MARSHAL_RUNS/dond_Qwen3-4B_lp384_20260723-142530/
 ├── manifest.json           the same, machine-readable
 ├── marshal_config.yaml     frozen copy of the config this run used
 ├── experiment.env          every setting, re-sourceable to re-run by hand
+├── experiment.resume.env   only if resume_experiment.sh ran: the same, plus what
+│                           that resume changed. The original is left as the record
 ├── RESULTS.md            ← lm-eval scores, with deltas vs the untrained base
 ├── results.tsv             the same numbers for pandas
 ├── PLAYPEN_RESULTS.md    ← clemscore + per-game table, same deltas
 ├── playpen_results.tsv     the same numbers for pandas
 ├── logs/
-│   ├── train.<jobid>.out/.err
+│   ├── train1.<jobid>.out/.err    one per training segment
 │   ├── eval1.<jobid>.out/.err     one per shard
 │   ├── eval2.<jobid>.out/.err
 │   ├── ppeval1.<jobid>.out/.err
@@ -156,6 +163,116 @@ one-line command to fetch it), and **`scikit-learn` must be in the venv** —
 `clembench/privateshared` imports it. Nothing else: unlike lm-eval, this runs in the
 repo's own `.venv` (clemcore + playpen + peft are all there), so there is no second
 environment to build and the job is the same on both clusters.
+
+### Long runs: segments and resuming
+
+Training is one job by default. `TRAIN_SEGMENTS=N` makes it **N chained jobs**, each
+resuming the previous one's last checkpoint:
+
+```bash
+# 1000 steps as three jobs of <= 400, in one experiment directory
+TRAIN_SEGMENTS=3 experiments/eddie/run_experiment.sh guesswhat
+
+# ...and ask for a walltime those shorter jobs actually need
+TRAIN_SEGMENTS=3 TRAIN_SBATCH_OPTS='--time=08:00:00' \
+  experiments/isambard/run_experiment.sh guesswhat
+```
+
+```
+train seg 1 (0→400) ─▶ train seg 2 (400→800) ─▶ train seg 3 (800→1000) ─┬─▶ eval shards ─▶ summary
+                                                                        └─▶ gameplay shards
+```
+
+**Why.** Eddie's gpu queue caps `h_rt` at 48 h and Isambard's `workq_qos` caps
+`--time` at 24 h. Neither can be raised, so before this a run that outgrew its
+walltime could only be redone. Segments also schedule sooner (a 8 h request backfills
+where a 24 h one waits) and, on Isambard, book credit against 3 × 8 h instead of
+3 × 24 h, because Slurm reserves against the request rather than the usage.
+
+**`MAX_STEPS` is always the total, in every segment.** Segments partition it; they
+never extend it. This is not a convention — it is what keeps a segmented arm
+comparable with an unsegmented one:
+
+> HF builds the LR scheduler from `max_steps`, and `scheduler.pt` restores only the
+> step counter, never the decay curve. Hand segment *k* `max_steps = k*S` and every
+> resume re-derives a **steeper** slope: step 3 of a 10-step run comes out at
+> `2.5e-06` instead of `7e-06`, and the rate jumps back up at each boundary. So
+> `--max-steps` stays the total and `--stop-at-step` ends the segment instead. Step
+> 700 then has the same learning rate whether the run was one job or five —
+> verified, and pinned by `tests/test_marshal_resume.py`.
+
+Boundaries land on `SAVE_STEPS` multiples wherever possible, so a segment ends on a
+checkpoint the schedule was going to write anyway and the run's checkpoint set is
+exactly what an unsegmented run would produce. Ask for more segments than there are
+checkpoints and you get the checkpoint count — the `[plan]` line reports what will
+actually be submitted, which is not always the number you asked for.
+
+| variable | default | what it does |
+|---|---|---|
+| `TRAIN_SEGMENTS` | `1` | how many chained training jobs. `1` = the single job this always submitted |
+| `SEGMENT_STEPS` | — | steps per segment, when you want to size against a walltime directly. `TRAIN_SEGMENTS` is then derived from it |
+| `RESUME_FROM` | — | `auto` \| `latest` \| a checkpoint path. Applies to the **first** segment only |
+
+Set either knob, not both — whichever you set governs and the other is derived. (Set
+both and the explicit `SEGMENT_STEPS` wins.)
+
+#### Resuming a run that died
+
+```bash
+experiments/eddie/resume_experiment.sh    $MARSHAL_RUNS/<experiment>
+experiments/isambard/resume_experiment.sh $MARSHAL_RUNS/<experiment>
+```
+
+Re-queues only the training segments still ahead of what is on disk, then the full
+evaluation chain behind them — **in the same directory, under the same settings, into
+the same W&B run**. Do not use `run_experiment.sh` for this: that makes a new
+experiment directory and starts again at step 0.
+
+```
+$ experiments/eddie/resume_experiment.sh $MARSHAL_RUNS/guesswhat_Qwen3-4B_20260727-120621
+[resume] plan       : 1000 steps total, 3 segment(s) of <= 400
+[resume] from       : checkpoint-500 (global step 500)
+[resume] segments   : 2..3 of 3 still to run
+```
+
+The remaining work can be re-planned on the way — usually the reason you are here,
+since the run died *because* one job could not fit it:
+
+```bash
+TRAIN_SEGMENTS=5 TRAIN_QSUB_OPTS='-l h_rt=12:00:00' \
+  experiments/eddie/resume_experiment.sh $MARSHAL_RUNS/<experiment>
+```
+
+`MAX_STEPS` is the one thing it refuses to change, for the reason in the quote above:
+a different horizon would give the rest of the run a different LR schedule from its
+first half, inside one continuous set of checkpoints that says nothing about it.
+Extending a run is a new experiment.
+
+#### What is going on underneath
+
+* **`--resume-from-checkpoint`** restores the LoRA adapter, optimizer, scheduler, RNG
+  and step counter. `auto` = resume if there is something, else start at step 0;
+  `latest` = the same but an *error* when there is nothing. Segment 1 gets `auto`,
+  segments 2+ get `latest` — because by then an empty `train/` means the previous job
+  died before its first save, and quietly restarting would cost a whole walltime.
+* **A half-written checkpoint is never resumed from.** `trainer_state.json` is the
+  last file HF writes, so its absence marks a job killed mid-save. Note this is
+  *stricter* than the eval side: lm-eval can score a checkpoint whose optimizer state
+  was never written, resume cannot.
+* **Dependencies are `afterany` / plain `-hold_jid`**, not a success condition. A
+  segment killed at the walltime exits non-zero having written `checkpoint-350`, and
+  the next one is meant to pick that up. What stops a broken chain from silently
+  retraining from scratch is the `latest` spec above, not the dependency.
+* **A segment with nothing left to do exits 0 in seconds**, before the model loads, so
+  the rest of the chain carries on.
+* **One W&B run for the whole chain.** All segments share a run id derived from
+  `EXP_ID` (`WB_RESUME=allow`), so the UI shows one continuous curve rather than N
+  unrelated ones. `resume_experiment.sh` computes the same id, so a rescue lands in
+  the same place.
+* **Checkpoints from every segment share one `train/` directory** (`--no-run-subdir`),
+  which is what lets the eval jobs enumerate the whole run rather than the last
+  segment. `--resume-from-checkpoint auto`/`latest` therefore *require* that flag and
+  refuse to run without it.
 
 ### Sharded evaluation
 
@@ -369,7 +486,10 @@ Scheduler options pass through too:
 | `MODEL` | `Qwen/Qwen3-4B` | policy to train |
 | `EXP_TAG` | — | goes in the directory name; set it for every variant |
 | `EXTRA_TRAIN_ARGS` | — | extra `train_selfplay.py` flags, verbatim |
-| `MAX_STEPS` / `SAVE_STEPS` | `1000` / `100` in every preset | schedule and checkpoint cadence |
+| `MAX_STEPS` / `SAVE_STEPS` | `1000` / `100` in every preset | schedule and checkpoint cadence. `MAX_STEPS` is the **total** for the run however many jobs it is split across |
+| `TRAIN_SEGMENTS` | `1` | chained training jobs, each resuming the last (see [Long runs](#long-runs-segments-and-resuming)) |
+| `SEGMENT_STEPS` | — | steps per segment, instead of `TRAIN_SEGMENTS` |
+| `RESUME_FROM` | — | `auto` \| `latest` \| a checkpoint path, for the first segment |
 | `UNIQUE_POOL` | — | tri-state `1`/`0`/empty for `marshal_exact`'s `torch.unique` pooling (see [below](#marshal_exacts-unique-pooling-unique_pool)) |
 | `EVAL_TASKS` | `logiglue,logicbench` | lm-eval tasks (comma-separated) |
 | `EVAL_BASE` | `1` | also score the untrained model |

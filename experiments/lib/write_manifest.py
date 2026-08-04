@@ -54,6 +54,15 @@ TRAIN_FIELDS = [
     ("GRAD_CKPT", "gradient_checkpointing", lambda v: bool(int(v))),
     ("VLLM_UTIL", "vllm_gpu_memory_utilization", float),
     ("VLLM_MAX_MODEL_LEN", "vllm_max_model_len", int),
+    # How the run was split across jobs. Recorded because it is the one thing about a
+    # chained run that is NOT visible from its checkpoints: segments partition
+    # max_steps rather than extending it, and every segment trains under the same
+    # --max-steps (hence the same LR schedule), so a 3-segment run and a 1-segment run
+    # of the same config produce indistinguishable output directories. When a run does
+    # turn out odd around step 400, this is what says a job boundary was there.
+    ("TRAIN_SEGMENTS", "train_segments", int),
+    ("SEGMENT_STEPS", "segment_steps", int),
+    ("RESUME_FROM", "resume_from", str),
 ]
 
 PACKAGES = ["torch", "trl", "peft", "transformers", "vllm", "datasets", "accelerate"]
@@ -389,6 +398,26 @@ def main() -> None:
         "-- training ---------------------------------------------------------",
     ]
     lines += [f"  {k:<28} {v}" for k, v in train.items()]
+
+    # Spell the chain out. "train_segments 3" above is a number; the boundaries are
+    # what you actually want when reading a reward curve with a discontinuity in it.
+    if isinstance(train.get("train_segments"), int) and train["train_segments"] > 1:
+        try:
+            from playpen.marshal.resume import segment_bounds
+
+            bounds = segment_bounds(train["max_steps"], train.get("segment_steps") or 0)
+            lines += [
+                "",
+                "-- chained training jobs ---------------------------------------------",
+                f"  {len(bounds)} job(s), each resuming the last one's checkpoint, ending at steps:",
+                "    " + ", ".join(str(b) for b in bounds),
+                "  --max-steps is the TOTAL in every one of them, so the LR schedule is",
+                "  identical to an uninterrupted run and this arm stays comparable with an",
+                "  unsegmented one. Only --stop-at-step differs between the jobs.",
+            ]
+        except Exception:
+            pass
+
     lines += ["", "-- marshal config (resolved: YAML + CLI overrides) -------------------"]
     lines += [f"  {k:<28} {v}" for k, v in marshal_cfg.items()]
     if cfg_error:

@@ -71,7 +71,7 @@ python -c "import lm_eval, peft; print('[eval] lm_eval', lm_eval.__version__, '|
 RUN_DIR="$(exp_find_run_dir || true)"
 if [ -z "$RUN_DIR" ]; then
     echo "[eval] no training run directory under $TRAIN_BASE." >&2
-    echo "[eval] training produced nothing to evaluate -- check $LOG_DIR/train_*.err" >&2
+    echo "[eval] training produced nothing to evaluate -- check $LOG_DIR/train*.err" >&2
     exit 0
 fi
 echo "[eval] run dir = $RUN_DIR"
