@@ -100,7 +100,7 @@ sampling_top_k: 50
 #   including its two documented departures from its own paper (a biasing pre-sum
 #   reward normalization, and distinct-value pooling that equal-weights rare and
 #   common outcomes). Use only for comparison against MARSHAL's own numbers.
-fidelity_mode: marshal_exact
+fidelity_mode: paper_correct
 
 # Sub-flag for marshal_exact's SECOND departure only: the torch.unique distinct-value
 # pooling in advantage._pool_offset_scale. true (default) = marshal_exact unchanged.
