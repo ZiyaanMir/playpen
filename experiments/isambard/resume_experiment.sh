@@ -72,8 +72,18 @@ if [ -n "${MAX_STEPS+set}" ]; then
     exit 2
 fi
 
+# `set -a` so every name in the env file is EXPORTED, not merely assigned.
+#
+# The file is written as bare `NAME=value` assignments. train.sh reads them as shell
+# variables, so it never noticed -- but check_resume_config.py below is a SUBPROCESS,
+# and a subprocess sees only exported names. Without this it resolves the config with
+# LP_COEF, EXTRA_TRAIN_ARGS, TR_* and the rest all missing, reports five fields of
+# "drift" that are really its own blindness, and teaches you to reach for
+# RESUME_FORCE=1 -- which would defeat the whole check.
+set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
+set +a
 source "$HERE/../lib/experiment.sh"
 EXP_DIR="$EXP_DIR_ARG"
 exp_layout
@@ -126,6 +136,43 @@ echo "[resume] segments   : ${RESUME_FIRST_SEGMENT}..${LAST_SEGMENT} of ${TRAIN_
 # EXP_ID, so it is the same one either way.
 exp_wandb_chain_setup force
 
+# --- pin the algorithm config to what this run actually started with ----------
+# experiment.env stores MARSHAL_CONFIG as a PATH into the repo, not as content, and
+# that shared YAML is edited between runs -- it is the file every ablation arm is
+# varied from. So the stored path says nothing about what THIS run used, and resuming
+# through it silently hands the remaining segments whatever the YAML happens to say
+# today.
+#
+# Not hypothetical: taboo_Qwen3-4B_turnrew_20260730-231934 resumed against the current
+# shared YAML would flip turn_level_rewards true->false and whiten_rewards true->false,
+# half way through the run, with nothing on disk recording it.
+#
+# write_manifest.py froze a copy inside the experiment at submit time for exactly this
+# reason. Point at that instead.
+if [ -f "$EXP_DIR/marshal_config.yaml" ]; then
+    MARSHAL_CONFIG="$EXP_DIR/marshal_config.yaml"
+    export MARSHAL_CONFIG
+    echo "[resume] config     : $MARSHAL_CONFIG (this run's frozen copy, not the shared YAML)"
+else
+    echo "[resume] WARNING: no frozen marshal_config.yaml in the experiment directory," >&2
+    echo "[resume]          so this resume falls back to $MARSHAL_CONFIG as it reads" >&2
+    echo "[resume]          TODAY. If that file has been edited since, the remaining" >&2
+    echo "[resume]          segments train under a different config. The check below" >&2
+    echo "[resume]          will catch it." >&2
+fi
+
+# --- and prove nothing else drifted ------------------------------------------
+# Compares every resolved MARSHAL setting against what manifest.json recorded at first
+# submission, and refuses if any of them moved. Catches the case the pin above cannot:
+# a value that reached the ORIGINAL job through the environment (Isambard's
+# --export=ALL carries TR_ENABLE without it ever being written to experiment.env) and
+# has no route into this one. See experiments/lib/check_resume_config.py.
+if [ "${RESUME_FORCE:-0}" != "1" ]; then
+    "$REPO/.venv/bin/python" "$EXP_ROOT_DIR/lib/check_resume_config.py" "$EXP_DIR" || exit 1
+else
+    echo "[config-check] SKIPPED by RESUME_FORCE=1 -- this run may be trained two ways."
+fi
+
 # --- the env file these jobs read --------------------------------------------
 # A COPY, appended to. The job sources it top to bottom so a later assignment wins,
 # and the original experiment.env is left as the record of what was first submitted.
@@ -139,7 +186,10 @@ cp "$ENV_FILE" "$RESUME_ENV_FILE"
 {
     echo ""
     echo "# --- resume overrides, $(date --iso-8601=seconds) ---"
-    for _v in TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM EVAL_SHARD_SIZE WB_ID WB_RESUME \
+    for _v in TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM MARSHAL_CONFIG \
+              LP_MAX_LEN LP_COEF UNIQUE_POOL EXTRA_TRAIN_ARGS \
+              TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
+              EVAL_SHARD_SIZE WB_ID WB_RESUME \
               EVAL_BASE PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE \
               PPEVAL_CKPTS PPEVAL_SERIAL; do
         printf '%s=%q\nexport %s\n' "$_v" "${!_v-}" "$_v"

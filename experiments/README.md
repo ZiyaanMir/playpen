@@ -248,6 +248,48 @@ a different horizon would give the rest of the run a different LR schedule from 
 first half, inside one continuous set of checkpoints that says nothing about it.
 Extending a run is a new experiment.
 
+#### It checks that the config really did survive
+
+Resuming re-derives the config from the environment, and two things make that
+environment different weeks later. Both are handled, and then verified:
+
+* **The shared YAML gets edited.** `experiment.env` stores `MARSHAL_CONFIG` as a
+  *path*, not as content — and `examples/marshal/marshal_config.yaml` is the file every
+  ablation is varied from. Resuming through that path hands the remaining segments
+  whatever it says *today*. So the resume points at the **frozen per-run copy** that
+  `write_manifest.py` saved inside the experiment directory instead.
+* **A setting arrived by a route the resume doesn't have.** Isambard's
+  `sbatch --export=ALL` carries your whole shell environment, so `TR_ENABLE=1` reached
+  the original job without ever being written to `experiment.env`. Nothing carries it
+  on a resume. No care in the resume script can fix that — the value simply isn't
+  recorded anywhere the resume can read.
+
+So before submitting anything, every resolved MARSHAL setting is compared against what
+`manifest.json` recorded at first submission, and a mismatch **stops the resume**:
+
+```
+[config-check] REFUSING TO RESUME -- the algorithm config has changed.
+
+  field                            was (manifest.json)      would be now
+  -------------------------------- ------------------------ ------------
+  turn_rewards                     True                     False
+```
+
+Put the missing value back for that submission and it proceeds:
+
+```bash
+TR_ENABLE=1 experiments/isambard/resume_experiment.sh <EXP_DIR>
+```
+
+`RESUME_FORCE=1` skips the check if the change is deliberate and you accept a run
+trained two ways. Fields that simply didn't *exist* when the run was submitted
+(`MarshalConfig` gains fields over time) are reported as a note, not a refusal — there
+is no old value for them to have drifted from.
+
+This is worth knowing about even if you never resume: it is the only thing in the
+pipeline that will tell you a stored experiment can no longer be reproduced from what
+was recorded about it.
+
 #### What is going on underneath
 
 * **`--resume-from-checkpoint`** restores the LoRA adapter, optimizer, scheduler, RNG

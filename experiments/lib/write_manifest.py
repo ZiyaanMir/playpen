@@ -164,12 +164,17 @@ def _marshal_overrides_from_argv(tokens: list) -> dict:
     return out
 
 
-def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
-    """Merge the YAML with the CLI length-penalty overrides, exactly as training does.
+def resolve_config() -> tuple[dict, str | None]:
+    """The MARSHAL config a job launched from THIS environment would actually use.
 
-    Returns ``(config_dict, error)``. A malformed YAML is reported rather than
-    raised: the manifest is diagnostic, and failing to write it must not block a
-    submission (the training job will fail on the same file soon enough, loudly).
+    Returns ``(config_dict, error)``. Side-effect free, and separate from
+    :func:`_resolved_marshal_config` (which additionally freezes a copy) so that
+    ``check_resume_config.py`` can ask the same question without writing anything --
+    the point of that check is to compare two answers, not to change one of them.
+
+    A malformed YAML is reported rather than raised: the manifest is diagnostic, and
+    failing to write it must not block a submission (the training job will fail on the
+    same file soon enough, loudly).
     """
     rel = _env("MARSHAL_CONFIG", "examples/marshal/marshal_config.yaml")
     path = rel if os.path.isabs(rel) else os.path.join(REPO, rel)
@@ -216,14 +221,28 @@ def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
             cfg = dataclasses.replace(cfg, **overrides)
         except Exception as exc:
             return cfg.to_dict(), f"config override rejected: {exc}"
+    return cfg.to_dict(), None
 
-    # Freeze the config next to the results so a later edit to the shared YAML
-    # cannot silently rewrite what this run claims to have used.
+
+def _resolved_marshal_config(exp_dir: str) -> tuple[dict, str | None]:
+    """:func:`resolve_config`, plus a frozen copy of the YAML inside ``exp_dir``.
+
+    The freeze is what lets a run be resumed months later under the config it
+    actually had: ``experiment.env`` records MARSHAL_CONFIG as a PATH to the *shared*
+    YAML, which is edited between runs, so the path alone says nothing about what a
+    given run used. ``resume_experiment.sh`` points the resumed segments at this copy
+    rather than at that path -- see the comment there.
+    """
+    cfg_dict, error = resolve_config()
+    rel = _env("MARSHAL_CONFIG", "examples/marshal/marshal_config.yaml")
+    path = rel if os.path.isabs(rel) else os.path.join(REPO, rel)
+    frozen = os.path.join(exp_dir, "marshal_config.yaml")
     try:
-        shutil.copy2(path, os.path.join(exp_dir, "marshal_config.yaml"))
+        if os.path.abspath(path) != os.path.abspath(frozen):
+            shutil.copy2(path, frozen)
     except Exception:
         pass
-    return cfg.to_dict(), None
+    return cfg_dict, error
 
 
 def _wandb_summary() -> dict:
