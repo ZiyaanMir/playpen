@@ -39,6 +39,28 @@ TURN_REWARD_SOURCES = ("auto", "game", "generic")
 # See MarshalConfig.turn_reward_budget.
 TURN_REWARD_SAFE_BUDGET = 0.5
 
+# Same idea for the length penalty. That term is one-sided (always <= 0), so its
+# own worst-case swing between two episodes is 1 x budget rather than 2 x, and it
+# would stay safe on its own up to 1.0. The lower bound here leaves headroom for
+# turn_rewards to be on at the same time (0.5 + 2 x 0.3 = 1.1 is already too much,
+# so in practice keep length_penalty_budget + 2 x turn_reward_budget < 1.0).
+# See MarshalConfig.length_penalty_budget.
+LENGTH_PENALTY_SAFE_BUDGET = 0.5
+
+# The fields of MARSHAL's original threshold-based length penalty, mapped to the
+# values they shipped with. They are still accepted (so pinned resume configs,
+# cluster presets and old manifests keep loading) but no longer do anything --
+# see MarshalConfig.length_penalty_coef. MarshalConfig.legacy_length_penalty_values
+# reports the ones a config actually set, so a run can say out loud that they are
+# being ignored rather than silently training under a penalty nobody configured.
+LEGACY_LENGTH_PENALTY_DEFAULTS = {
+    "length_penalty_coef": 0.5,
+    "length_penalty_bonus": 0.0,
+    "length_penalty_min_len": 11,
+    "length_penalty_max_len": 2048,
+    "length_penalty_offset": 1.0,
+}
+
 
 @dataclass
 class MarshalConfig:
@@ -141,43 +163,68 @@ class MarshalConfig:
             keeping per-seat *pooling*), since a per-group std is exactly the bias
             Dr. GRPO removes. Batch-wide ``whiten_advantages`` is left alone -- the
             Dr. GRPO paper explicitly permits batch-level normalization.
-        length_penalty: When ``True`` (and ``enabled``), add MARSHAL's Kimi-1.5-style
-            per-turn length reward to each turn's reward before any normalization --
-            a one-sided linear penalty for generations longer than
-            ``length_penalty_max_len``. Ported from MARSHAL's
-            ``compute_length_penalty`` (``roll/agentic/rollout/env_manager.py:276-294``);
-            see ``advantage.LengthPenaltySpec`` for the formula.
+        length_penalty: When ``True`` (and ``enabled``), charge every turn a small
+            per-token cost, added to that turn's reward before any normalization:
+            ``-length_penalty_per_token * generated_tokens``. There is **no
+            threshold** -- the first token costs the same as the thousandth, and
+            there is no length below which a turn is free. See
+            ``advantage.LengthPenaltySpec`` for the formula and
+            ``length_penalty_budget`` for why it cannot outweigh the game outcome.
 
             Default ``False``, and that default is the MARSHAL-faithful setting: MARSHAL
-            applies this penalty *only* to its board-game envs and explicitly skips it
-            for free-text ones (``env_manager.py:470-480`` guards it behind
+            applies its length penalty *only* to its board-game envs and explicitly skips
+            it for free-text ones (``env_manager.py:470-480`` guards it behind
             ``not isinstance(env, BaseLanguageBasedEnv)``, commented "No MARSHAL-imposed
             reward shaping for free-text envs (e.g. Playpen/clembench)"). Turning it on
-            for a clembench game is therefore a deliberate divergence -- useful against a
-            reasoning model that overruns its token budget, but a run using it is not a
+            for a clembench game is therefore a deliberate divergence -- useful as gentle
+            pressure against a model that pads every turn, but a run using it is not a
             MARSHAL reproduction and should be reported as such.
-        length_penalty_coef: Scale on the *negative* (too-long) part of the length
-            reward -- MARSHAL's ``lower``. This is the main magnitude knob: at twice
-            ``length_penalty_max_len`` the penalty is about ``-length_penalty_coef``.
-            MARSHAL ships ``0.5``, chosen to be "comparable with the winning rewards"
-            (clembench: SUCCESS ``+1`` / ABORTED ``-1``).
-        length_penalty_bonus: Scale on the *positive* (short-enough) part -- MARSHAL's
-            ``upper``. MARSHAL ships ``0.0``, which zeroes that branch and makes the
-            reward a pure penalty. Raise it only if you want to actively reward brevity,
-            which risks the policy learning to answer with nothing.
-        length_penalty_min_len: Length at which the raw term equals
-            ``length_penalty_offset`` -- MARSHAL's ``min_len`` (ships ``11``, a constant
-            derived from the minimum ``<answer>X(i,j)</answer>`` response in their
-            board games; it only sets the slope's origin, so it is near-irrelevant when
-            ``length_penalty_bonus`` is 0).
-        length_penalty_max_len: Length at which the raw term crosses zero (when
-            ``length_penalty_offset`` is 1) -- MARSHAL's ``max_len``, ships ``2048``.
-            This is the "too long" threshold; set it near your per-turn
-            ``--max-completion-length`` so only genuine overruns are charged.
-        length_penalty_offset: Vertical offset of the raw term -- MARSHAL's ``coef``,
-            ships ``1.0``. With the default ``length_penalty_bonus`` of 0 this just
-            shifts the zero-crossing away from ``length_penalty_max_len``; prefer
-            changing ``length_penalty_max_len`` instead.
+        length_penalty_per_token: Reward charged per generated token. Non-negative;
+            the minus sign is applied in ``LengthPenaltySpec``, so ``2e-5`` (the
+            default) means ``-2e-5`` per token, i.e. ``-0.02`` per 1000 tokens.
+
+            Calibrate against the ``+-1`` outcome, not against a single turn: a
+            500-token turn costs ``-0.01`` and a 10-turn episode of them ``-0.10``,
+            about a tenth of the gap between winning and losing. It is meant to be a
+            tie-breaker among equally-scoring episodes, so prefer the smallest value
+            that still moves ``marshal/length_penalty/episode_total_mean`` off zero.
+            ``0`` makes the penalty inert without turning the flag off.
+        length_penalty_budget: Hard cap on ``|sum of one seat's length penalty over
+            one episode|``, applied as a proportional rescale of that row's per-turn
+            penalties (so relative charge between turns survives and no sign flips).
+            This is what makes "cannot overwhelm the terminal reward" a *guarantee*
+            rather than a hope, and it is the reason no per-game calibration is
+            needed: the penalty is charged per turn and the backward cumulative
+            return sums a seat's turns, so a 20-turn game would otherwise accumulate
+            four times what a 5-turn game does.
+
+            The smallest gap between two distinct clembench outcomes is 1.0 (SUCCESS
+            ``+1`` / FAILURE ``0`` / ABORTED ``-1``) and the penalty is one-sided, so
+            any ``0 < budget < 1.0`` guarantees it can never reorder two episodes
+            that ended differently -- only rank episodes *within* an outcome class.
+            Default ``0.1``. ``0`` disables the cap and gives up the guarantee.
+            Values ``>= 0.5`` (``LENGTH_PENALTY_SAFE_BUDGET``) are allowed but warned
+            about by the launch script, because they leave no headroom for
+            ``turn_rewards`` (whose own swing is ``2 * turn_reward_budget``) to be on
+            at the same time; keep ``length_penalty_budget + 2 * turn_reward_budget``
+            under 1.0 when both channels run.
+
+            Like ``turn_reward_budget`` it is a safety net, not the operating point:
+            tune ``length_penalty_per_token`` so a typical episode lands under it and
+            watch ``marshal/length_penalty/budget_clip_rate``.
+        length_penalty_coef: DEPRECATED and inert, along with ``length_penalty_bonus``,
+            ``length_penalty_min_len``, ``length_penalty_max_len`` and
+            ``length_penalty_offset``. These five parameterized the previous,
+            threshold-based penalty (a direct port of MARSHAL's Kimi-1.5-style
+            ``compute_length_penalty``: exactly 0 below ``max_len``, linear beyond it).
+            That shape is gone -- see ``advantage.LengthPenaltySpec`` for why -- and the
+            fields survive only so existing YAMLs, pinned resume configs, cluster presets
+            and old manifests keep loading unchanged.
+
+            They are **not** validated and have **no** effect. A config that sets any of
+            them to a non-default value is reported by
+            :meth:`legacy_length_penalty_values` and warned about at startup, so a run
+            cannot quietly believe it is using a calibration that no longer exists.
         row_context_mode: How a multi-turn rollout row's token sequence is assembled.
             Like ``dr_grpo``, this takes effect *regardless of* ``enabled``: it
             governs rollout collection, which both the MARSHAL path and the plain-GRPO
@@ -349,6 +396,10 @@ class MarshalConfig:
     whiten_advantages: bool = False
     dr_grpo: bool = False
     length_penalty: bool = False
+    length_penalty_per_token: float = 2e-5
+    length_penalty_budget: float = 0.1
+    # Inert legacy fields of the old threshold-based penalty; kept loadable only.
+    # See the class docstring under `length_penalty_coef`.
     length_penalty_coef: float = 0.5
     length_penalty_bonus: float = 0.0
     length_penalty_min_len: int = 11
@@ -400,19 +451,32 @@ class MarshalConfig:
                 "Use 0 to disable top-k truncation."
             )
         self.gamma = float(self.gamma)
+        self.length_penalty_per_token = float(self.length_penalty_per_token)
+        self.length_penalty_budget = float(self.length_penalty_budget)
+        # A negative rate would turn the penalty into a *reward* for length, and a
+        # negative budget would make the rescale factor negative and do the same.
+        # Neither is a thing anyone means. (Same rule as turn_reward_scale/budget.)
+        if self.length_penalty_per_token < 0.0:
+            raise ValueError(
+                f"length_penalty_per_token must be >= 0, got "
+                f"{self.length_penalty_per_token}. The minus sign is applied by "
+                "LengthPenaltySpec; use 0 to make the penalty inert, or "
+                "length_penalty: false to switch it off."
+            )
+        if self.length_penalty_budget < 0.0:
+            raise ValueError(
+                f"length_penalty_budget must be >= 0, got {self.length_penalty_budget}. "
+                "Use 0 to remove the per-episode cap (which also gives up the guarantee "
+                "that the penalty cannot outweigh the game outcome)."
+            )
+        # The legacy threshold fields are coerced so an old YAML's types are still
+        # normalized, but deliberately NOT validated: they are inert, so rejecting a
+        # combination they used to reject would only block a config that now runs fine.
         self.length_penalty_coef = float(self.length_penalty_coef)
         self.length_penalty_bonus = float(self.length_penalty_bonus)
         self.length_penalty_min_len = int(self.length_penalty_min_len)
         self.length_penalty_max_len = int(self.length_penalty_max_len)
         self.length_penalty_offset = float(self.length_penalty_offset)
-        # A non-positive span makes the penalty a silent no-op (division guard in
-        # LengthPenaltySpec.penalty_for), which would look like the flag doing
-        # nothing. Fail loudly at construction instead.
-        if self.length_penalty and self.length_penalty_max_len <= self.length_penalty_min_len:
-            raise ValueError(
-                "length_penalty_max_len must be greater than length_penalty_min_len, got "
-                f"{self.length_penalty_max_len} <= {self.length_penalty_min_len}"
-            )
         if self.turn_reward_source not in TURN_REWARD_SOURCES:
             raise ValueError(
                 f"turn_reward_source must be one of {TURN_REWARD_SOURCES}, "
@@ -444,12 +508,38 @@ class MarshalConfig:
         if not self.length_penalty:
             return None
         return {
-            "coef": self.length_penalty_coef,
-            "bonus": self.length_penalty_bonus,
-            "min_len": self.length_penalty_min_len,
-            "max_len": self.length_penalty_max_len,
-            "offset": self.length_penalty_offset,
+            "per_token": self.length_penalty_per_token,
+            "budget": self.length_penalty_budget,
         }
+
+    def legacy_length_penalty_values(self) -> Dict[str, Any]:
+        """Legacy threshold fields this config sets away from their old defaults.
+
+        Empty when nothing was set (the common case). Non-empty means a YAML, preset
+        or CLI flag is still carrying a calibration for the removed threshold-based
+        penalty, which is now inert -- the launch script turns this into one loud
+        startup warning and the manifest records it, so a run can never quietly train
+        under a penalty shape that no longer exists.
+
+        Reported regardless of ``length_penalty``: a config that sets these while the
+        penalty is off is equally out of date, and saying so costs nothing.
+        """
+        return {
+            name: getattr(self, name)
+            for name, default in LEGACY_LENGTH_PENALTY_DEFAULTS.items()
+            if getattr(self, name) != default
+        }
+
+    @property
+    def length_penalty_budget_is_safe(self) -> bool:
+        """Whether the cap still guarantees the penalty cannot reorder two outcomes.
+
+        See ``length_penalty_budget``. A disabled cap (``0``) is *not* safe -- the
+        per-episode total is then unbounded, since the penalty is charged per turn.
+        """
+        if not self.length_penalty:
+            return True
+        return 0.0 < self.length_penalty_budget < LENGTH_PENALTY_SAFE_BUDGET
 
     def turn_reward_component_list(self) -> tuple:
         """``turn_reward_components`` parsed into a tuple; empty means "all"."""

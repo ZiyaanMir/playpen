@@ -73,6 +73,25 @@ def compare(recorded: dict, current: dict) -> tuple[list, list]:
     return drifted, added
 
 
+def length_penalty_reshaped(recorded: dict) -> bool:
+    """Whether resuming would change the *shape* of this run's length penalty.
+
+    The one case ``compare`` cannot see. A run submitted before the penalty was
+    rewritten recorded ``length_penalty: true`` plus the threshold fields
+    (``length_penalty_max_len`` etc.), and none of those values changed -- so no field
+    drifts. What changed is the formula they feed: a hinge that charged nothing below
+    ``max_len`` became a flat per-token cost that charges every turn. The new
+    ``length_penalty_per_token``/``_budget`` fields show up only as "added", i.e. a
+    soft note, which is far too quiet for "the second half of this run is trained
+    under a different reward".
+
+    Detected by their absence from the recorded config, which dates the manifest to
+    before the rewrite. A run that had the penalty *off* is unaffected -- nothing was
+    being shaped either way.
+    """
+    return bool(recorded.get("length_penalty")) and "length_penalty_per_token" not in recorded
+
+
 def main() -> None:
     exp_dir = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("EXP_DIR", "")
     if not exp_dir:
@@ -104,6 +123,33 @@ def main() -> None:
     for field, value in added:
         print(f"[config-check] note: '{field}' did not exist when this run was "
               f"submitted; it defaults to {value}.")
+
+    if length_penalty_reshaped(recorded):
+        print("", file=sys.stderr)
+        print("[config-check] REFUSING TO RESUME -- the length penalty was rewritten "
+              "since this run started.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  This run was submitted with length_penalty: true under the old "
+              "threshold-based", file=sys.stderr)
+        print("  penalty: exactly 0 below length_penalty_max_len "
+              f"({recorded.get('length_penalty_max_len')}), linear beyond it.",
+              file=sys.stderr)
+        print("  It is now a flat per-token cost with no threshold "
+              f"({current.get('length_penalty_per_token')} per token, capped at "
+              f"{current.get('length_penalty_budget')} per episode),", file=sys.stderr)
+        print("  so every turn is charged and the old calibration is inert. No field "
+              "'drifted' --", file=sys.stderr)
+        print("  the values are the same, the formula reading them is not.",
+              file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  Resuming would train the rest of this run under a different reward "
+              "than its first", file=sys.stderr)
+        print("  half. Prefer starting a fresh run. If you accept a run trained two "
+              "ways:", file=sys.stderr)
+        print("  RESUME_FORCE=1 to proceed anyway.", file=sys.stderr)
+        print("", file=sys.stderr)
+        raise SystemExit(1)
+
     if not diffs:
         print(f"[config-check] OK: all {len(recorded)} MARSHAL settings match the ones "
               f"manifest.json recorded at first submission.")

@@ -71,66 +71,93 @@ class RowRollout:
 
 @dataclass(frozen=True)
 class LengthPenaltySpec:
-    """MARSHAL's Kimi-1.5-style per-turn length reward, as a parameter bundle.
+    """A tiny, threshold-free per-token cost on generation length.
 
-    Ported from ``MARSHAL/roll/agentic/rollout/env_manager.py:276-294``
-    (``compute_length_penalty``), whose shipped scale is
-    ``{upper: 0.0, lower: 0.5, min_len: 11, max_len: 2048, coef: 1}``
-    (``env_manager.py:212-218``). Field names here are spelled out; the mapping is:
+    Every generated token costs ``per_token``, from the first one -- there is no
+    "free" length below a threshold and no bonus branch above one, so the penalty
+    for a turn is simply::
 
-    ==================  ==================  ===================================
-    this class          MARSHAL key         meaning
-    ==================  ==================  ===================================
-    ``coef``            ``lower``           scale applied to the *negative* part
-    ``bonus``           ``upper``           scale applied to the *positive* part
-    ``min_len``         ``min_len``         length at which the raw term is
-                                            ``offset``
-    ``max_len``         ``max_len``         length at which the raw term hits 0
-                                            (when ``offset == 1``)
-    ``offset``          ``coef``            vertical offset of the raw term
-    ==================  ==================  ===================================
+        penalty(tokens) = -per_token * tokens        (0 for a turn that generated
+                                                      nothing)
 
-    With MARSHAL's defaults ``bonus == 0`` zeroes the positive branch, so the net
-    effect is a **one-sided linear penalty for generations longer than
-    ``max_len``**, scaled by ``coef`` -- about ``-0.5`` at twice ``max_len``,
-    deliberately "comparable with the winning rewards" (their comment), i.e. on the
-    same scale as clembench's SUCCESS ``+1`` / ABORTED ``-1``.
+    and the whole term is ``<= 0`` by construction: it can only ever discourage
+    length, never pay for it.
 
-    IMPORTANT -- this is a deliberate divergence from MARSHAL's shipped behavior for
-    this class of environment. MARSHAL applies the penalty only to its board-game
-    envs: ``env_manager.py:470-480`` guards the call behind
+    WHY THIS CANNOT OVERWHELM THE TERMINAL REWARD
+    ---------------------------------------------
+    ``per_token`` alone is not a bound -- the penalty is charged *per turn* and the
+    backward cumulative return sums a seat's turns, so what actually competes with
+    the game outcome is the episode total, which grows with turn count. ``budget``
+    bounds exactly that: :func:`row_length_penalties` rescales a row's per-turn
+    penalties proportionally whenever their sum exceeds it, so
+
+        ``|sum of one seat's length penalty over one episode| <= budget``
+
+    holds whatever the game, the turn count or the turn lengths turn out to be. The
+    rescale is proportional, so relative credit between turns survives (a long turn
+    is still charged more than a short one) and no sign is flipped.
+
+    With ``budget`` below 1.0 the penalty can therefore never reorder two episodes
+    that ended differently: the smallest gap between two distinct clembench outcomes
+    (SUCCESS ``+1`` / FAILURE ``0`` / ABORTED ``-1``) is 1.0, and the most the
+    penalty can move an episode's return is ``budget``. It ranks episodes *within*
+    an outcome class -- shorter is better, all else equal -- and the terminal reward
+    keeps deciding everything else. The shipped ``0.1`` leaves that guarantee intact
+    with room to spare, including alongside the dense ``turn_rewards`` channel
+    (whose own worst-case swing is ``2 * turn_reward_budget``; see
+    ``MarshalConfig.length_penalty_budget``).
+
+    The defaults are deliberately far below the bound: at ``2e-5`` per token a
+    500-token turn costs ``-0.01`` and a 10-turn episode of them ``-0.10``, i.e. a
+    tenth of the gap between winning and losing. ``budget`` is a safety net, not the
+    operating point -- tune ``per_token`` so a typical episode lands under it, and
+    watch ``marshal/length_penalty/budget_clip_rate`` (a rate near 1.0 means the cap
+    binds every episode, so only the *shape* of the term survives and its magnitude
+    is being set by ``budget`` rather than by ``per_token``).
+
+    HISTORY -- this replaces the direct port of MARSHAL's Kimi-1.5-style
+    ``compute_length_penalty`` (``roll/agentic/rollout/env_manager.py:276-294``), a
+    hinge that scored exactly 0 below ``max_len`` and fell linearly beyond it. That
+    shape needed per-game calibration of the threshold against the generation cap
+    (get it wrong in either direction and the term was either numerically inert or
+    strong enough to make silence beat winning), and it charged nothing at all for
+    the ordinary-length turns that make up most of a run. A flat per-token cost
+    needs no threshold and no per-game tuning. The old ``length_penalty_coef`` /
+    ``_bonus`` / ``_min_len`` / ``_max_len`` / ``_offset`` config fields are still
+    accepted so existing YAMLs, pinned resume configs and cluster presets keep
+    loading, but they are inert -- see ``MarshalConfig``.
+
+    IMPORTANT -- enabling this at all is a deliberate divergence from MARSHAL's
+    shipped behavior for this class of environment. MARSHAL applies its penalty only
+    to its board-game envs: ``env_manager.py:470-480`` guards the call behind
     ``if not isinstance(env, BaseLanguageBasedEnv)`` with the comment "No
     MARSHAL-imposed reward shaping for free-text envs (e.g. Playpen/clembench)".
-    Enabling it here shapes a reward MARSHAL leaves unshaped, so a run using it is
+    Turning it on here shapes a reward MARSHAL leaves unshaped, so a run using it is
     not a MARSHAL reproduction and should say so.
+
+    Attributes:
+        per_token: reward charged for each generated token. Non-negative; the sign
+            is applied here, so ``2e-5`` means ``-2e-5`` per token.
+        budget: cap on ``|sum of one seat's length penalty over one episode|``.
+            ``0`` disables the cap, which also gives up the guarantee above.
     """
 
-    coef: float = 0.5
-    bonus: float = 0.0
-    min_len: int = 11
-    max_len: int = 2048
-    offset: float = 1.0
+    per_token: float = 2e-5
+    budget: float = 0.1
 
     def penalty_for(self, token_length: int) -> float:
-        """The length reward for a single turn of ``token_length`` generated tokens.
+        """The (negative) length reward for one turn of ``token_length`` tokens.
+
+        This is the *uncapped* per-turn term; the episode-level ``budget`` is
+        applied across a whole row by :func:`row_length_penalties`.
 
         Returns 0.0 for a turn that generated nothing -- there is no response to
-        penalize, and with a nonzero ``bonus`` the raw term would otherwise hand a
-        *reward* to a turn that never happened.
+        charge for, and the ``-1`` end position an empty generation records would
+        otherwise be treated as a real turn.
         """
         if token_length <= 0:
             return 0.0
-        span = float(self.max_len - self.min_len)
-        if span <= 0.0:
-            return 0.0
-        reward = self.offset - (token_length - self.min_len) / span
-        # Two independent `if`s, mirroring MARSHAL's own structure (the branches are
-        # mutually exclusive, so this is the same as if/elif).
-        if reward > 0:
-            reward *= self.bonus
-        if reward < 0:
-            reward *= self.coef
-        return float(reward)
+        return -float(self.per_token) * float(token_length)
 
 
 def turn_token_lengths(
@@ -163,13 +190,45 @@ def turn_token_lengths(
     return lengths
 
 
+def row_length_penalties(
+    owner_mask: Sequence[int],
+    turn_end_positions: Sequence[int],
+    spec: LengthPenaltySpec,
+) -> tuple[List[float], bool]:
+    """One row's per-turn length penalties, after the episode budget cap.
+
+    A row is one seat's trajectory within one episode, which is the unit the cap is
+    defined over: the backward cumulative return sums a seat's turns, so the row
+    total is what competes with the terminal reward.
+
+    Returns ``(penalties, clipped)`` -- ``penalties`` aligned with
+    ``turn_end_positions``, and ``clipped`` saying whether the budget actually bound
+    this row (the trainer logs it as ``budget_clip_rate``; a rate near 1.0 means
+    ``per_token`` is set too high and only the shape of the term is surviving).
+
+    The cap is a *proportional* rescale of the whole row rather than a per-turn
+    clip, so the relative charge between turns is preserved and no sign flips --
+    same rule as ``turn_rewards.TurnRewardTracker.finalize``.
+    """
+    penalties = [
+        spec.penalty_for(length)
+        for length in turn_token_lengths(owner_mask, turn_end_positions)
+    ]
+    magnitude = abs(sum(penalties))
+    clipped = spec.budget > 0.0 and magnitude > spec.budget
+    if clipped:
+        factor = spec.budget / magnitude
+        penalties = [p * factor for p in penalties]
+    return penalties, clipped
+
+
 def apply_length_penalty(
     turn_rewards: Sequence[float],
     owner_mask: Sequence[int],
     turn_end_positions: Sequence[int],
     spec: LengthPenaltySpec,
 ) -> List[float]:
-    """Add the per-turn length reward to each of a row's turn rewards.
+    """Add the per-turn length penalty to each of a row's turn rewards.
 
     Mirrors MARSHAL's ``num_actions_info['reward'] += format_reward +
     length_penalty`` (``env_manager.py:770-771``): the penalty is folded into the
@@ -177,10 +236,10 @@ def apply_length_penalty(
     normalization, ``whiten_rewards``, the backward cumulative sum and the per-seat
     pooling) sees it, exactly as in MARSHAL.
     """
-    lengths = turn_token_lengths(owner_mask, turn_end_positions)
+    penalties, _ = row_length_penalties(owner_mask, turn_end_positions, spec)
     return [
-        float(reward) + spec.penalty_for(length)
-        for reward, length in zip(turn_rewards, lengths)
+        float(reward) + penalty
+        for reward, penalty in zip(turn_rewards, penalties)
     ]
 
 
@@ -439,8 +498,10 @@ def compute_marshal_advantages(
 
     ``length_penalty`` (``None`` = off, the default) is a :class:`LengthPenaltySpec`
     applied to each turn's reward before anything else, matching where MARSHAL adds
-    it (``env_manager.py:770-771``). See that class for the formula and for why
-    enabling it on a clembench game is a deliberate divergence from MARSHAL.
+    it (``env_manager.py:770-771``). It is a small per-token cost with no threshold,
+    capped per row so the episode total can never outweigh the terminal reward. See
+    that class for the formula and for why enabling it on a clembench game is a
+    deliberate divergence from MARSHAL.
 
     ``whiten_rewards`` / ``whiten_advantages`` mirror the same-named ROLL flags
     that every shipped MARSHAL ``*_selfplay.yaml`` sets to true (they are framework

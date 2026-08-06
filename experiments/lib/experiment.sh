@@ -61,13 +61,13 @@ exp_load_preset() {
     # the preset's 200-step run. So we save what the caller set, source the preset,
     # then put the caller's values back on top.
     #
-    # `${!v+set}` tests for *set*, not non-empty, so an intentional `LP_COEF=` (meaning
+    # `${!v+set}` tests for *set*, not non-empty, so an intentional `LP_PER_TOKEN=` (meaning
     # "leave this to the YAML") is preserved rather than treated as absent.
     local _override_names=() _override_vals=() _v _i
     for _v in MODEL MARSHAL_CONFIG \
               NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL \
+              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
@@ -109,8 +109,17 @@ exp_load_preset() {
     VLLM_UTIL="${VLLM_UTIL:-0.30}"
     VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 
-    # Length penalty. Empty LP_MAX_LEN/LP_COEF => don't pass the flag, so the YAML
-    # value stands. See experiments/README.md for how these were calibrated.
+    # Length penalty: a flat per-token cost, capped per episode. Empty
+    # LP_PER_TOKEN/LP_BUDGET => don't pass the flag, so the YAML value stands. No
+    # per-game calibration is needed any more (the cap makes the episode total
+    # game-independent), so presets set neither by default.
+    LP_PER_TOKEN="${LP_PER_TOKEN:-}"
+    LP_BUDGET="${LP_BUDGET:-}"
+
+    # DEPRECATED and inert: these configured the old threshold-based penalty. Still
+    # forwarded (so an existing preset or command line runs unchanged) and still
+    # recorded in the manifest, which flags them as ignored -- train_selfplay.py
+    # prints the same warning at startup.
     LP_MAX_LEN="${LP_MAX_LEN:-}"
     LP_COEF="${LP_COEF:-}"
 
@@ -239,7 +248,7 @@ exp_load_preset() {
     export GAME MODEL MARSHAL_CONFIG \
            NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_MAX_LEN LP_COEF UNIQUE_POOL \
+           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL \
            TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
            TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
@@ -965,7 +974,8 @@ exp_banner() {
         echo "batch       = ${PER_DEVICE_BATCH:-?} x ${GRAD_ACCUM:-?} accum, "\
 "${NUM_GENERATIONS:-?} generations"
         echo "max_compl   = ${MAX_COMPLETION_LENGTH:-?} tokens/turn"
-        echo "len_penalty = max_len=${LP_MAX_LEN:-<yaml>} coef=${LP_COEF:-<yaml>}"
+        echo "len_penalty = per_token=${LP_PER_TOKEN:-<yaml>} budget=${LP_BUDGET:-<yaml>}"\
+"${LP_MAX_LEN:+  [LP_MAX_LEN=$LP_MAX_LEN IGNORED]}${LP_COEF:+  [LP_COEF=$LP_COEF IGNORED]}"
         echo "turn_rewards= ${TR_ENABLE:-<yaml>} scale=${TR_SCALE:-<yaml>} "\
 "budget=${TR_BUDGET:-<yaml>} source=${TR_SOURCE:-<yaml>}"
         if [ "${WB_ENABLE:-1}" = "1" ] && [ "${WB_MODE:-auto}" != "disabled" ]; then

@@ -184,6 +184,14 @@ def resolve_config() -> tuple[dict, str | None]:
         return {}, f"could not load {path}: {exc}"
 
     overrides = {}
+    if _env("LP_PER_TOKEN"):
+        overrides["length_penalty_per_token"] = float(_env("LP_PER_TOKEN"))
+    if _env("LP_BUDGET"):
+        overrides["length_penalty_budget"] = float(_env("LP_BUDGET"))
+    # Inert legacy knobs of the old threshold-based penalty. Still recorded, because
+    # train.sh still forwards them and a manifest that dropped them would hide the
+    # fact that a preset is asking for a calibration that no longer applies --
+    # _length_penalty_summary reports them under `legacy_fields_ignored`.
     if _env("LP_MAX_LEN"):
         overrides["length_penalty_max_len"] = int(_env("LP_MAX_LEN"))
     if _env("LP_COEF"):
@@ -270,53 +278,92 @@ def _wandb_summary() -> dict:
     }
 
 
+def _legacy_length_penalty_fields(cfg: dict) -> dict:
+    """Legacy threshold fields this config sets away from their (inert) defaults.
+
+    Mirrors ``MarshalConfig.legacy_length_penalty_values`` but reads the resolved
+    dict, so it works without importing torch. Reported in every manifest, penalty
+    on or off: a preset still exporting LP_MAX_LEN/LP_COEF is out of date either way,
+    and the whole point of the manifest is that a run never looks like it used a
+    setting it ignored.
+    """
+    defaults = {
+        "length_penalty_coef": 0.5,
+        "length_penalty_bonus": 0.0,
+        "length_penalty_min_len": 11,
+        "length_penalty_max_len": 2048,
+        "length_penalty_offset": 1.0,
+    }
+    return {
+        name: cfg[name]
+        for name, default in defaults.items()
+        if name in cfg and cfg[name] != default
+    }
+
+
 def _length_penalty_summary(cfg: dict) -> dict:
     """What the penalty is actually worth, in reward units, for this run.
 
     A penalty is easy to enable and hard to notice doing nothing, so the manifest
-    records the two numbers that make it obvious: the worst a single turn can
-    score (generation is capped at max_completion_length, so this is the maximum
-    reachable, not a theoretical limit) and the per-episode total across all turns.
+    records the numbers that make it obvious: what one generation-capped turn costs
+    (generation is capped at max_completion_length, so this is the maximum reachable
+    per turn, not a theoretical limit) and the per-episode total the game outcome
+    actually competes with.
+
+    Unlike the old threshold-based penalty, the per-episode figure has a hard
+    analytic bound -- ``length_penalty_budget`` -- so this is a real guarantee rather
+    than the per-game estimate it used to be.
     """
+    legacy = _legacy_length_penalty_fields(cfg)
     if not cfg.get("length_penalty"):
-        return {"enabled": False}
+        out = {"enabled": False}
+        if legacy:
+            out["legacy_fields_ignored"] = legacy
+        return out
     if not cfg.get("enabled"):
         # The penalty is applied inside compute_marshal_advantages, which the plain-GRPO
         # path never calls. Reporting its nominal magnitude here would overstate what
         # this run does. train_selfplay.py prints the same warning at startup.
-        return {
+        out = {
             "enabled": True,
             "effective": False,
             "note": "MARSHAL advantage path is off (enabled=false), so the length "
                     "penalty has NO effect on this run.",
         }
-    try:
-        from playpen.marshal.advantage import LengthPenaltySpec
-    except Exception:
-        return {"enabled": True, "note": "torch unavailable at submit time"}
+        if legacy:
+            out["legacy_fields_ignored"] = legacy
+        return out
 
-    spec = LengthPenaltySpec(
-        coef=cfg["length_penalty_coef"], bonus=cfg["length_penalty_bonus"],
-        min_len=cfg["length_penalty_min_len"], max_len=cfg["length_penalty_max_len"],
-        offset=cfg["length_penalty_offset"],
-    )
+    per_token = float(cfg.get("length_penalty_per_token", 0.0))
+    budget = float(cfg.get("length_penalty_budget", 0.0))
     try:
         cap = int(_env("MAX_COMPLETION_LENGTH", "0"))
     except ValueError:
         cap = 0
-    if cap <= 0:
-        return {"enabled": True}
-    per_turn = spec.penalty_for(cap)
-    # Turns per seat is the game's own round limit, which MAX_TURNS only bounds.
-    turns = {"dond": 5, "guesswhat": 8, "taboo": 3}.get(_env("GAME"), 0)
     out = {
         "enabled": True,
-        "max_reachable_per_turn": round(per_turn, 5),
-        "per_turn_generation_cap": cap,
+        "per_token": per_token,
+        # Analytic, not estimated: the budget rescale bounds the row total whatever
+        # the game and the turn count turn out to be.
+        "max_per_episode": round(budget, 5) if budget else None,
+        # 1.0 is the smallest gap between two clembench outcomes; the penalty is
+        # one-sided, so a budget under it cannot reorder two different outcomes.
+        # 0 means no cap at all, hence no guarantee.
+        "preserves_outcome_ordering": bool(0.0 < budget < 1.0),
     }
-    if turns:
-        out["est_per_episode_total"] = round(per_turn * turns, 5)
-        out["est_turns_per_seat"] = turns
+    if cap > 0:
+        out["max_reachable_per_turn"] = round(-per_token * cap, 5)
+        out["per_turn_generation_cap"] = cap
+        # Turns per seat is the game's own round limit, which MAX_TURNS only bounds.
+        turns = {"dond": 5, "guesswhat": 8, "taboo": 3}.get(_env("GAME"), 0)
+        if turns:
+            worst = -per_token * cap * turns
+            if budget:
+                worst = max(worst, -budget)  # the cap, if it binds first
+            out["est_per_episode_total"] = round(worst, 5)
+            out["est_turns_per_seat"] = turns
+    if legacy:
+        out["legacy_fields_ignored"] = legacy
     return out
 
 
@@ -449,33 +496,52 @@ def main() -> None:
             "-- length penalty ---------------------------------------------------",
             f"  configured ON, but INACTIVE: {lpe['note']}",
         ]
-    elif lpe.get("enabled") and "max_reachable_per_turn" in lpe:
+    elif lpe.get("enabled"):
+        cap_s = (f"{-lpe['max_per_episode']:+.4f}"
+                 if lpe.get("max_per_episode") else "UNCAPPED")
         lines += [
             "",
             "-- length penalty, in reward units (game outcome is +1 / 0 / -1) -----",
-            f"  worst a single turn can score  {lpe['max_reachable_per_turn']:+.4f}"
-            f"   (turns are capped at {lpe['per_turn_generation_cap']} tokens)",
+            f"  charged per generated token    {-lpe['per_token']:+.2e}   (no threshold)",
+            f"  per-episode total, per seat    {cap_s} at worst (hard cap)",
         ]
+        if "max_reachable_per_turn" in lpe:
+            lines.append(
+                f"  worst a single turn can score  {lpe['max_reachable_per_turn']:+.4f}"
+                f"   (turns are capped at {lpe['per_turn_generation_cap']} tokens)"
+            )
         if "est_per_episode_total" in lpe:
             lines.append(
-                f"  estimated per-episode total    {lpe['est_per_episode_total']:+.4f}"
-                f"   (~{lpe['est_turns_per_seat']} turns/seat)"
+                f"  expected per-episode total     {lpe['est_per_episode_total']:+.4f}"
+                f"   (~{lpe['est_turns_per_seat']} turns/seat, at the generation cap)"
             )
-            total = lpe["est_per_episode_total"]
-            if abs(total) < 0.05:
+            if abs(lpe["est_per_episode_total"]) < 0.002:
                 lines.append(
-                    "  WARNING: that is ~0 against a +-1 outcome -- the penalty is "
-                    "effectively inert.\n"
-                    "           Lower LP_MAX_LEN (rule of thumb: max_completion_length/2) "
-                    "or raise LP_COEF."
+                    "  WARNING: that is ~0 even for maximally long turns -- the penalty "
+                    "is effectively inert.\n"
+                    "           Raise LP_PER_TOKEN."
                 )
-            elif abs(total) > 1.0:
-                lines.append(
-                    "  WARNING: that EXCEEDS the +-1 game outcome -- staying silent can "
-                    "now beat winning.\n"
-                    "           Raise LP_MAX_LEN or lower LP_COEF so the episode total "
-                    "stays under ~0.5."
-                )
+        if lpe.get("preserves_outcome_ordering"):
+            lines.append(
+                "  The cap is below the 1.0 gap between two clembench outcomes, so the "
+                "penalty can only\n  rank episodes WITHIN an outcome class -- it can "
+                "never make staying silent beat winning."
+            )
+        else:
+            lines.append(
+                "  WARNING: with no cap (or a cap >= 1.0) the per-episode total can reach "
+                "the +-1 game\n           outcome, and staying silent can beat winning. "
+                "Set LP_BUDGET below 1.0."
+            )
+    if lpe.get("legacy_fields_ignored"):
+        lines += [
+            "",
+            "-- length penalty: DEPRECATED fields set, and IGNORED ----------------",
+            "  " + ", ".join(f"{k}={v}" for k, v in sorted(lpe["legacy_fields_ignored"].items())),
+            "  These parameterized the old threshold-based penalty (0 below max_len,",
+            "  linear beyond). It is now a flat per-token cost with no threshold --",
+            "  use LP_PER_TOKEN / LP_BUDGET. Nothing in this run read the values above.",
+        ]
 
     tre = manifest["turn_reward_effect"]
     if tre.get("enabled"):

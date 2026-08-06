@@ -120,6 +120,12 @@ ARGS+=( --resume-from-checkpoint "$SEGMENT_RESUME" )
 [ "${SEGMENT_STOP_AT:-0}" -lt "${MAX_STEPS:-0}" ] 2>/dev/null \
     && ARGS+=( --stop-at-step "$SEGMENT_STOP_AT" )
 [ "${GRAD_CKPT:-1}" = "1" ] && ARGS+=( --gradient-checkpointing )
+# Length penalty. Empty => don't pass the flag, so the YAML value stands.
+[ -n "${LP_PER_TOKEN:-}" ] && ARGS+=( --length-penalty-per-token "$LP_PER_TOKEN" )
+[ -n "${LP_BUDGET:-}"    ] && ARGS+=( --length-penalty-budget "$LP_BUDGET" )
+# DEPRECATED and inert (the penalty no longer has a threshold), still forwarded so an
+# existing preset or command line runs unchanged. train_selfplay.py warns that they
+# are ignored, and the manifest records them under legacy_fields_ignored.
 [ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )
 [ -n "${LP_COEF:-}"    ] && ARGS+=( --length-penalty-coef "$LP_COEF" )
 # marshal_exact's torch.unique distinct-value pooling. Tri-state like TR_ENABLE

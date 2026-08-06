@@ -75,6 +75,10 @@ MARSHAL_CLI_FIELDS = (
     "episode_pairing",
     "dr_grpo",
     "length_penalty",
+    "length_penalty_per_token",
+    "length_penalty_budget",
+    # Inert legacy fields; still accepted so cluster presets and old command lines
+    # keep running. See MarshalConfig.length_penalty_coef.
     "length_penalty_coef",
     "length_penalty_bonus",
     "length_penalty_min_len",
@@ -207,34 +211,42 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--episode-pairing", choices=EPISODE_PAIRING_MODES, default=None,
                    help="How the two seats of an episode are paired into rollout rows.")
 
-    # Length penalty (MARSHAL's compute_length_penalty; overrides the YAML fields).
-    # Off by default, which is also the MARSHAL-faithful setting: MARSHAL applies this
-    # only to its board-game envs and explicitly skips it for free-text ones like
-    # clembench (env_manager.py:470-480). Turn it on to discipline a reasoning model
-    # that overruns its per-turn budget -- and say so when reporting the run.
+    # Length penalty (playpen/marshal/advantage.py:LengthPenaltySpec; overrides the
+    # YAML fields). A small per-token cost with NO threshold, capped per episode so it
+    # cannot outweigh the terminal reward. Off by default, which is also the
+    # MARSHAL-faithful setting: MARSHAL applies its penalty only to its board-game envs
+    # and explicitly skips it for free-text ones like clembench (env_manager.py:470-480).
+    # Turn it on as gentle pressure against padding -- and say so when reporting the run.
     lenpen = p.add_mutually_exclusive_group()
     lenpen.add_argument("--length-penalty", dest="length_penalty", action="store_true", default=None,
                         help="Force the per-turn length penalty ON (overrides the YAML 'length_penalty').")
     lenpen.add_argument("--no-length-penalty", dest="length_penalty", action="store_false",
                         help="Force the per-turn length penalty OFF.")
+    p.add_argument("--length-penalty-per-token", type=float, default=None,
+                   help="Reward charged per generated token, from the first one (YAML "
+                        "'length_penalty_per_token', ships 2e-5 = -0.02 per 1000 tokens). "
+                        "Judge it against the +-1 outcome: a 10-turn episode of 500-token "
+                        "turns costs -0.10. 0 makes the penalty inert.")
+    p.add_argument("--length-penalty-budget", type=float, default=None,
+                   help="Cap on |sum of one seat's length penalty over one episode| (YAML "
+                        "'length_penalty_budget', ships 0.1). Under 1.0 this GUARANTEES the "
+                        "penalty cannot reorder two episodes with different clembench "
+                        "outcomes. 0 disables the cap and that guarantee.")
+
+    # DEPRECATED, inert. These parameterized the previous threshold-based penalty
+    # (a port of MARSHAL's compute_length_penalty). They are still parsed so cluster
+    # presets and old command lines keep running; resolve_marshal_config records them
+    # and main() warns once, loudly, that they do nothing.
     p.add_argument("--length-penalty-coef", type=float, default=None,
-                   help="Penalty magnitude (MARSHAL's 'lower', ships 0.5): at twice the "
-                        "threshold the turn reward is docked by about this much. clembench "
-                        "outcomes are +1/0/-1, so 0.5 is already a strong signal.")
+                   help=argparse.SUPPRESS)
     p.add_argument("--length-penalty-max-len", type=int, default=None,
-                   help="Per-turn token count above which a generation is penalized "
-                        "(MARSHAL's 'max_len', ships 2048). Set near --max-completion-length "
-                        "so only genuine overruns are charged.")
+                   help=argparse.SUPPRESS)
     p.add_argument("--length-penalty-bonus", type=float, default=None,
-                   help="Scale on the positive branch (MARSHAL's 'upper', ships 0.0 = no "
-                        "reward for brevity). Nonzero pays the policy to be short, which "
-                        "with a strict clembench parser can degenerate into empty answers.")
+                   help=argparse.SUPPRESS)
     p.add_argument("--length-penalty-min-len", type=int, default=None,
-                   help="Origin of the penalty slope (MARSHAL's 'min_len', ships 11). "
-                        "Near-irrelevant while --length-penalty-bonus is 0.")
+                   help=argparse.SUPPRESS)
     p.add_argument("--length-penalty-offset", type=float, default=None,
-                   help="Vertical offset of the raw term (MARSHAL's 'coef', ships 1.0). "
-                        "Prefer changing --length-penalty-max-len instead.")
+                   help=argparse.SUPPRESS)
 
     # Dense per-turn rewards (playpen/marshal/turn_rewards.py; overrides the YAML).
     # Off by default, and with it off a run is byte-identical to before this feature
@@ -517,6 +529,68 @@ def wandb_config(args: argparse.Namespace, marshal_config, output_dir: str,
     }
 
 
+def _report_length_penalty(marshal_config, max_completion_length: int) -> None:
+    """Print what the length penalty will actually be worth, and warn.
+
+    The per-token rate is not a number anyone can eyeball against a ``+-1`` game
+    outcome, so this prints the two derived figures that matter: what one
+    generation-capped turn costs, and what a whole episode can cost (which is what
+    the backward cumulative return puts up against the outcome). It also reports
+    inert legacy threshold fields, so a preset still carrying the old per-game
+    calibration says so once instead of quietly doing nothing.
+    """
+    if not marshal_config.length_penalty:
+        print("[length_penalty] off (MARSHAL-faithful default for clembench games)")
+        _report_legacy_length_penalty_fields(marshal_config)
+        return
+
+    from playpen.marshal.advantage import LengthPenaltySpec
+
+    spec = LengthPenaltySpec(**marshal_config.length_penalty_kwargs())
+    per_capped_turn = spec.penalty_for(max_completion_length)
+    print(f"[length_penalty] ON per_token={spec.per_token:g} budget={spec.budget} "
+          f"(no threshold: every generated token is charged)")
+    print(f"[length_penalty] a turn at the {max_completion_length}-token generation cap "
+          f"scores {per_capped_turn:+.4f}; an episode's total is capped at "
+          f"{-spec.budget:+.3f} against a +-1 outcome"
+          + ("" if spec.budget else " (UNCAPPED)"))
+    if spec.per_token == 0.0:
+        print("[length_penalty] WARNING: per_token is 0, so the penalty is INERT. Set "
+              "--length-penalty-per-token, or --no-length-penalty to be explicit.")
+    if not marshal_config.length_penalty_budget_is_safe:
+        print("[length_penalty] WARNING: budget >= 0.5 (or 0 = uncapped). Under 1.0 the "
+              "per-episode total stays below the smallest gap between two clembench "
+              "outcomes (1.0), so the penalty can only rank episodes within an outcome "
+              "class and never make staying silent beat winning. Above it, it can -- and "
+              "0.5 already leaves no room for turn_rewards (swing 2 x budget) as well.")
+    if not marshal_config.enabled:
+        print("[length_penalty] WARNING: --no-marshal is set, so the MARSHAL advantage "
+              "path is off and the length penalty has NO effect (it is applied inside "
+              "compute_marshal_advantages).")
+    print("[length_penalty] NOTE: MARSHAL skips this penalty for free-text envs like "
+          "clembench (env_manager.py:470-480); this run is a deliberate divergence.")
+    print("[length_penalty] watch marshal/length_penalty/episode_total_mean (what the "
+          "outcome competes with) and .../budget_clip_rate, NOT the per-turn mean.")
+    _report_legacy_length_penalty_fields(marshal_config)
+
+
+def _report_legacy_length_penalty_fields(marshal_config) -> None:
+    """Say out loud that the old threshold knobs are set but do nothing.
+
+    Silence here is exactly the failure mode this project has been bitten by before:
+    a cluster preset exports LP_MAX_LEN/LP_COEF, the manifest dutifully records them,
+    and a reader concludes the run used a calibration it never applied.
+    """
+    legacy = marshal_config.legacy_length_penalty_values()
+    if not legacy:
+        return
+    print("[length_penalty] WARNING: these config fields are DEPRECATED and IGNORED -- "
+          + ", ".join(f"{k}={v}" for k, v in sorted(legacy.items())))
+    print("[length_penalty]          they parameterized the old threshold-based penalty "
+          "(0 below max_len, linear beyond). The penalty is now a flat per-token cost "
+          "with no threshold; use --length-penalty-per-token / --length-penalty-budget.")
+
+
 def _report_turn_rewards(marshal_config, env) -> None:
     """Print what the dense per-turn reward channel will actually do, and warn.
 
@@ -712,25 +786,7 @@ def main() -> None:
               "the policy generated under from turn 2 onward. TRL's vLLM "
               "importance-sampling correction then collapses the gradient. Use it only "
               "to reproduce an old run.")
-    if marshal_config.length_penalty:
-        from playpen.marshal.advantage import LengthPenaltySpec
-
-        _spec = LengthPenaltySpec(**marshal_config.length_penalty_kwargs())
-        _probe = marshal_config.length_penalty_max_len * 2
-        print(f"[length_penalty] ON coef={marshal_config.length_penalty_coef} "
-              f"max_len={marshal_config.length_penalty_max_len} "
-              f"bonus={marshal_config.length_penalty_bonus} "
-              f"min_len={marshal_config.length_penalty_min_len} "
-              f"offset={marshal_config.length_penalty_offset} "
-              f"-> a {_probe}-token turn scores {_spec.penalty_for(_probe):+.3f}")
-        if not marshal_config.enabled:
-            print("[length_penalty] WARNING: --no-marshal is set, so the MARSHAL advantage "
-                  "path is off and the length penalty has NO effect (it is applied inside "
-                  "compute_marshal_advantages).")
-        print("[length_penalty] NOTE: MARSHAL skips this penalty for free-text envs like "
-              "clembench (env_manager.py:470-480); this run is a deliberate divergence.")
-    else:
-        print("[length_penalty] off (MARSHAL-faithful default for clembench games)")
+    _report_length_penalty(marshal_config, args.max_completion_length)
     print(f"[kl] beta={args.kl_beta}" + (" (disabled)" if args.kl_beta == 0.0 else ""))
     _dr_overrides = marshal_config.trl_grpo_overrides()
     print(f"[dr_grpo] enabled={marshal_config.dr_grpo}"

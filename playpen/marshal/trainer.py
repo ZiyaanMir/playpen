@@ -31,6 +31,7 @@ from playpen.marshal.advantage import (
     LengthPenaltySpec,
     RowRollout,
     compute_marshal_advantages,
+    row_length_penalties,
     turn_token_lengths,
 )
 from playpen.marshal.config import MarshalConfig
@@ -642,21 +643,35 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
     ) -> None:
         """Log turn lengths and the penalty they incur.
 
-        Worth having because the penalty is silent when it does nothing: with
-        MARSHAL's defaults every turn shorter than ``max_len`` scores exactly 0, so
-        ``penalty/mean == 0`` and ``over_rate == 0`` is the signature of a threshold
-        set too high to bite, which is otherwise indistinguishable from the flag
-        not being wired up.
+        Worth having because the penalty is deliberately tiny, so it is easy to
+        confuse "correctly small" with "not wired up". The number to read is
+        ``episode_total_mean``: the per-turn charge is not what competes with the
+        ``+-1`` outcome, the row total is (the backward cumulative return sums a
+        seat's turns). ``budget_clip_rate`` is the other end of the same question --
+        near 1.0 means ``per_token`` is high enough that the cap, not the game, is
+        setting the magnitude.
+
+        Penalties are read back through :func:`row_length_penalties` rather than
+        recomputed from :meth:`LengthPenaltySpec.penalty_for`, so what is logged is
+        what was actually added to the rewards, budget rescale included.
         """
         try:
             lengths: List[int] = []
             penalties: List[float] = []
+            episode_totals: List[float] = []
+            clips: List[float] = []
             for row in rows:
-                for length in turn_token_lengths(row.owner_mask, row.turn_end_positions):
+                row_penalties, clipped = row_length_penalties(
+                    row.owner_mask, row.turn_end_positions, spec
+                )
+                turn_lengths = turn_token_lengths(row.owner_mask, row.turn_end_positions)
+                episode_totals.append(sum(row_penalties))
+                clips.append(1.0 if clipped else 0.0)
+                for length, penalty in zip(turn_lengths, row_penalties):
                     if length <= 0:
                         continue  # a turn that generated nothing is not a data point
                     lengths.append(length)
-                    penalties.append(spec.penalty_for(length))
+                    penalties.append(penalty)
             if not lengths:
                 return
             mode = "train"
@@ -665,8 +680,14 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
             metrics["marshal/length_penalty/min"].append(min(penalties))
             metrics["marshal/turn_tokens/mean"].append(sum(lengths) / len(lengths))
             metrics["marshal/turn_tokens/max"].append(max(lengths))
-            over = sum(1 for length in lengths if length > spec.max_len)
-            metrics["marshal/length_penalty/over_rate"].append(over / len(lengths))
+            # What the outcome actually competes with, per seat per episode.
+            metrics["marshal/length_penalty/episode_total_mean"].append(
+                sum(episode_totals) / len(episode_totals)
+            )
+            metrics["marshal/length_penalty/episode_total_min"].append(min(episode_totals))
+            metrics["marshal/length_penalty/budget_clip_rate"].append(
+                sum(clips) / len(clips)
+            )
         except Exception:
             # Metrics logging must never break training.
             pass

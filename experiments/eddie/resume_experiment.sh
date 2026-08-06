@@ -76,7 +76,7 @@ fi
 # The file is written as bare `NAME=value` assignments. train.sh reads them as shell
 # variables, so it never noticed -- but check_resume_config.py below is a SUBPROCESS,
 # and a subprocess sees only exported names. Without this it resolves the config with
-# LP_COEF, EXTRA_TRAIN_ARGS, TR_* and the rest all missing, reports five fields of
+# LP_PER_TOKEN, EXTRA_TRAIN_ARGS, TR_* and the rest all missing, reports five fields of
 # "drift" that are really its own blindness, and teaches you to reach for
 # RESUME_FORCE=1 -- which would defeat the whole check.
 set -a
@@ -185,7 +185,7 @@ cp "$ENV_FILE" "$RESUME_ENV_FILE"
     echo ""
     echo "# --- resume overrides, $(date --iso-8601=seconds) ---"
     for _v in TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM MARSHAL_CONFIG \
-              LP_MAX_LEN LP_COEF UNIQUE_POOL EXTRA_TRAIN_ARGS \
+              LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL EXTRA_TRAIN_ARGS \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               EVAL_SHARD_SIZE WB_ID WB_RESUME \
               EVAL_BASE PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE \

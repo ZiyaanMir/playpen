@@ -133,10 +133,22 @@ for exp in sorted(glob.glob(os.path.join(runs, "*"))):
     lp = man.get("length_penalty_effect", {})
     lp_s = "off"
     if lp.get("enabled"):
+        # The cap, not the estimate: it is the number that bounds what the penalty
+        # can be worth against the outcome, and it is exact rather than per-game.
+        cap = lp.get("max_per_episode")
         total = lp.get("est_per_episode_total")
-        lp_s = f"{total:+.2f}/ep" if isinstance(total, (int, float)) else "on"
-        if isinstance(total, (int, float)) and abs(total) < 0.05:
+        if isinstance(cap, (int, float)):
+            lp_s = f"<={-cap:+.2f}/ep"
+        elif isinstance(total, (int, float)):
+            lp_s = f"{total:+.2f}/ep"
+        else:
+            lp_s = "on"
+        # Deliberately small is the design; "would be zero even for the longest
+        # possible turns" is the failure this flags.
+        if isinstance(total, (int, float)) and abs(total) < 0.002:
             lp_s += " INERT"
+    if lp.get("legacy_fields_ignored"):
+        lp_s += " [legacy fields ignored]"
 
     rows.append({
         "id": os.path.basename(exp),

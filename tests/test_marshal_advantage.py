@@ -19,6 +19,7 @@ from playpen.marshal.advantage import (
     compute_marshal_advantages,
     masked_whiten,
     reinforce_returns,
+    row_length_penalties,
     turn_token_lengths,
 )
 from playpen.marshal.config import MarshalConfig
@@ -636,59 +637,141 @@ class TestTurnTokenLengths(unittest.TestCase):
 
 
 class TestLengthPenaltySpec(unittest.TestCase):
-    """MARSHAL's compute_length_penalty (env_manager.py:276-294), shipped defaults."""
+    """A flat per-token cost: no threshold, no free length, never positive."""
 
-    def test_matches_marshal_formula_on_overlong_turn(self):
-        spec = LengthPenaltySpec()  # upper=0, lower=0.5, min_len=11, max_len=2048, coef=1
-        # raw = 1 - (4096-11)/(2048-11) = -2.00540...; negative branch scales by 0.5.
-        expected = (1.0 - (4096 - 11) / (2048 - 11)) * 0.5
-        self.assertAlmostEqual(spec.penalty_for(4096), expected, places=9)
-        self.assertAlmostEqual(spec.penalty_for(4096), -0.50270, places=4)
+    def test_linear_in_token_count(self):
+        spec = LengthPenaltySpec(per_token=1e-4)
+        self.assertAlmostEqual(spec.penalty_for(1), -1e-4, places=12)
+        self.assertAlmostEqual(spec.penalty_for(500), -0.05, places=12)
+        self.assertAlmostEqual(spec.penalty_for(1000), -0.10, places=12)
 
-    def test_default_bonus_zeroes_the_positive_branch(self):
+    def test_no_threshold_every_turn_is_charged(self):
+        # The defining change from the old hinge: a short turn is NOT free.
         spec = LengthPenaltySpec()
-        # Anything at or under max_len earns exactly 0, not a bonus.
-        for length in (1, 11, 500, 2047):
-            self.assertEqual(spec.penalty_for(length), 0.0)
+        for length in (1, 11, 500, 2047, 4096):
+            self.assertLess(spec.penalty_for(length), 0.0)
 
-    def test_penalty_only_past_the_threshold(self):
-        spec = LengthPenaltySpec(max_len=1000)
-        self.assertEqual(spec.penalty_for(999), 0.0)
-        self.assertLess(spec.penalty_for(1500), 0.0)
+    def test_never_rewards_length(self):
+        spec = LengthPenaltySpec()
+        self.assertTrue(all(spec.penalty_for(n) <= 0.0 for n in range(0, 5000, 97)))
 
     def test_monotonically_more_negative_with_length(self):
-        spec = LengthPenaltySpec(max_len=100)
+        spec = LengthPenaltySpec()
         values = [spec.penalty_for(n) for n in (200, 400, 800)]
         self.assertTrue(all(a > b for a, b in zip(values, values[1:])))
 
-    def test_coef_scales_the_penalty(self):
-        weak = LengthPenaltySpec(coef=0.5, max_len=100).penalty_for(500)
-        strong = LengthPenaltySpec(coef=1.0, max_len=100).penalty_for(500)
-        self.assertAlmostEqual(strong, 2 * weak, places=9)
-
-    def test_bonus_enables_the_positive_branch(self):
-        spec = LengthPenaltySpec(bonus=1.0, max_len=100)
-        self.assertGreater(spec.penalty_for(50), 0.0)
+    def test_per_token_scales_the_penalty(self):
+        weak = LengthPenaltySpec(per_token=1e-5).penalty_for(500)
+        strong = LengthPenaltySpec(per_token=2e-5).penalty_for(500)
+        self.assertAlmostEqual(strong, 2 * weak, places=12)
 
     def test_zero_length_turn_scores_nothing(self):
-        # Even with a bonus, a turn that generated nothing must not be rewarded.
-        self.assertEqual(LengthPenaltySpec(bonus=1.0).penalty_for(0), 0.0)
         self.assertEqual(LengthPenaltySpec().penalty_for(0), 0.0)
+        self.assertEqual(LengthPenaltySpec().penalty_for(-1), 0.0)
 
-    def test_degenerate_span_is_a_noop(self):
-        self.assertEqual(LengthPenaltySpec(min_len=100, max_len=100).penalty_for(500), 0.0)
+    def test_zero_rate_is_inert(self):
+        self.assertEqual(LengthPenaltySpec(per_token=0.0).penalty_for(9999), 0.0)
+
+    def test_shipped_default_is_small_against_a_unit_outcome(self):
+        # The point of the default: a long turn is worth ~1% of winning the game.
+        self.assertAlmostEqual(LengthPenaltySpec().penalty_for(500), -0.01, places=9)
+
+
+class TestLengthPenaltyBudget(unittest.TestCase):
+    """The per-episode cap is what makes "cannot outweigh the outcome" a guarantee."""
+
+    def test_uncapped_row_is_untouched(self):
+        spec = LengthPenaltySpec(per_token=1e-4, budget=0.5)
+        row = _multi_turn_row(0, [100, 200], [0.0, 1.0])
+        penalties, clipped = row_length_penalties(
+            row.owner_mask, row.turn_end_positions, spec
+        )
+        self.assertFalse(clipped)
+        self.assertAlmostEqual(penalties[0], -0.01, places=9)
+        self.assertAlmostEqual(penalties[1], -0.02, places=9)
+
+    def test_row_total_never_exceeds_the_budget(self):
+        # 20 turns x 1000 tokens x 1e-4 = -2.0 uncapped, which would swamp a +-1 outcome.
+        spec = LengthPenaltySpec(per_token=1e-4, budget=0.1)
+        row = _multi_turn_row(0, [1000] * 20, [0.0] * 19 + [1.0])
+        penalties, clipped = row_length_penalties(
+            row.owner_mask, row.turn_end_positions, spec
+        )
+        self.assertTrue(clipped)
+        self.assertAlmostEqual(sum(penalties), -0.1, places=9)
+
+    def test_cap_is_proportional_and_preserves_ordering(self):
+        spec = LengthPenaltySpec(per_token=1e-3, budget=0.1)
+        row = _multi_turn_row(0, [100, 300], [0.0, 1.0])
+        penalties, _ = row_length_penalties(row.owner_mask, row.turn_end_positions, spec)
+        # Uncapped: -0.1 and -0.3 (total -0.4) -> scaled by 0.25.
+        self.assertAlmostEqual(penalties[0], -0.025, places=9)
+        self.assertAlmostEqual(penalties[1], -0.075, places=9)
+        self.assertAlmostEqual(penalties[1] / penalties[0], 3.0, places=9)
+        self.assertTrue(all(p <= 0.0 for p in penalties))
+
+    def test_budget_zero_disables_the_cap(self):
+        spec = LengthPenaltySpec(per_token=1e-3, budget=0.0)
+        row = _multi_turn_row(0, [1000, 1000], [0.0, 1.0])
+        penalties, clipped = row_length_penalties(
+            row.owner_mask, row.turn_end_positions, spec
+        )
+        self.assertFalse(clipped)
+        self.assertAlmostEqual(sum(penalties), -2.0, places=9)
+
+    def test_bound_is_independent_of_turn_count(self):
+        # The whole reason the cap exists: a 20-turn game must not accumulate 4x
+        # what a 5-turn game does, or the penalty would need per-game calibration.
+        spec = LengthPenaltySpec(per_token=1e-3, budget=0.1)
+        for turns in (2, 5, 20, 50):
+            row = _multi_turn_row(0, [500] * turns, [0.0] * turns)
+            penalties, _ = row_length_penalties(
+                row.owner_mask, row.turn_end_positions, spec
+            )
+            self.assertLessEqual(abs(sum(penalties)), 0.1 + 1e-9)
+
+    def test_cannot_reorder_two_different_outcomes(self):
+        # The guarantee stated in LengthPenaltySpec: with budget < 1.0, a maximally
+        # penalised WIN still beats an unpenalised LOSS.
+        spec = LengthPenaltySpec(per_token=1e-2, budget=0.1)
+        win = _multi_turn_row(0, [1000] * 10, [0.0] * 9 + [1.0])
+        loss = _multi_turn_row(1, [1], [0.0])
+        win_total = sum(apply_length_penalty(
+            win.turn_rewards, win.owner_mask, win.turn_end_positions, spec))
+        loss_total = sum(apply_length_penalty(
+            loss.turn_rewards, loss.owner_mask, loss.turn_end_positions, spec))
+        self.assertGreater(win_total, loss_total)
+        self.assertGreaterEqual(win_total, 1.0 - spec.budget)
 
 
 class TestApplyLengthPenalty(unittest.TestCase):
     def test_added_per_turn(self):
-        spec = LengthPenaltySpec(min_len=1, max_len=4)
+        # budget high enough not to bind, so this isolates the per-turn charge.
+        spec = LengthPenaltySpec(per_token=1e-2, budget=1.0)
         row = _multi_turn_row(0, [2, 10], [0.0, 1.0])
         got = apply_length_penalty(
             row.turn_rewards, row.owner_mask, row.turn_end_positions, spec
         )
-        self.assertEqual(got[0], 0.0)          # 2 tokens: under threshold, untouched
-        self.assertLess(got[1], 1.0)           # 10 tokens: terminal reward docked
-        self.assertAlmostEqual(got[1], 1.0 + spec.penalty_for(10), places=9)
+        # Every turn is charged now -- including the short one.
+        self.assertAlmostEqual(got[0], -0.02, places=9)
+        self.assertAlmostEqual(got[1], 1.0 - 0.10, places=9)
+
+    def test_terminal_reward_still_dominates(self):
+        spec = LengthPenaltySpec()
+        row = _multi_turn_row(0, [800, 800], [0.0, 1.0])
+        got = apply_length_penalty(
+            row.turn_rewards, row.owner_mask, row.turn_end_positions, spec
+        )
+        self.assertGreater(sum(got), 0.9)
+
+    def test_empty_generation_is_not_charged(self):
+        row = RowRollout(seat=0, completion_len=2, owner_mask=[1, 1],
+                         turn_end_positions=[-1], turn_rewards=[1.0])
+        got = apply_length_penalty(
+            row.turn_rewards, row.owner_mask, row.turn_end_positions,
+            LengthPenaltySpec(),
+        )
+        self.assertEqual(got, [1.0])
 
 
 class TestLengthPenaltyEndToEnd(unittest.TestCase):
@@ -712,27 +795,46 @@ class TestLengthPenaltyEndToEnd(unittest.TestCase):
             _multi_turn_row(1, [10, 20], [0.0, 1.0]),
         ]
         seq_len = 6100
-        spec = LengthPenaltySpec(max_len=1024)
         adv = compute_marshal_advantages(
-            list(rows), seq_len=seq_len, length_penalty=spec, norm_mode="mean"
+            list(rows), seq_len=seq_len, length_penalty=LengthPenaltySpec(),
+            norm_mode="mean",
         )
         # Seat 0's rambling row must end up below its concise sibling.
         self.assertLess(adv[0, 0].item(), adv[1, 0].item())
         # Seat 1 rows are identical to each other, so mean-centering zeroes them.
         self.assertAlmostEqual(adv[2, 0].item(), 0.0, places=5)
 
-    def test_no_effect_when_every_turn_is_short(self):
-        rows = [_multi_turn_row(0, [5, 5], [0.0, 1.0]), _multi_turn_row(1, [5, 5], [0.0, -1.0])]
-        plain = compute_marshal_advantages(list(rows), seq_len=12)
-        penalised = compute_marshal_advantages(
-            list(rows), seq_len=12, length_penalty=LengthPenaltySpec(max_len=1024)
+    def test_shorter_wins_among_equal_outcomes(self):
+        # With no threshold, two same-outcome rows that differ only in length are
+        # separated -- which the old hinge did not do below max_len.
+        rows = [
+            _multi_turn_row(0, [40, 40], [0.0, 1.0]),
+            _multi_turn_row(0, [5, 5], [0.0, 1.0]),
+        ]
+        adv = compute_marshal_advantages(
+            list(rows), seq_len=100, length_penalty=LengthPenaltySpec(per_token=1e-3),
+            norm_mode="mean",
         )
-        self.assertTrue(torch.allclose(plain, penalised))
+        self.assertLess(adv[0, 0].item(), adv[1, 0].item())
+
+    def test_outcome_still_outranks_the_penalty(self):
+        # A verbose WIN must keep a higher advantage than a terse LOSS. This is the
+        # property the budget exists to guarantee, checked end to end.
+        rows = [
+            _multi_turn_row(0, [2000] * 8, [0.0] * 7 + [1.0]),
+            _multi_turn_row(0, [3] * 8, [0.0] * 7 + [-1.0]),
+        ]
+        adv = compute_marshal_advantages(
+            list(rows), seq_len=17000,
+            length_penalty=LengthPenaltySpec(per_token=1e-3, budget=0.1),
+            norm_mode="mean",
+        )
+        self.assertGreater(adv[0, 0].item(), adv[1, 0].item())
 
     def test_advantages_stay_masked_to_model_tokens(self):
         rows = [_multi_turn_row(0, [2, 3000], [0.0, 1.0]), _sparse_row(1, -1.0)]
         adv = compute_marshal_advantages(
-            list(rows), seq_len=3010, length_penalty=LengthPenaltySpec(max_len=64)
+            list(rows), seq_len=3010, length_penalty=LengthPenaltySpec()
         )
         env_position = 2  # the separator token between turn 0 and turn 1
         self.assertEqual(rows[0].owner_mask[env_position], 0)
@@ -749,47 +851,77 @@ class TestLengthPenaltyEndToEnd(unittest.TestCase):
         adv = compute_marshal_advantages(
             list(rows), seq_len=5100, marshal_exact=True,
             whiten_rewards=True, whiten_advantages=True,
-            length_penalty=LengthPenaltySpec(max_len=512),
+            length_penalty=LengthPenaltySpec(),
         )
         self.assertTrue(torch.isfinite(adv).all())
 
 
 class TestLengthPenaltyConfig(unittest.TestCase):
-    def test_defaults_are_off_and_marshal_shipped_values(self):
+    def test_defaults_are_off_and_small(self):
         cfg = MarshalConfig()
         self.assertFalse(cfg.length_penalty)
-        self.assertEqual(cfg.length_penalty_coef, 0.5)
-        self.assertEqual(cfg.length_penalty_bonus, 0.0)
-        self.assertEqual(cfg.length_penalty_min_len, 11)
-        self.assertEqual(cfg.length_penalty_max_len, 2048)
-        self.assertEqual(cfg.length_penalty_offset, 1.0)
+        self.assertEqual(cfg.length_penalty_per_token, 2e-5)
+        self.assertEqual(cfg.length_penalty_budget, 0.1)
 
     def test_kwargs_none_when_disabled(self):
         self.assertIsNone(MarshalConfig().length_penalty_kwargs())
 
     def test_kwargs_build_a_spec_when_enabled(self):
-        cfg = MarshalConfig(length_penalty=True, length_penalty_coef=0.25,
-                            length_penalty_max_len=1536)
+        cfg = MarshalConfig(length_penalty=True, length_penalty_per_token=1e-4,
+                            length_penalty_budget=0.25)
         spec = LengthPenaltySpec(**cfg.length_penalty_kwargs())
-        self.assertEqual(spec.coef, 0.25)
-        self.assertEqual(spec.max_len, 1536)
-        self.assertEqual(spec.penalty_for(100), 0.0)
-        self.assertLess(spec.penalty_for(4096), 0.0)
+        self.assertEqual(spec.per_token, 1e-4)
+        self.assertEqual(spec.budget, 0.25)
+        self.assertLess(spec.penalty_for(100), 0.0)
 
-    def test_rejects_non_positive_span_when_enabled(self):
+    def test_rejects_negative_rate_and_budget(self):
         with self.assertRaises(ValueError):
-            MarshalConfig(length_penalty=True, length_penalty_min_len=2048,
-                          length_penalty_max_len=2048)
+            MarshalConfig(length_penalty=True, length_penalty_per_token=-1e-5)
+        with self.assertRaises(ValueError):
+            MarshalConfig(length_penalty=True, length_penalty_budget=-0.1)
 
-    def test_bad_span_tolerated_while_disabled(self):
-        # Off => the fields are inert, so an odd combination must not block startup.
-        MarshalConfig(length_penalty=False, length_penalty_min_len=99,
-                      length_penalty_max_len=10)
+    def test_budget_safety_property(self):
+        self.assertTrue(MarshalConfig(length_penalty=True,
+                                      length_penalty_budget=0.1)
+                        .length_penalty_budget_is_safe)
+        self.assertFalse(MarshalConfig(length_penalty=True,
+                                       length_penalty_budget=0.9)
+                         .length_penalty_budget_is_safe)
+        # An uncapped episode total has no bound at all -- not safe.
+        self.assertFalse(MarshalConfig(length_penalty=True,
+                                       length_penalty_budget=0.0)
+                         .length_penalty_budget_is_safe)
+        # Inert while the penalty is off.
+        self.assertTrue(MarshalConfig(length_penalty_budget=9.0)
+                        .length_penalty_budget_is_safe)
+
+    def test_legacy_fields_still_load_and_are_inert(self):
+        # An old YAML / pinned resume config / cluster preset must keep working.
+        cfg = MarshalConfig.from_dict({
+            "length_penalty": True,
+            "length_penalty_coef": 0.05,
+            "length_penalty_max_len": 256,
+        })
+        self.assertEqual(cfg.length_penalty_kwargs(),
+                         {"per_token": 2e-5, "budget": 0.1})
+        self.assertEqual(cfg.legacy_length_penalty_values(),
+                         {"length_penalty_coef": 0.05, "length_penalty_max_len": 256})
+
+    def test_legacy_fields_at_defaults_are_not_reported(self):
+        self.assertEqual(MarshalConfig().legacy_length_penalty_values(), {})
+
+    def test_legacy_span_no_longer_rejected(self):
+        # The old max_len > min_len rule guarded a formula that no longer exists;
+        # rejecting it now would block a config that runs fine.
+        MarshalConfig(length_penalty=True, length_penalty_min_len=2048,
+                      length_penalty_max_len=2048)
 
     def test_from_dict_roundtrip(self):
-        cfg = MarshalConfig.from_dict({"length_penalty": True, "length_penalty_coef": 0.75})
+        cfg = MarshalConfig.from_dict({"length_penalty": True,
+                                       "length_penalty_per_token": 7.5e-5})
         self.assertTrue(cfg.length_penalty)
-        self.assertEqual(cfg.length_penalty_coef, 0.75)
+        self.assertEqual(cfg.length_penalty_per_token, 7.5e-5)
+        self.assertIn("length_penalty_budget", cfg.to_dict())
         self.assertIn("length_penalty_max_len", cfg.to_dict())
 
     def test_unknown_length_key_still_rejected(self):
