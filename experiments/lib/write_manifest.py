@@ -451,7 +451,26 @@ def main() -> None:
     if cfg_error:
         manifest["marshal_config_error"] = cfg_error
 
-    with open(os.path.join(exp_dir, "manifest.json"), "w") as fh:
+    # Job ids already recorded for this directory, carried across.
+    #
+    # This script is called once, at submission, on a directory that does not exist
+    # yet -- so normally there is nothing to carry. But it is also runnable by hand on
+    # an existing experiment (to refresh the versions, say), and re-running it must not
+    # silently drop the record of which jobs the run was submitted as. That section is
+    # written afterwards, by experiments/lib/record_jobs.py, which is why it cannot
+    # simply be rebuilt here.
+    json_path = os.path.join(exp_dir, "manifest.json")
+    previous_jobs = None
+    try:
+        with open(json_path) as fh:
+            previous = json.load(fh)
+        if isinstance(previous, dict) and isinstance(previous.get("jobs"), dict):
+            previous_jobs = previous["jobs"]
+            manifest["jobs"] = previous_jobs
+    except (OSError, ValueError):
+        pass
+
+    with open(json_path, "w") as fh:
         json.dump(manifest, fh, indent=2, sort_keys=False)
         fh.write("\n")
 
@@ -603,6 +622,19 @@ def main() -> None:
 
     with open(os.path.join(exp_dir, "manifest.txt"), "w") as fh:
         fh.write("\n".join(lines) + "\n")
+        # manifest.txt is rewritten whole, so the job blocks appended to the old one
+        # would be lost with it. Re-render them from the JSON that was just carried
+        # across, so both files still say the same thing. Guarded: a manifest that
+        # cannot render its job history is worth far more than no manifest at all.
+        if previous_jobs:
+            try:
+                sys.path.insert(0, _HERE)
+                from record_jobs import text_block
+
+                for submission in previous_jobs.get("submissions", []):
+                    fh.write(text_block(submission))
+            except Exception as exc:  # pragma: no cover - diagnostic only
+                fh.write(f"\n-- job ids: see manifest.json (not rendered: {exc})\n")
 
     print(f"[manifest] wrote {exp_dir}/manifest.json and manifest.txt")
     if manifest["code"]["git_dirty"]:

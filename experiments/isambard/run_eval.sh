@@ -136,6 +136,15 @@ SUMMARY_ID="$(sbatch --parsable \
     ${SUMMARY_SBATCH_OPTS:-} \
     "$HERE/summarize.sh")"
 
+# Add these ids to the manifest, next to whatever the original submission recorded --
+# a re-run of the evaluation is another entry in that history, not a replacement.
+# Never fatal: the jobs are already queued. See exp_record_jobs.
+exp_record_jobs \
+    --eval "${EVAL_IDS[@]}" \
+    --summary "$SUMMARY_ID" \
+    --shard-total "$EVAL_SHARD_TOTAL" \
+    --env-file "$EVAL_ENV_FILE"
+
 cat <<EOF
 [eval-only] ${#EVAL_IDS[@]} eval job(s) + summary job $SUMMARY_ID queued.
             The eval jobs have no dependency -- they start as soon as GPUs are free,

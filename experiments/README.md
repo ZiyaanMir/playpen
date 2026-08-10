@@ -953,3 +953,29 @@ and `peft=` all keep working. Everything still lives under the one experiment di
 **The manifest is written at submit time**, so a job that dies in the queue still leaves a
 record of what it was meant to be. The training job appends its host, GPU and job id when
 it starts.
+
+**The job ids go in the manifest too, in a second pass.** Being written before anything is
+submitted is exactly why the manifest cannot contain them at that point — they do not
+exist yet — so every submitter calls `experiments/lib/record_jobs.py` once the queue has
+accepted everything, and it appends a block naming which id trains which segment, which
+scores which shard, and the one command that cancels the lot:
+
+```
+-- jobs queued 2026-08-07T14:25:31+01:00 by eddie/run_experiment.sh ----
+  train                        4761223  segment 1 of 3
+  ...
+  summary                      4761234
+  settings from                experiment.env
+  cancel                       qdel 4761223 4761224 ... 4761234
+  logs                         logs/*_<job id>.out
+```
+
+`manifest.json` gets the same thing under `jobs`: a flat `ids` list, and one record per
+submitting invocation. A resume, or a re-run of either evaluation, **appends** a record
+rather than replacing the first, so the directory ends up holding the whole history of
+what was queued against it — including which jobs trained which half of a run that had to
+be resumed. That is worth having because `qstat`/`squeue` forget a job within days, log
+files are only findable by the id in their name, and neither a checkpoint nor a score says
+which job produced it. Recording is done by the submitter (one process on a login node, so
+it cannot race) and is never fatal: by the time it runs the jobs are already queued, so a
+manifest that could not be updated warns and nothing else.

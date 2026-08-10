@@ -718,6 +718,73 @@ exp_shard_label() {
         "$EVAL_SHARD" "${EVAL_SHARD_TOTAL:-?}" "${EVAL_SHARD_SIZE:-5}"
 }
 
+# --- job ids ------------------------------------------------------------------
+# The manifest is written BEFORE anything is submitted -- so a run that dies in the
+# queue still records what it was meant to be -- which is exactly why it cannot
+# contain the job ids: they do not exist yet. The submitters call exp_record_jobs
+# once everything is queued, and that adds them in a second pass. The reading of the
+# ids afterwards is the point: `qstat`/`squeue` forget a job days before you come
+# back to the directory, and a log file is only findable by the id in its name.
+
+# sge | slurm | "" -- the scheduler this experiment is submitted to.
+#
+# EXP_CLUSTER is set by run_experiment.sh and stored in experiment.env, so every
+# submitter has it, including the ones that only re-run an evaluation. The PATH probe
+# is the fallback for experiment directories written before EXP_CLUSTER was recorded.
+exp_scheduler() {
+    case "${EXP_CLUSTER:-}" in
+        eddie)    printf 'sge\n' ;;
+        isambard) printf 'slurm\n' ;;
+        *)
+            if command -v sbatch >/dev/null 2>&1; then
+                printf 'slurm\n'
+            elif command -v qsub >/dev/null 2>&1; then
+                printf 'sge\n'
+            fi
+            ;;
+    esac
+}
+
+# Record the ids of the jobs just queued, in manifest.json and manifest.txt.
+#
+#   exp_record_jobs --train "${TRAIN_IDS[@]}" --train-total "$TRAIN_SEGMENTS" \
+#                   --eval "${EVAL_IDS[@]}" --playpen "${PPEVAL_IDS[@]}" \
+#                   --summary "$SUMMARY_ID" --shard-total "$EVAL_SHARD_TOTAL" \
+#                   --env-file "$ENV_FILE"
+#
+# Every flag is optional (see experiments/lib/record_jobs.py --help): a submission
+# that only queues gameplay shards passes only --playpen and --summary. Which script
+# queued them is taken from the CALLER's own path, so it cannot go stale.
+#
+# NEVER FATAL. By the time this runs the jobs are already in the queue, so a manifest
+# that could not be updated must not make a successful submission look like a failed
+# one -- nor stop the script before it prints the ids and the cancel command to the
+# terminal. Every failure path warns and returns 0.
+exp_record_jobs() {
+    local src py by
+    [ -n "${EXP_DIR:-}" ] || {
+        echo "[jobs] WARNING: EXP_DIR unset -- job ids not recorded in the manifest." >&2
+        return 0
+    }
+    src="${BASH_SOURCE[1]:-$0}"
+    by="$(basename "$(dirname "$src")")/$(basename "$src")"
+    case "$by" in ./*|//*) by="$(basename "$src")" ;; esac
+    py="${REPO:-}/.venv/bin/python"
+    [ -x "$py" ] || py="$(command -v python3 || command -v python || true)"
+    [ -n "$py" ] || {
+        echo "[jobs] WARNING: no python found -- job ids not recorded in the manifest." >&2
+        return 0
+    }
+    "$py" "$EXP_ROOT_DIR/lib/record_jobs.py" "$EXP_DIR" \
+        --submitted-by "$by" \
+        --cluster "${EXP_CLUSTER:-}" \
+        --scheduler "$(exp_scheduler)" \
+        "$@" \
+    || echo "[jobs] WARNING: could not record the job ids in the manifest." \
+            "The jobs ARE queued -- see the ids above." >&2
+    return 0
+}
+
 # Activate a venv and verify it really is the one we asked for.
 #
 # Compares the venv ROOT DIRECTORIES resolved to physical paths (`pwd -P`).

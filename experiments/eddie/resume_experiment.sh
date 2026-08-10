@@ -266,6 +266,7 @@ for SHARD in $(seq 1 "$EVAL_SHARD_TOTAL"); do
     echo "[submit] eval      job $ID  shard $SHARD/$EVAL_SHARD_TOTAL (held until $TRAIN_ID finishes)"
 done
 
+PPEVAL_IDS=()
 if [ "${PPEVAL_ENABLE:-1}" = "1" ]; then
     if [ "${PPEVAL_SERIAL:-0}" = "1" ]; then
         PP_HOLD="$(IFS=,; echo "${EVAL_IDS[*]}")"
@@ -282,6 +283,7 @@ if [ "${PPEVAL_ENABLE:-1}" = "1" ]; then
             -v "EVAL_SHARD=$SHARD" \
             ${PPEVAL_QSUB_OPTS:-} \
             "$HERE/playpen_eval.sh" | tr -d '[:space:]')"
+        PPEVAL_IDS+=("$ID")
         ALL_EVAL_IDS+=("$ID")
         echo "[submit] playpen   job $ID  shard $SHARD/$EVAL_SHARD_TOTAL (held until $PP_HOLD finishes)"
     done
@@ -298,6 +300,20 @@ SUMMARY_ID="$(qsub -terse \
     ${SUMMARY_QSUB_OPTS:-} \
     "$HERE/summarize.sh" | tr -d '[:space:]')"
 echo "[submit] summary   job $SUMMARY_ID  (held until all ${#ALL_EVAL_IDS[@]} eval job(s) finish)"
+
+# --- the job ids, into the manifest -------------------------------------------
+# APPENDED, like the "-- resumed --" block above: the original submission's ids stay
+# where they are, and this adds a second record next to them. So the directory says
+# which jobs trained which half of the run -- the one thing a checkpoint cannot.
+# --train-first-segment because a resume queues segments 2..N, not 1..N.
+exp_record_jobs \
+    --train "${TRAIN_IDS[@]}" \
+    --train-first-segment "$RESUME_FIRST_SEGMENT" --train-total "$TRAIN_SEGMENTS" \
+    --eval ${EVAL_IDS[@]+"${EVAL_IDS[@]}"} \
+    --playpen ${PPEVAL_IDS[@]+"${PPEVAL_IDS[@]}"} \
+    --summary "$SUMMARY_ID" \
+    --shard-total "$EVAL_SHARD_TOTAL" \
+    --env-file "$RESUME_ENV_FILE"
 
 cat <<EOF
 

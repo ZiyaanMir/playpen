@@ -237,6 +237,19 @@ SUMMARY_ID="$(sbatch --parsable \
     "$HERE/summarize.sh")"
 echo "[submit] summary   job $SUMMARY_ID  (held until all ${#ALL_EVAL_IDS[@]} eval job(s) finish)"
 
+# --- the job ids, into the manifest -------------------------------------------
+# The manifest was written before any of this was submitted, so it could not name the
+# jobs. Add them now -- which id trains which segment, which scores which shard, and
+# the one command that cancels the lot. Never fatal: everything above is already
+# queued. See exp_record_jobs in experiments/lib/experiment.sh.
+exp_record_jobs \
+    --train "${TRAIN_IDS[@]}" --train-total "$TRAIN_SEGMENTS" \
+    --eval ${EVAL_IDS[@]+"${EVAL_IDS[@]}"} \
+    --playpen ${PPEVAL_IDS[@]+"${PPEVAL_IDS[@]}"} \
+    --summary "$SUMMARY_ID" \
+    --shard-total "$EVAL_SHARD_TOTAL" \
+    --env-file "$ENV_FILE"
+
 cat <<EOF
 
 experiment : $EXP_ID
@@ -257,6 +270,9 @@ jobs       : ${TRAIN_SEGMENTS} train$([ "$TRAIN_SEGMENTS" -gt 1 ] && echo " (cha
 
   squeue --me                 # watch the jobs
   scancel ${TRAIN_IDS[*]} ${ALL_EVAL_IDS[*]} $SUMMARY_ID  # cancel the experiment
+
+Those ids, and that cancel command, are recorded in manifest.txt / manifest.json --
+so they are still there once squeue has forgotten the jobs.
 
 If a training segment dies, the rest of the chain still runs and picks up from its
 last checkpoint. To restart a chain that stopped short:
