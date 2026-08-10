@@ -255,7 +255,7 @@ turn_reward_components: ""
 # --length-penalty-per-token, --length-penalty-budget.
 # Watch marshal/length_penalty/episode_total_mean (the number the outcome competes
 # with) and marshal/length_penalty/budget_clip_rate -- NOT the per-turn mean.
-length_penalty: true
+length_penalty: false
 
 # Reward charged per generated token. The minus sign is applied in code, so this
 # is -2e-5 per token = -0.02 per 1000 tokens. Judge it against the +-1 outcome,
