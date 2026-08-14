@@ -533,6 +533,7 @@ Scheduler options pass through too:
 | `SEGMENT_STEPS` | — | steps per segment, instead of `TRAIN_SEGMENTS` |
 | `RESUME_FROM` | — | `auto` \| `latest` \| a checkpoint path, for the first segment |
 | `UNIQUE_POOL` | — | tri-state `1`/`0`/empty for `marshal_exact`'s `torch.unique` pooling (see [below](#marshal_exacts-unique-pooling-unique_pool)) |
+| `GRPO_LOSS` | — | tri-state `1`/`0`/empty for TRL's `loss_type` (see [below](#trl-loss-aggregation-grpo_loss)) |
 | `EVAL_TASKS` | `logiglue,logicbench` | lm-eval tasks (comma-separated) |
 | `EVAL_BASE` | `1` | also score the untrained model |
 | `EVAL_LIMIT` | — | `--limit N`, smoke tests only |
@@ -552,7 +553,7 @@ Everything else lives in `presets/<game>.env` — that file is the per-game sour
 
 On by default. The run is **named after the experiment** (`EXP_ID`), grouped by
 `{game}_{model}`, and tagged with the switches that define the arm (`marshal` /
-`no-marshal`, `dr_grpo`, `length_penalty`, `paper_correct` / `marshal_exact`,
+`no-marshal`, `dr_grpo`, `grpo_loss`, `length_penalty`, `paper_correct` / `marshal_exact`,
 `no-unique-pool`, the cluster, your `EXP_TAG`). Its config carries the *resolved* MARSHAL config plus every training
 hyperparameter, so two arms can be diffed in the UI without opening a manifest.
 
@@ -797,6 +798,60 @@ than only where turns ran long (see the reporting caveat under
 
 **Reporting.** A run with `UNIQUE_POOL=0` is not a reproduction of MARSHAL's shipped
 normalization; describe it as `marshal_exact` minus distinct-value pooling.
+
+---
+
+## TRL loss aggregation (`GRPO_LOSS`)
+
+Which of TRL's `loss_type`s the run trains under. This is a different axis from the
+advantage estimator — it decides how the per-token losses are *summed into a scalar*,
+and it applies to the MARSHAL path and the `--no-marshal` baseline alike.
+
+| `loss_type` | how it aggregates | how to get it |
+|---|---|---|
+| `dapo` | every token weighted equally: `Σ_{i,t} ℓ / (active tokens in the accumulated batch)` | **default** — set nothing |
+| `grpo` | every **row** weighted equally: `mean_i( Σ_t ℓ / Σ_t m )` | `GRPO_LOSS=1` |
+| `dr_grpo` | constant normalizer `B · max_completion_length`, plus `scale_rewards='none'` | `EXTRA_TRAIN_ARGS='--dr-grpo'` |
+
+```bash
+# upstream MARSHAL's aggregation
+GRPO_LOSS=1 EXP_TAG=grpo_loss ./run_experiment.sh guesswhat
+# force TRL's dapo default over a YAML that sets grpo_loss/dr_grpo
+GRPO_LOSS=0 EXP_TAG=dapo ./run_experiment.sh guesswhat
+```
+
+| var | flag | meaning |
+|---|---|---|
+| `GRPO_LOSS` | `--grpo-loss` / `--no-grpo-loss` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `TR_*` / `LP_*` / `UNIQUE_POOL`) |
+
+**Why you would want `grpo`.** Upstream MARSHAL is a ROLL fork, and its shipped playpen
+selfplay YAMLs leave `loss_agg_mode` unset — so they run ROLL's `seq-mean-token-sum`
+default, whose body is `masked_mean(loss_mat, mask, dim=-1)` followed by a mean over rows.
+That is a per-row **mean** (the `# token-sum` comment above it does not match the code),
+i.e. exactly TRL's `grpo` — *not* TRL's default `dapo`. A run on `dapo` is therefore not
+aggregating the way MARSHAL does; `GRPO_LOSS=1` closes that gap.
+
+**What it costs.** Rows get equal weight regardless of length, so a token in a 12-token
+turn carries many times the gradient of one in a 300-token turn — the response-level
+length bias that DAPO and Dr. GRPO were both written to remove. If you are also running
+`LP_*`, note that the two now push on the same quantity from opposite directions.
+
+One further mismatch with ROLL, and it is **not** small on every game: TRL divides by the
+**full** row count while ROLL divides by its **valid**-row count, so a placeholder row (an
+idle seat, a drifted row) adds nothing to the numerator but still takes a denominator slot.
+The run is therefore scaled by `1 - placeholder_rate` against upstream MARSHAL — ~2.1×
+weaker on `wordle_withclue` (mean rate 0.53), 1.9× on `imagegame`, 1.6× on
+`wordle_withcritic`, 1.5× on `guesswhat`, but ~1× on `dond`, `matchit_ascii`,
+`referencegame` and `textmapworld*`. The worst-hit games are those where `GameSpec` players
+outnumber learner seats. Check `marshal/rows/placeholder_rate` for the run before comparing
+its gradient scale with anything. Under `dapo` the question does not arise: a placeholder
+contributes no tokens, so it never enters the normalizer.
+
+**`dr_grpo` and `grpo_loss` are mutually exclusive** — both write `loss_type`, and asking
+for both raises at startup rather than picking a silent winner. `EXTRA_TRAIN_ARGS` is
+applied after `GRPO_LOSS`, so `GRPO_LOSS=1 EXTRA_TRAIN_ARGS='--dr-grpo'` is a startup
+error, not a coin flip. The resolved value lands in `manifest.json` and W&B tags the run
+`grpo_loss`; `train.sh` prints `loss_type=` in its banner and `[loss]` at startup.
 
 ---
 

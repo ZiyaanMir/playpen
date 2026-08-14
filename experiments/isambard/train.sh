@@ -134,6 +134,14 @@ case "${UNIQUE_POOL:-}" in
     1) ARGS+=( --marshal-exact-unique-pooling ) ;;
     0) ARGS+=( --no-marshal-exact-unique-pooling ) ;;
 esac
+# TRL loss aggregation. Tri-state like UNIQUE_POOL: 1 = loss_type='grpo' (upstream
+# MARSHAL/ROLL's per-row mean), 0 = force TRL's default loss_type='dapo', empty = leave
+# the YAML alone. Dr. GRPO is the other arm of this axis and is passed the old way,
+# EXTRA_TRAIN_ARGS='--dr-grpo'; train_selfplay.py rejects both at once.
+case "${GRPO_LOSS:-}" in
+    1) ARGS+=( --grpo-loss ) ;;
+    0) ARGS+=( --no-grpo-loss ) ;;
+esac
 # Dense per-turn rewards. Same convention: empty => leave the YAML alone. TR_ENABLE
 # is a tri-state (1 on / 0 off / empty = whatever the YAML says) because "on" and
 # "leave alone" must stay distinguishable, exactly as --turn-rewards/--no-turn-rewards

@@ -449,6 +449,73 @@ class TestDrGrpo(unittest.TestCase):
             MarshalConfig.from_dict({"dr_grpoo": True})
 
 
+class TestGrpoLoss(unittest.TestCase):
+    """The original-GRPO loss switch: TRL's loss_type='grpo', and nothing else."""
+
+    def test_default_off(self):
+        cfg = MarshalConfig()
+        self.assertFalse(cfg.grpo_loss)
+        self.assertEqual(cfg.trl_loss_type, "dapo")
+
+    def test_overrides_off_is_empty(self):
+        # Off => empty dict => splatting into GRPOConfig(...) changes nothing.
+        self.assertEqual(MarshalConfig(grpo_loss=False).trl_grpo_overrides(), {})
+
+    def test_overrides_on_sets_only_loss_type(self):
+        # scale_rewards is deliberately NOT touched: this flag is about aggregation.
+        self.assertEqual(
+            MarshalConfig(grpo_loss=True).trl_grpo_overrides(),
+            {"loss_type": "grpo"},
+        )
+
+    def test_resolved_loss_type(self):
+        self.assertEqual(MarshalConfig(grpo_loss=True).trl_loss_type, "grpo")
+        self.assertEqual(MarshalConfig(dr_grpo=True).trl_loss_type, "dr_grpo")
+
+    def test_mutually_exclusive_with_dr_grpo(self):
+        # Both write loss_type; a silent winner would make an arm's name disagree
+        # with the loss it trained under, so this must raise rather than resolve.
+        with self.assertRaises(ValueError) as ctx:
+            MarshalConfig(dr_grpo=True, grpo_loss=True)
+        self.assertIn("mutually exclusive", str(ctx.exception))
+
+    def test_applies_regardless_of_enabled(self):
+        """It configures the shared TRL loss, which the --no-marshal arm also uses."""
+        cfg = MarshalConfig(enabled=False, grpo_loss=True)
+        self.assertEqual(cfg.trl_grpo_overrides(), {"loss_type": "grpo"})
+
+    def test_does_not_touch_advantage_norm_mode(self):
+        # Unlike dr_grpo, there is no reconciliation: grpo_loss says nothing about
+        # how advantages are normalized.
+        cfg = MarshalConfig(grpo_loss=True, enabled=True, advantage_norm_mode="mean_std")
+        self.assertEqual(cfg.reconcile_for_dr_grpo(), [])
+        self.assertEqual(cfg.advantage_norm_mode, "mean_std")
+
+    def test_composes_with_sampling_without_key_collision(self):
+        cfg = MarshalConfig(grpo_loss=True)
+        merged = {**cfg.trl_grpo_overrides(), **cfg.trl_sampling_overrides()}
+        self.assertEqual(merged, {"loss_type": "grpo", "top_p": 0.95, "top_k": 50})
+
+    def test_from_dict_roundtrip(self):
+        cfg = MarshalConfig.from_dict({"grpo_loss": True})
+        self.assertTrue(cfg.grpo_loss)
+        self.assertEqual(MarshalConfig.from_dict(cfg.to_dict()).to_dict(), cfg.to_dict())
+
+    def test_loss_type_is_a_real_grpoconfig_value(self):
+        """Guards against a TRL rename turning this into a silently ignored kwarg."""
+        try:
+            from trl import GRPOConfig
+        except Exception:  # pragma: no cover - trl not installed
+            self.skipTest("trl not installed")
+        gc = GRPOConfig(
+            output_dir="/tmp/marshal-test",
+            **MarshalConfig(grpo_loss=True).trl_grpo_overrides(),
+        )
+        self.assertEqual(gc.loss_type, "grpo")
+        # scale_rewards must still be TRL's default -- the flag does not touch it.
+        self.assertEqual(gc.scale_rewards, GRPOConfig(output_dir="/tmp/m").scale_rewards)
+
+
 class TestPreSumNormalizationDivergence(unittest.TestCase):
     """paper_correct and marshal_exact should differ when a pre-sum bias exists."""
 

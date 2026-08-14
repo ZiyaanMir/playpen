@@ -104,6 +104,20 @@ def _fidelity(cfg):
         return mode + "(no-unique-pool)"
     return mode
 
+def _loss_type(cfg):
+    """The TRL loss_type the run trained under.
+
+    Falls back to 'dapo' -- TRL's default and what a manifest written before either
+    flag existed necessarily ran, since neither key being present means neither was
+    set. The two are mutually exclusive at config-validation time, so the order here
+    cannot hide a run that asked for both.
+    """
+    if cfg.get("dr_grpo"):
+        return "dr_grpo"
+    if cfg.get("grpo_loss"):
+        return "grpo"
+    return "dapo"
+
 
 rows = []
 for exp in sorted(glob.glob(os.path.join(runs, "*"))):
@@ -157,6 +171,7 @@ for exp in sorted(glob.glob(os.path.join(runs, "*"))):
         "steps": train.get("max_steps", "?"),
         "lp": lp_s,
         "fidelity": _fidelity(man.get("marshal_config", {})),
+        "loss": _loss_type(man.get("marshal_config", {})),
         "state": state,
         "score": best_metric(exp),
         "dirty": man.get("code", {}).get("git_dirty", False),
@@ -175,7 +190,7 @@ for r in rows:
     print(f"{r['id'].ljust(w_id)}  {r['state'].ljust(w_state)}  {r['score']}")
     if verbose:
         print(f"{' ' * w_id}    model={r['model']} game={r['game']} steps={r['steps']} "
-              f"len_penalty={r['lp']} fidelity={r['fidelity']}"
+              f"len_penalty={r['lp']} fidelity={r['fidelity']} loss={r['loss']}"
               + ("  [dirty tree]" if r["dirty"] else ""))
 
 print()

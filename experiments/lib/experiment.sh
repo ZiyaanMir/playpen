@@ -67,7 +67,7 @@ exp_load_preset() {
     for _v in MODEL MARSHAL_CONFIG \
               NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL \
+              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL GRPO_LOSS \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
@@ -131,6 +131,14 @@ exp_load_preset() {
     # fidelity_mode itself has no env var; set it in the YAML or via
     # EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact'.
     UNIQUE_POOL="${UNIQUE_POOL:-}"
+
+    # TRL loss aggregation, tri-state like UNIQUE_POOL: 1 = loss_type='grpo' (upstream
+    # MARSHAL/ROLL's per-row mean; short rows carry more gradient per token), 0 = force
+    # it off (TRL's default loss_type='dapo'), empty = leave the YAML alone. Applies on
+    # the MARSHAL path and the --no-marshal baseline alike. Dr. GRPO is the other arm of
+    # the same axis and has no env var -- pass EXTRA_TRAIN_ARGS='--dr-grpo' for it;
+    # setting both is rejected by MarshalConfig, not silently resolved.
+    GRPO_LOSS="${GRPO_LOSS:-}"
 
     # Dense per-turn rewards (playpen/marshal/turn_rewards.py). Same convention as
     # LP_*: empty => don't pass the flag at all, so the YAML value stands. Set
@@ -248,7 +256,7 @@ exp_load_preset() {
     export GAME MODEL MARSHAL_CONFIG \
            NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL \
+           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL GRPO_LOSS \
            TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
            TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
@@ -1045,6 +1053,17 @@ exp_banner() {
 "${LP_MAX_LEN:+  [LP_MAX_LEN=$LP_MAX_LEN IGNORED]}${LP_COEF:+  [LP_COEF=$LP_COEF IGNORED]}"
         echo "turn_rewards= ${TR_ENABLE:-<yaml>} scale=${TR_SCALE:-<yaml>} "\
 "budget=${TR_BUDGET:-<yaml>} source=${TR_SOURCE:-<yaml>}"
+        # Which TRL loss the run will train under. <yaml> means GRPO_LOSS did not force
+        # it, so marshal_config.yaml decides (dapo unless it sets dr_grpo/grpo_loss) --
+        # possibly overridden again by EXTRA_TRAIN_ARGS, which is printed beside it.
+        local _loss
+        case "${GRPO_LOSS:-}" in
+            1) _loss="grpo" ;;
+            0) _loss="dapo (forced)" ;;
+            *) _loss="<yaml>" ;;
+        esac
+        echo "loss_type   = ${_loss}"\
+"${EXTRA_TRAIN_ARGS:+  [EXTRA_TRAIN_ARGS=$EXTRA_TRAIN_ARGS]}"
         if [ "${WB_ENABLE:-1}" = "1" ] && [ "${WB_MODE:-auto}" != "disabled" ]; then
             echo "wandb       = ${WB_PROJECT:-playpen-marshal}${WB_ENTITY:+ ($WB_ENTITY)} "\
 "mode=${WB_MODE:-auto} run=${EXP_ID:-?}"

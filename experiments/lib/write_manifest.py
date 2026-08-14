@@ -203,6 +203,13 @@ def resolve_config() -> tuple[dict, str | None]:
     if _env("UNIQUE_POOL") in ("0", "1"):
         overrides["marshal_exact_unique_pooling"] = _env("UNIQUE_POOL") == "1"
 
+    # TRL loss aggregation, tri-state on the same pattern and here for the same reason:
+    # train.sh turns GRPO_LOSS into --grpo-loss/--no-grpo-loss directly, so the
+    # EXTRA_TRAIN_ARGS parser below never sees it. Which loss a run trained under is
+    # exactly the kind of thing a manifest must not get wrong.
+    if _env("GRPO_LOSS") in ("0", "1"):
+        overrides["grpo_loss"] = _env("GRPO_LOSS") == "1"
+
     # Dense per-turn rewards, same story as LP_*: train.sh turns these env vars into
     # CLI flags directly (not via EXTRA_TRAIN_ARGS), so the argv parser below cannot
     # see them and the manifest would otherwise report the YAML's values for a run

@@ -166,6 +166,36 @@ class TestGrpoConfigWiring(unittest.TestCase):
         self.assertEqual(cfg.trl_sampling_overrides(), {"top_p": 0.95, "top_k": 50})
 
 
+class TestGrpoLossFlag(unittest.TestCase):
+    """``--grpo-loss`` / ``--no-grpo-loss``, and its clash with ``--dr-grpo``."""
+
+    def test_flag_turns_it_on(self):
+        cfg, overrides = _merge(["--grpo-loss"], {"grpo_loss": False})
+        self.assertTrue(cfg.grpo_loss)
+        self.assertEqual(overrides.get("grpo_loss"), True)
+        self.assertEqual(cfg.trl_grpo_overrides(), {"loss_type": "grpo"})
+
+    def test_no_flag_forces_it_off_over_a_yaml_that_says_on(self):
+        cfg, _ = _merge(["--no-grpo-loss"], {"grpo_loss": True})
+        self.assertFalse(cfg.grpo_loss)
+        self.assertEqual(cfg.trl_grpo_overrides(), {})
+
+    def test_absent_flag_leaves_the_yaml_alone(self):
+        cfg, overrides = _merge([], {"grpo_loss": True})
+        self.assertTrue(cfg.grpo_loss)
+        self.assertNotIn("grpo_loss", overrides)
+
+    def test_clash_with_dr_grpo_is_rejected_by_the_merge(self):
+        # __post_init__ runs on the MERGED config, so a YAML dr_grpo plus a CLI
+        # --grpo-loss must fail here rather than reaching GRPOConfig.
+        with self.assertRaises(ValueError):
+            _merge(["--grpo-loss"], {"dr_grpo": True})
+
+    def test_argparse_rejects_both_spellings_at_once(self):
+        with self.assertRaises(SystemExit):
+            _merge(["--grpo-loss", "--no-grpo-loss"])
+
+
 class TestShippedYamlMatchesTheDataclass(unittest.TestCase):
     """The shipped YAML must load, and must not drift from the field set."""
 

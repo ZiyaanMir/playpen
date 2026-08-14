@@ -144,6 +144,32 @@ whiten_advantages: true
 # std divisor but keeping per-seat pooling), with a printed notice.
 dr_grpo: false
 
+# Original-GRPO loss aggregation: TRL's loss_type='grpo', i.e. each row's token losses
+# are averaged over that row's OWN length and the rows are then averaged
+# (mean_i(sum_t l/sum_t m)). Nothing else changes -- scale_rewards keeps TRL's 'group'
+# default and MARSHAL's advantage math is untouched. Quick CLI override: --grpo-loss /
+# --no-grpo-loss. MUTUALLY EXCLUSIVE with dr_grpo (both set loss_type); setting both
+# raises. Like dr_grpo, it applies REGARDLESS of `enabled` and is set by the launch
+# script, not the advantage math.
+#
+# Why it exists: upstream MARSHAL is a ROLL fork, and its shipped playpen selfplay
+# YAMLs leave loss_agg_mode unset -> ROLL's 'seq-mean-token-sum' default, whose code is
+# masked_mean(loss_mat, mask, dim=-1) then a mean over rows (a per-row MEAN, despite the
+# "# token-sum" comment). That is TRL's 'grpo', not TRL's default 'dapo'. Turn this on
+# for a closer reproduction of what MARSHAL actually trains under.
+#
+# Cost of turning it on: every row gets weight 1/B whatever its length, so a token in a
+# 12-token turn carries many times the gradient of one in a 300-token turn -- the length
+# bias dapo and Dr. GRPO both remove. Also note TRL divides by the FULL row count while
+# ROLL divides by its VALID-row count: a placeholder row (an idle seat, a drifted row)
+# adds nothing to the numerator but still takes a denominator slot, so the update is
+# scaled by (1 - placeholder_rate) against upstream MARSHAL. That is game-dependent and
+# not small -- ~2.1x weaker on wordle_withclue, 1.9x on imagegame, 1.5x on guesswhat,
+# ~1x on dond/matchit_ascii/referencegame/textmapworld. Check
+# marshal/rows/placeholder_rate for the run. (Under dapo this does not arise: a
+# placeholder contributes no tokens, so it never enters the normalizer.)
+grpo_loss: false
+
 # ---------------------------------------------------------------------------
 # Dense PER-TURN REWARDS (playpen/marshal/turn_rewards.py).
 #

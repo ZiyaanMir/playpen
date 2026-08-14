@@ -163,6 +163,54 @@ class MarshalConfig:
             keeping per-seat *pooling*), since a per-group std is exactly the bias
             Dr. GRPO removes. Batch-wide ``whiten_advantages`` is left alone -- the
             Dr. GRPO paper explicitly permits batch-level normalization.
+        grpo_loss: When ``True``, run with TRL's ``loss_type="grpo"`` -- the *original*
+            GRPO aggregation, where each row's token losses are averaged over that
+            row's own length and the rows are then averaged:
+            ``mean_i( sum_t l[i,t]·m[i,t] / sum_t m[i,t] )``. Nothing else moves:
+            ``scale_rewards`` keeps TRL's ``"group"`` default, and MARSHAL's advantage
+            math is untouched. Mutually exclusive with :attr:`dr_grpo` (both write
+            ``loss_type``); setting both raises. See :meth:`trl_grpo_overrides`.
+
+            This exists to match **upstream MARSHAL**, which is a ROLL fork and whose
+            shipped playpen self-play YAMLs leave ``loss_agg_mode`` unset, i.e. at
+            ROLL's ``"seq-mean-token-sum"`` default. That branch calls
+            ``masked_mean(loss_mat, loss_mask, dim=-1)`` (``roll/utils/functionals.py``)
+            -- a per-row *mean* despite the ``# token-sum`` comment above it -- and
+            then averages over rows. That is exactly TRL's ``grpo``, and it is *not*
+            TRL's default ``dapo``, which normalizes by the active-token count of the
+            whole accumulated batch and so weights every token equally regardless of
+            which row it sits in. Running this port on ``dapo`` and calling it a
+            MARSHAL reproduction overstates the match; this flag closes that gap.
+
+            Two consequences worth knowing before reading a run trained with it:
+
+            * **Short rows dominate.** Every row gets weight ``1/B`` however long it
+              is, so a token in a 12-token turn carries many times the gradient of a
+              token in a 300-token one. This is the response-level length bias both
+              DAPO and Dr. GRPO were written to remove -- it is the point of the flag,
+              not a defect, but it makes ``grpo_loss`` and ``length_penalty`` two
+              different pressures on the same quantity.
+            * **Placeholder rows are counted, and on some games that is a big deal.**
+              TRL divides by the full row count ``B`` (``per_token_loss.size(0)``),
+              while ROLL divides by its ``valid_samples`` count. An inert row
+              (``trainer._empty_row``: a seat that never got a turn, or a row dropped
+              for re-tokenization drift) contributes 0 to the numerator but still
+              takes a slot in the denominator, so the update is scaled by
+              ``1 - placeholder_rate`` relative to ROLL. Measured means over the
+              2026-08 runs: wordle_withclue 0.53 (**2.1x** weaker than ROLL),
+              imagegame 0.47 (1.9x), wordle_withcritic 0.36 (1.6x), guesswhat 0.31
+              (1.5x), wordle 0.12, codenames 0.065, taboo 0.04, and ~0 for
+              dond/adventuregame/matchit_ascii/referencegame/textmapworld*. Read
+              ``marshal/rows/placeholder_rate`` for the run before comparing its
+              gradient scale with anything. Note this is *specific to this flag*:
+              under ``dapo`` a placeholder row contributes no tokens and so does not
+              enter the normalizer at all. The games worst affected are the ones
+              where ``GameSpec`` players outnumber learner seats.
+
+            Like ``dr_grpo``, this takes effect *regardless of* ``enabled`` -- it
+            configures the shared TRL loss used by both the MARSHAL path and the
+            ``--no-marshal`` baseline -- and is applied by the launch script, not by
+            ``advantage.py``.
         length_penalty: When ``True`` (and ``enabled``), charge every turn a small
             per-token cost, added to that turn's reward before any normalization:
             ``-length_penalty_per_token * generated_tokens``. There is **no
@@ -395,6 +443,7 @@ class MarshalConfig:
     whiten_rewards: bool = False
     whiten_advantages: bool = False
     dr_grpo: bool = False
+    grpo_loss: bool = False
     length_penalty: bool = False
     length_penalty_per_token: float = 2e-5
     length_penalty_budget: float = 0.1
@@ -434,6 +483,16 @@ class MarshalConfig:
             raise ValueError(
                 f"episode_pairing must be one of {EPISODE_PAIRING_MODES}, "
                 f"got {self.episode_pairing!r}"
+            )
+        # Both write GRPOConfig.loss_type, so "both on" has no meaning -- and the two
+        # ask for opposite things (dr_grpo removes the response-level length bias,
+        # grpo_loss reinstates it). Rejected here rather than resolved by precedence:
+        # a silent winner would make an ablation arm's name disagree with its loss.
+        if self.dr_grpo and self.grpo_loss:
+            raise ValueError(
+                "dr_grpo and grpo_loss are mutually exclusive -- both set "
+                "GRPOConfig.loss_type ('dr_grpo' vs 'grpo'). Pick one, or leave both "
+                "off for TRL's default loss_type='dapo'."
             )
         self.sampling_top_p = float(self.sampling_top_p)
         self.sampling_top_k = int(self.sampling_top_k)
@@ -590,21 +649,47 @@ class MarshalConfig:
         """
         return self.marshal_exact and self.marshal_exact_unique_pooling
 
-    def trl_grpo_overrides(self) -> Dict[str, Any]:
-        """TRL ``GRPOConfig`` kwargs implementing the Dr. GRPO recipe (or nothing).
+    @property
+    def trl_loss_type(self) -> str:
+        """The ``GRPOConfig.loss_type`` this config resolves to.
 
-        Returns an empty dict when ``dr_grpo`` is off, so the launch script can
-        splat ``**cfg.trl_grpo_overrides()`` into ``GRPOConfig(...)`` and get a
-        *byte-identical* config to today (no keys added, TRL's own defaults stand).
+        ``"dapo"`` when neither loss flag is set -- named explicitly rather than left
+        as "whatever TRL defaults to", so a printed/logged run says what it trained
+        under. :meth:`trl_grpo_overrides` still omits the key in that case.
+        """
+        if self.dr_grpo:
+            return "dr_grpo"
+        if self.grpo_loss:
+            return "grpo"
+        return "dapo"
+
+    def trl_grpo_overrides(self) -> Dict[str, Any]:
+        """TRL ``GRPOConfig`` kwargs for the selected loss recipe (or nothing).
+
+        Returns an empty dict when both ``dr_grpo`` and ``grpo_loss`` are off, so the
+        launch script can splat ``**cfg.trl_grpo_overrides()`` into ``GRPOConfig(...)``
+        and get a *byte-identical* config to today (no keys added, TRL's own defaults
+        stand).
+
         When ``dr_grpo`` is on it returns the two settings TRL's docs prescribe for
         Dr. GRPO: ``loss_type="dr_grpo"`` (constant-normalized loss -> no length
         bias) and ``scale_rewards="none"`` (no std division -> no difficulty bias).
 
+        When ``grpo_loss`` is on it returns ``loss_type="grpo"`` and *nothing else* --
+        ``scale_rewards`` keeps TRL's ``"group"`` default. That is deliberate: the flag
+        exists to match upstream MARSHAL's per-row loss normalization, and reward
+        scaling is a separate axis (and inert on the MARSHAL path anyway, where the
+        trainer overwrites TRL's scalar advantages).
+
+        The two are mutually exclusive; ``__post_init__`` rejects both at once.
+
         Values are plain strings, so this stays importable without ``trl``.
         """
-        if not self.dr_grpo:
-            return {}
-        return {"loss_type": "dr_grpo", "scale_rewards": "none"}
+        if self.dr_grpo:
+            return {"loss_type": "dr_grpo", "scale_rewards": "none"}
+        if self.grpo_loss:
+            return {"loss_type": "grpo"}
+        return {}
 
     def trl_sampling_overrides(self) -> Dict[str, Any]:
         """TRL ``GRPOConfig`` kwargs for sampling-tail truncation (or nothing).

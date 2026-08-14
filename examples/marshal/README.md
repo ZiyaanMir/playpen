@@ -63,6 +63,7 @@ Custom `rollout_func` generation requires vLLM (`use_vllm=True`).
 | `whiten_rewards` | z-score the token-level reward field batch-wide *before* the cumulative sum (mirrors ROLL's `whiten_rewards: true`, set in every shipped MARSHAL selfplay YAML; densifies sparse rewards with a length-dependent component). Default `false`. |
 | `whiten_advantages` | z-score the final advantages batch-wide *after* per-seat normalization (mirrors ROLL's `whiten_advantages: true`; scale stabilization). Default `false`. |
 | `dr_grpo` | run with the **Dr. GRPO** ([arXiv:2503.20783](https://arxiv.org/abs/2503.20783)) recipe: TRL `loss_type='dr_grpo'` (loss normalized by the constant `max_completion_length` ⇒ no length bias) + `scale_rewards='none'` (no std division ⇒ no difficulty bias). Default `false`. |
+| `grpo_loss` | run with TRL `loss_type='grpo'` — the original per-row aggregation (`mean_i(Σ_t ℓ / Σ_t m)`), which is what upstream MARSHAL/ROLL trains under. `scale_rewards` untouched. **Mutually exclusive with `dr_grpo`.** Default `false`. |
 | `turn_rewards` | **dense per-turn rewards** read off the game's live state, on top of the terminal outcome. Default `false` (terminal-only, i.e. unchanged). See [below](#dense-per-turn-rewards). |
 
 KL regularization is a CLI switch (not part of the advantage math): `--kl-beta 0.2`
@@ -91,8 +92,45 @@ It composes cleanly with MARSHAL:
 
 Caveat: `dr_grpo` normalizes the loss by `max_completion_length` (a constant, e.g. 2048)
 rather than the realized active-token count, so per-step loss/grad magnitude is smaller
-than the default `dapo`. This is inherent to Dr. GRPO's constant normalizer (paper
-Listing 1), not a bug — bump the learning rate if convergence looks slow.
+than the default `dapo` — by exactly `mean_completion_length / max_completion_length`,
+measured at 0.016–1.09 across the 2026-08-10 runs (it *rises* where multi-turn rows
+outrun the per-turn cap). This is inherent to Dr. GRPO's constant normalizer (paper
+Listing 1), not a bug. AdamW absorbs most of a constant rescale, so this is rarely an LR
+problem; what it does change is that `max_grad_norm=1.0` clipping stops engaging, and
+that logged `loss`/`grad_norm` are no longer comparable with a `dapo` arm.
+
+**Original GRPO** (`grpo_loss`, or `--grpo-loss`/`--no-grpo-loss`) is the third setting on
+this same axis: TRL `loss_type='grpo'`, where each row's token losses are averaged over
+*that row's own length* and the rows are then averaged. Nothing else moves — `scale_rewards`
+keeps TRL's `group` default and `advantage.py` is untouched. It is **mutually exclusive**
+with `dr_grpo` (both write `loss_type`); setting both raises at config-validation time.
+
+It exists because that is what upstream MARSHAL actually trains under. MARSHAL is a ROLL
+fork whose shipped playpen selfplay YAMLs leave `loss_agg_mode` unset, so they take ROLL's
+`seq-mean-token-sum` default — whose implementation is `masked_mean(loss_mat, mask, dim=-1)`
+then a mean over rows (`roll/utils/functionals.py`), i.e. a per-row **mean** despite the
+`# token-sum` comment sitting above it. That is TRL's `grpo`, not TRL's default `dapo`.
+Two things to know before using it. Rows are weighted equally regardless of length, so
+short turns dominate the gradient (the length bias `dapo` removes). And TRL divides by the
+**full** row count where ROLL divides by its **valid** row count — a placeholder row
+(`_empty_row`: an idle seat, a drifted row) adds nothing to the numerator but still takes a
+denominator slot, so the update is scaled by `1 - placeholder_rate` against upstream. That
+is game-dependent and not small:
+
+| game | mean `marshal/rows/placeholder_rate` | weaker than ROLL by |
+|---|---|---|
+| `wordle_withclue` | 0.53 | 2.1× |
+| `imagegame` | 0.47 | 1.9× |
+| `wordle_withcritic` | 0.36 | 1.6× |
+| `guesswhat` | 0.31 | 1.5× |
+| `wordle` | 0.12 | 1.13× |
+| `codenames` / `taboo` | 0.065 / 0.04 | ~1.05× |
+| `dond`, `adventuregame`, `matchit_ascii`, `referencegame`, `textmapworld*` | ≤0.01 | ~1× |
+
+(means over the 2026-08 runs; the worst-hit games are the ones where `GameSpec` players
+outnumber learner seats). This does not arise under `dapo`, where a placeholder
+contributes no tokens and so never enters the normalizer. Read
+`marshal/rows/placeholder_rate` for your own run before comparing gradient scales.
 
 Flip it off for a run without editing the file:
 

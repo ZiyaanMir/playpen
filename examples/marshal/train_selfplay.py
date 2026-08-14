@@ -16,6 +16,11 @@ scale_rewards='none' to remove GRPO's length and difficulty biases. It composes 
 MARSHAL switch (on either the MARSHAL path or the plain-GRPO baseline) and is a no-op
 when off. LoRA is always on (independent of both switches).
 
+``grpo_loss`` (or ``--grpo-loss``/``--no-grpo-loss``) is the third switch on the same
+axis: TRL's loss_type='grpo', the original per-row-mean aggregation, which is what
+upstream MARSHAL (a ROLL fork) actually trains under. Mutually exclusive with
+``dr_grpo``; with both off, TRL's default loss_type='dapo' stands.
+
 Prerequisites (into playpen's venv):
     uv pip install "trl>=0.28.0,<1.0.0" vllm
     uv pip install wandb          # only for --wandb
@@ -74,6 +79,7 @@ MARSHAL_CLI_FIELDS = (
     "row_context_mode",
     "episode_pairing",
     "dr_grpo",
+    "grpo_loss",
     "length_penalty",
     "length_penalty_per_token",
     "length_penalty_budget",
@@ -169,6 +175,18 @@ def parse_args() -> argparse.Namespace:
                         help="Force Dr. GRPO ON (overrides the YAML 'dr_grpo').")
     drgrpo.add_argument("--no-dr-grpo", dest="dr_grpo", action="store_false",
                         help="Force Dr. GRPO OFF (TRL default loss/scaling).")
+
+    # Original-GRPO loss switch (overrides the YAML 'grpo_loss'). Same axis as
+    # --dr-grpo -- both write GRPOConfig.loss_type, and passing both is rejected by
+    # MarshalConfig.__post_init__ rather than silently resolved. Applies to the
+    # MARSHAL path and the --no-marshal baseline alike; off => TRL's loss_type=dapo.
+    grpoloss = p.add_mutually_exclusive_group()
+    grpoloss.add_argument("--grpo-loss", dest="grpo_loss", action="store_true", default=None,
+                          help="Force TRL loss_type='grpo' ON (overrides the YAML "
+                               "'grpo_loss'): per-row mean token loss, then a mean over "
+                               "rows -- what upstream MARSHAL/ROLL trains under.")
+    grpoloss.add_argument("--no-grpo-loss", dest="grpo_loss", action="store_false",
+                          help="Force it OFF (TRL default loss_type='dapo').")
 
     # --- the rest of the MARSHAL algorithm config ----------------------------------
     # Every remaining MarshalConfig field, so a cluster sweep can vary any of them
@@ -449,6 +467,8 @@ def wandb_tags(args: argparse.Namespace, marshal_config) -> list[str]:
     ]
     if marshal_config.dr_grpo:
         tags.append("dr_grpo")
+    if marshal_config.grpo_loss:
+        tags.append("grpo_loss")
     if marshal_config.length_penalty:
         tags.append("length_penalty")
     if marshal_config.turn_rewards:
@@ -789,9 +809,21 @@ def main() -> None:
     _report_length_penalty(marshal_config, args.max_completion_length)
     print(f"[kl] beta={args.kl_beta}" + (" (disabled)" if args.kl_beta == 0.0 else ""))
     _dr_overrides = marshal_config.trl_grpo_overrides()
-    print(f"[dr_grpo] enabled={marshal_config.dr_grpo}"
-          + (f" -> {_dr_overrides}" if _dr_overrides
-             else " (off; TRL defaults: loss_type=dapo, scale_rewards=group)"))
+    print(f"[loss] loss_type={marshal_config.trl_loss_type} "
+          f"(dr_grpo={marshal_config.dr_grpo} grpo_loss={marshal_config.grpo_loss})"
+          + (f" -> GRPOConfig{_dr_overrides}" if _dr_overrides
+             else " (TRL defaults: loss_type=dapo, scale_rewards=group; no key set)"))
+    if marshal_config.grpo_loss:
+        print("[loss] NOTE: loss_type='grpo' weights every ROW equally (each row's "
+              "tokens are averaged over that row's own length), so short turns carry "
+              "far more gradient per token than long ones -- the response-level length "
+              "bias dapo removes. This is what upstream MARSHAL/ROLL trains under.")
+        print("[loss] NOTE: TRL divides by the FULL row count, placeholder rows "
+              "included, where ROLL divides by its VALID-row count -- so this run is "
+              "scaled by (1 - placeholder_rate) against upstream. That is ~2.1x on "
+              "wordle_withclue, 1.9x on imagegame, 1.5x on guesswhat, ~1x on dond/"
+              "matchit_ascii/referencegame/textmapworld. Read marshal/rows/"
+              "placeholder_rate for THIS run before comparing gradient scales.")
 
     # 2. Self-play env (persistent across rollout calls) + dataset from packaged instances.
     env = SelfPlayEnv(args.game)
