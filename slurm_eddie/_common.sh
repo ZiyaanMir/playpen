@@ -85,6 +85,15 @@ export UV_CACHE_DIR="$SCRATCH/home_cache/uv"
 export TMPDIR="${TMPDIR:-$SCRATCH/tmp}"
 mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$TMPDIR"
 
+# The one remaining thing that writes to $HOME on every run. vLLM's usage reporter
+# appends to ~/.config/vllm/usage_stats.json from a background thread; with home at
+# quota that thread dies with
+#   OSError: [Errno 122] Disk quota exceeded   (vllm/usage/usage_lib.py:289)
+# in the first 20 lines of every train*.err. It is NOT fatal -- it is a daemon thread
+# and training continues -- but it is noise on top of a real error, and it is a
+# telemetry upload nobody asked for. Off costs nothing.
+export VLLM_NO_USAGE_STATS=1
+
 # --- Isambard compatibility shim ---------------------------------------------
 # The sibling ../slurm/*.sh scripts are for Isambard and end with
 #     --output-dir "$PROJECTDIR/$USER/marshal-runs/<game>"
