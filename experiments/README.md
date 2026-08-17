@@ -410,6 +410,50 @@ recovered.
 > `model_registry.json` still has it at the top level, which matters if you call
 > `playpen eval <model>` directly.
 
+### Re-running the lm-eval half for runs that lost it
+
+```bash
+experiments/queue_eval_backfill.sh -n              # what WOULD be queued
+experiments/queue_eval_backfill.sh                 # queue it
+experiments/queue_eval_backfill.sh '*Qwen3-8B*' --limit 5
+```
+
+The lm-eval counterpart of the gameplay backfill below. Walks `$MARSHAL_RUNS`, finds every
+experiment with real checkpoints and no `results*.json` under `eval/`, and re-submits
+through the same `run_eval.sh` a fresh experiment uses. Written for the 2026-08-10..08-15
+`ModuleNotFoundError` window described under **Prerequisites**, and useful for any eval
+that died on OOM or the walltime.
+
+"Has results" is keyed on the `results*.json` that `summarize_eval.py` actually reads, not
+on `eval/` existing — every failed shard created that directory and put nothing in it.
+Gameplay results survive: `summarize.sh` rebuilds both tables, so `PLAYPEN_RESULTS.md`
+is regenerated, not lost.
+
+Two guards worth knowing about, because both were failure modes of the original
+submission:
+
+* **The environment is checked once, up front**, and nothing is submitted if it is still
+  broken. Without that, a backfill's only achievement is reproducing the original error
+  on 130 fresh GPU allocations.
+* **Experiments the scheduler still has a job for are skipped.** An experiment that is
+  still training must not be evaluated now — the jobs would score whichever checkpoints
+  happen to exist, and the eval shards the original submission already holds behind that
+  training job will run on their own when it finishes. The test is whether any job id in
+  the experiment's `manifest.json` is still in `qstat`/`squeue`.
+
+`--force` re-queues experiments that already have results; `--fresh` deletes `eval/` and
+the shared `_base_eval_cache` first, for results that are *wrong* rather than missing (the
+same false-cache-hit reasoning as the gameplay side, below). Any `EVAL_*` you export is
+passed through to every job, so `EVAL_LIMIT=5 experiments/queue_eval_backfill.sh` smoke-tests
+a whole backfill cheaply.
+
+To re-run a single experiment instead:
+
+```bash
+experiments/eddie/run_eval.sh    $MARSHAL_RUNS/<experiment>
+experiments/isambard/run_eval.sh $MARSHAL_RUNS/<experiment>
+```
+
 ### Scoring runs that finished before this existed
 
 ```bash
@@ -903,6 +947,34 @@ lm-eval environment** that must already exist — these scripts do not build it:
 
 See `notes/LMEVAL_CHECKPOINTS_EDDIE.md` / `..._ISAMBARD.md` for building them, and
 pre-cache the base model on a login node (compute nodes may be offline).
+
+**Check it before you submit.**
+
+```bash
+experiments/lib/check_lmeval_env.sh                     # this cluster's default env
+LMEVAL_CONDA_ENV=lmeval2 experiments/lib/check_lmeval_env.sh
+```
+
+`eval.sh`'s first real statement is `python -c "import lm_eval, peft"` under `set -e`, so
+an environment that has lost the package kills the job five seconds in — *after* it has
+queued for hours and been handed a GPU. That is how the evaluations for 65 experiments
+were lost between 2026-08-10 and 2026-08-15: the Eddie `lmeval` env no longer had
+`lm_eval`, every shard died with `ModuleNotFoundError`, and because the gameplay half
+runs in the **training** venv it was unaffected — so those runs have a complete
+`playpen-eval/`, an empty `eval/`, and no `RESULTS.md`. Nothing flagged it: the summary
+job still ran, still printed `found no results*.json ... nothing to summarize`, and still
+exited 0.
+
+The check replicates each cluster's activation sequence line for line and prints which
+`python` answered, so `conda activate` landing in `base` is distinguishable from a genuinely
+missing package. `run_eval.sh` and `queue_eval_backfill.sh` run it for you and refuse to
+submit if it fails (`EVAL_SKIP_ENV_CHECK=1` / `--skip-env-check` to override).
+
+> A plain `pip install lm-eval` fixes the import and **not** the tasks. `logiglue` and
+> `logicbench` were baked into that env's `lm_eval/tasks/`, which is why `eval.sh` passes
+> no `--include_path`; a fresh install ships neither, and lm-eval fails per task rather
+> than up front — so an env that passes the import check can still produce an empty
+> `RESULTS.md`. Confirm with `lm-eval --tasks list | grep -E 'logiglue|logicbench'`.
 
 **The playpen games evaluation needs no third environment** — it runs in the repo's
 own `.venv`, where clemcore, playpen and peft already are. What it does need is
