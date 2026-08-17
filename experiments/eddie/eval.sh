@@ -32,15 +32,40 @@ exp_layout
 exp_banner eval
 
 # --- the lm-eval environment (NOT the training venv) -------------------------
-# logiglue/logicbench are baked into this conda env's lm_eval/tasks, so no
-# --include_path is needed. See notes/LMEVAL_CHECKPOINTS_EDDIE.md section 2.
+# Two ways to provide it, and the VENV is now preferred.
+#
+# WHY. The conda route puts the environment in $HOME (~/.conda/envs + ~/.conda/pkgs),
+# which is the ONE thing in this pipeline not on scratch -- $REPO, $MARSHAL_RUNS,
+# $HF_HOME and $TMPDIR all are. Eddie home is a small quota, and exceeding it does not
+# fail loudly and stop: a pip/conda write that runs out of quota mid-way leaves the
+# environment importable but INCOMPLETE. That is how the 2026-08-10..08-15 evals were
+# lost -- `conda activate lmeval` still returned 0, and `import lm_eval` then raised
+# ModuleNotFoundError on every one of 65 experiments. Repairing it hit
+# `OSError: [Errno 122] Disk quota exceeded`, which is the same wall from the front.
+#
+# So: a venv on scratch, alongside everything else, with nothing in $HOME.
+# Build it once (see experiments/README.md, "Prerequisites"), then it is picked up
+# automatically. VENV_LMEVAL overrides the location; LMEVAL_CONDA_ENV still works and
+# is used when no venv is found, so older runs reproduce unchanged.
+SCRATCH="${SCRATCH:-/exports/eddie/scratch/$USER}"
+
 [ -r /etc/profile.d/modules.sh ] && . /etc/profile.d/modules.sh
 module load cuda
-module load anaconda/2024.02
-# shellcheck disable=SC1091
-conda activate "${LMEVAL_CONDA_ENV:-lmeval}"
 
-SCRATCH="${SCRATCH:-/exports/eddie/scratch/$USER}"
+LMEVAL_VENV_DEFAULT="$SCRATCH/lmeval-venv"
+if [ -n "${VENV_LMEVAL:-}" ] || [ -f "$LMEVAL_VENV_DEFAULT/bin/activate" ]; then
+    VENV_LMEVAL="${VENV_LMEVAL:-$LMEVAL_VENV_DEFAULT}"
+    # Identity-checked, not path-checked: a venv copied from another location keeps the
+    # original absolute VIRTUAL_ENV in bin/activate and silently activates a DIFFERENT
+    # environment. exp_activate_venv compares resolved prefixes and fails loudly.
+    exp_activate_venv "$VENV_LMEVAL" "lm-eval venv" || exit 1
+else
+    # logiglue/logicbench are baked into this conda env's lm_eval/tasks, so no
+    # --include_path is needed. See notes/LMEVAL_CHECKPOINTS_EDDIE.md section 2.
+    module load anaconda/2024.02
+    # shellcheck disable=SC1091
+    conda activate "${LMEVAL_CONDA_ENV:-lmeval}"
+fi
 export HF_HOME="$SCRATCH/home_cache/huggingface"
 export TMPDIR="${TMPDIR:-$SCRATCH/tmp}"
 export TOKENIZERS_PARALLELISM=false

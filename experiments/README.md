@@ -939,8 +939,39 @@ Training uses the repo's own `.venv`, plus `wandb` in it for the metrics logging
 above (`uv pip install wandb`, or `WB_ENABLE=0` to skip). **Evaluation uses a separate
 lm-eval environment** that must already exist — these scripts do not build it:
 
-* **Eddie** — conda env `lmeval` with `peft` installed and `logiglue`/`logicbench` baked
-  into its `lm_eval/tasks/`. Override the name with `LMEVAL_CONDA_ENV`.
+* **Eddie** — a venv at `$SCRATCH/lmeval-venv`, picked up automatically; override the
+  path with `VENV_LMEVAL`. If no venv is found it falls back to the conda env `lmeval`
+  (override the name with `LMEVAL_CONDA_ENV`), so runs from before 2026-08-17 reproduce
+  unchanged. **Prefer the venv**: the conda route is the one thing in this pipeline that
+  lives in `$HOME`, and `RUN_ON_EDDIE_playpen_marshal.md` §2.1 is blunt about that 10 GB
+  quota — *"nothing heavy — it will fill and break jobs"*. It did (see below).
+
+  ```bash
+  # in a PLAIN interactive session -- not the login node, not a GPU one
+  qlogin -l h_rt=02:00:00 -pe interactivemem 4 -l h_rss=16G
+  source /exports/applications/support/set_qlogin_environment.sh
+  . /etc/profile.d/modules.sh && module load cuda
+
+  export SCRATCH=/exports/eddie/scratch/$USER
+  export UV_CACHE_DIR=$SCRATCH/home_cache/uv     # the CACHE is what blows the quota,
+  export PIP_CACHE_DIR=$SCRATCH/home_cache/pip   # not the packages
+  export HF_HOME=$SCRATCH/home_cache/huggingface
+  mkdir -p "$UV_CACHE_DIR" "$PIP_CACHE_DIR" "$HF_HOME"
+
+  uv venv --python 3.10 $SCRATCH/lmeval-venv
+  source $SCRATCH/lmeval-venv/bin/activate
+  which python                                   # MUST be $SCRATCH/lmeval-venv/bin/python
+  uv pip install lm-eval peft
+  ```
+
+  Those three cache exports are the same ones `slurm_eddie/_common.sh:82-86` sets for
+  training. `eval.sh` historically set only `HF_HOME` and `TMPDIR`, so a bare
+  `pip install` into the conda env wrote to `~/.cache/pip` and hit
+  `OSError: [Errno 122] Disk quota exceeded`.
+
+  Being on scratch, this venv is subject to the ~1-month purge of untouched files. That
+  is what `check_lmeval_env.sh` is for — it catches a purged env in one second on a login
+  node instead of on 130 GPU allocations, and the four commands above rebuild it.
 * **Isambard** — a pre-existing venv at `$PROJECTDIR/$USER/evaluation/eval`
   (activated by `source`), with `logiglue`/`logicbench` already registered so no
   `--include_path` is needed. Override the path with `VENV_LMEVAL`.
@@ -964,6 +995,13 @@ runs in the **training** venv it was unaffected — so those runs have a complet
 `playpen-eval/`, an empty `eval/`, and no `RESULTS.md`. Nothing flagged it: the summary
 job still ran, still printed `found no results*.json ... nothing to summarize`, and still
 exited 0.
+
+**The home quota is the mechanism.** Exceeding it does not fail loudly and stop — a
+`pip`/`conda` write that runs out of quota part-way leaves the environment *activatable
+but incomplete*, which is precisely the observed signature: `conda activate lmeval`
+returned 0 (under `set -e` the job would otherwise have died before reaching the import),
+and `import lm_eval` then raised. Hence the venv-on-scratch route above, which keeps the
+eval environment out of `$HOME` entirely.
 
 The check replicates each cluster's activation sequence line for line and prints which
 `python` answered, so `conda activate` landing in `base` is distinguishable from a genuinely
