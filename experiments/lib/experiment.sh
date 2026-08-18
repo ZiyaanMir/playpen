@@ -891,7 +891,15 @@ exp_setup_tmpdir() {
     export TORCHINDUCTOR_CACHE_DIR="$base/inductor"
     export TRITON_CACHE_DIR="$base/triton"
     export VLLM_CACHE_ROOT="$base/vllm"
-    mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT"
+    # XDG_CACHE_HOME catches the packages that have no dedicated variable and would
+    # otherwise land in ~/.cache: flashinfer, tvm-ffi, and Triton's newer default
+    # location (~/.cache/triton, distinct from the ~/.triton that TRITON_CACHE_DIR
+    # above overrides -- BOTH existed in $HOME on Eddie, 97 MB and 25 MB).
+    export XDG_CACHE_HOME="$base/xdg"
+    export MPLCONFIGDIR="$base/matplotlib"
+    export WANDB_CACHE_DIR="$base/wandb"
+    mkdir -p "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR" "$VLLM_CACHE_ROOT" \
+             "$XDG_CACHE_HOME" "$MPLCONFIGDIR" "$WANDB_CACHE_DIR"
 
     # Remove it on the way out so compile caches don't bloat the experiment directory
     # or get rsync'd home. The path is baked into the trap NOW rather than read from

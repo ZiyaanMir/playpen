@@ -85,6 +85,19 @@ export UV_CACHE_DIR="$SCRATCH/home_cache/uv"
 export TMPDIR="${TMPDIR:-$SCRATCH/tmp}"
 mkdir -p "$HF_HOME" "$PIP_CACHE_DIR" "$UV_CACHE_DIR" "$TMPDIR"
 
+# The catch-all, and the reason this list kept growing one package at a time. Almost
+# everything that caches to $HOME does it under ~/.cache and honours XDG_CACHE_HOME:
+# flashinfer, tvm-ffi, and Triton's NEWER default (~/.cache/triton, which is a second
+# location from the ~/.triton the explicit TRITON_CACHE_DIR below covers). Redirecting
+# the parent is cheaper and more complete than chasing each one.
+export XDG_CACHE_HOME="$SCRATCH/home_cache/xdg"
+# wandb's artifact cache. Set NOWHERE before 2026-08-18 and 1.3 GB in $HOME by then --
+# every training run writes to it, so it grew unbounded.
+export WANDB_CACHE_DIR="$SCRATCH/home_cache/wandb"
+# matplotlib builds a font cache on first import; clean_up pulls matplotlib in.
+export MPLCONFIGDIR="$SCRATCH/home_cache/matplotlib"
+mkdir -p "$XDG_CACHE_HOME" "$WANDB_CACHE_DIR" "$MPLCONFIGDIR"
+
 # The one remaining thing that writes to $HOME on every run. vLLM's usage reporter
 # appends to ~/.config/vllm/usage_stats.json from a background thread; with home at
 # quota that thread dies with
