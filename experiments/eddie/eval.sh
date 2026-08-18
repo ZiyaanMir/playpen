@@ -67,10 +67,30 @@ else
     conda activate "${LMEVAL_CONDA_ENV:-lmeval}"
 fi
 export HF_HOME="$SCRATCH/home_cache/huggingface"
-export TMPDIR="${TMPDIR:-$SCRATCH/tmp}"
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-0}"
-mkdir -p "$HF_HOME" "$TMPDIR" "$EVAL_DIR"
+mkdir -p "$HF_HOME" "$EVAL_DIR"
+
+# TMPDIR **and every torch/triton/inductor cache derived from it**, per job, inside
+# the experiment directory. Isambard's eval.sh has always called this; Eddie's set
+# only TMPDIR, and that asymmetry is a bug that cost the whole 2026-08-18 backfill.
+#
+# WHAT WENT WRONG. lm-eval's `hf` backend runs a real forward pass, and torch JIT
+# compiles Triton kernels the first time it does. Triton writes its cache to
+# TRITON_CACHE_DIR, defaulting to **$HOME/.triton** -- and Eddie home is a 10 GB
+# quota that was already full. So ~500 requests into a 373,944-request run, every
+# evaluation died with
+#   OSError: [Errno 122] Disk quota exceeded:
+#     '/home/<user>/.triton/cache/<hash>/tmp.pid_...'
+#   (triton/runtime/cache.py:116 -> os.makedirs)
+# base row plus all five checkpoints, six for six, on every shard. Training was
+# never affected because slurm_eddie/_common.sh already redirects these three caches
+# and eval.sh does not source it (it uses the lm-eval env, not the training venv).
+#
+# exp_setup_tmpdir also makes the caches PER JOB, which matters here beyond the
+# quota: the two eval shards run concurrently, and a shared compile cache is how
+# concurrent jobs collide on each other's half-written kernels.
+exp_setup_tmpdir || exit 1
 
 python -c "import lm_eval, peft; print('[eval] lm_eval', lm_eval.__version__, '| peft', peft.__version__)"
 
