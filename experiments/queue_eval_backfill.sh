@@ -40,6 +40,7 @@ FORCE=0
 FRESH=0
 ASSUME_YES=0
 SKIP_ENV_CHECK=0
+REQUIRE_TASK=""
 LIMIT=0
 CLUSTER=""
 RUNS=""
@@ -63,6 +64,10 @@ options:
       --limit N      queue at most N experiments this time (0 = no limit)
       --runs DIR     experiments root      (default: \$MARSHAL_RUNS or the cluster's)
       --cluster C    eddie | isambard      (default: detected from qsub/sbatch)
+      --require-task P   a run counts as done only if some task name starts with P.
+                     Use it to re-queue runs that are missing one benchmark, e.g.
+                     --require-task bqa_  for logicbench (its group row is written
+                     even when every member task failed to register).
       --skip-env-check   submit even if the lm-eval env is broken (don't)
   -h, --help         this
 
@@ -91,6 +96,7 @@ while [ $# -gt 0 ]; do
         --fresh)           FRESH=1; FORCE=1 ;;
         --yes)             ASSUME_YES=1 ;;
         --skip-env-check)  SKIP_ENV_CHECK=1 ;;
+        --require-task)    REQUIRE_TASK="$2"; shift ;;
         --limit)           LIMIT="$2"; shift ;;
         --runs)            RUNS="$2"; shift ;;
         --cluster)         CLUSTER="$2"; shift ;;
@@ -196,8 +202,76 @@ count_checkpoints() {
     printf '%d\n' "$n"
 }
 
+# COVERAGE, not existence. Prints a short problem description; EMPTY means complete.
+#
+# WHY THIS IS NOT `find -name results*.json`. That was the original test, and it made
+# the backfill report "nothing to queue" over a pile of broken runs:
+#
+#   * 42 runs held a `base` row and NOTHING ELSE. The base row is served from
+#     $BASE_EVAL_CACHE ("reusing cached result (no GPU run)"), so it lands even when
+#     every checkpoint dies -- as they all did, on the ~/.triton quota bug. One cached
+#     file made a run with 20 unscored checkpoints look finished.
+#   * 13 runs scored logiglue but not logicbench, because the group registered EMPTY.
+#     lm-eval still writes the group row, so a results.json existed either way.
+#
+# So: count checkpoints actually scored against checkpoints on disk, and treat a task
+# that scored ZERO samples as absent. A group whose members all failed to register
+# emits {"alias":"logicbench","name":"logicbench","sample_len":0} -- no metrics at all
+# -- which is exactly the empty-group signature to catch generically.
+eval_status() {
+    [ -n "$PY" ] || { echo ""; return; }
+    "$PY" - "$1" "${REQUIRE_TASK:-}" <<'PYEND'
+import glob, json, os, sys
+exp, require = sys.argv[1], sys.argv[2]
+
+def scored_keys(d):
+    """Task keys with at least one real metric, merged over every results file here."""
+    keys, empty = set(), set()
+    for p in glob.glob(os.path.join(d, "**", "results*.json"), recursive=True):
+        try:
+            res = json.load(open(p)).get("results", {}) or {}
+        except Exception:
+            continue
+        for k, v in res.items():
+            if not isinstance(v, dict):
+                continue
+            if any(m.endswith(",none") and not m.startswith("alias") for m in v):
+                keys.add(k)
+            elif v.get("sample_len") == 0:
+                empty.add(k)
+    return keys, empty
+
+cks = set()
+for pat in ("train/checkpoint-*", "train/*/checkpoint-*"):
+    for c in glob.glob(os.path.join(exp, pat)):
+        if os.path.isfile(os.path.join(c, "adapter_config.json")):
+            cks.add(os.path.basename(c))
+if not cks:
+    print("")               # no checkpoints: the caller skips these separately
+    raise SystemExit
+
+done, allkeys, allempty = set(), set(), set()
+for name in cks:
+    k, e = scored_keys(os.path.join(exp, "eval", name))
+    allempty |= e
+    if k:
+        done.add(name)
+        allkeys |= k
+
+problems = []
+if len(done) < len(cks):
+    problems.append("%d/%d ckpt" % (len(done), len(cks)))
+if require and not any(k.startswith(require) for k in allkeys):
+    problems.append("no %s* tasks" % require)
+for g in sorted(allempty):
+    if g not in allkeys:
+        problems.append("%s EMPTY" % g)
+print("; ".join(problems))
+PYEND
+}
+
 has_eval_results() {
-    [ -n "$(find "$1/eval" -name 'results*.json' -print -quit 2>/dev/null)" ]
+    [ -z "$(eval_status "$1")" ]
 }
 
 echo "runs    : $RUNS"
@@ -238,11 +312,11 @@ if [ "${#TODO[@]}" -eq 0 ]; then
     exit 0
 fi
 
-printf '%-58s %5s  %s\n' EXPERIMENT CKPTS "lm-eval"
+printf '%-58s %5s  %s\n' EXPERIMENT CKPTS "what is missing"
 printf '%-58s %5s  %s\n' "$(printf '%.0s-' {1..58})" ----- -------
 for EXP in "${TODO[@]}"; do
     printf '%-58s %5s  %s\n' "$(basename "$EXP")" "$(count_checkpoints "$EXP")" \
-        "$(has_eval_results "$EXP" && echo "present (re-run)" || echo missing)"
+        "$(_st="$(eval_status "$EXP")"; [ -n "$_st" ] && echo "$_st" || echo "complete (re-run)")"
 done
 echo
 echo "${#TODO[@]} experiment(s) to queue" \

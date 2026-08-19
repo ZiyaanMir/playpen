@@ -53,18 +53,39 @@ def _write_atomic(path: str, text: str) -> None:
         raise
 
 
-def _newest_results_json(eval_subdir: str) -> str | None:
-    """The most recent results file lm-eval wrote anywhere under this directory.
+def _results_jsons(eval_subdir: str) -> list[str]:
+    """Every results file lm-eval wrote under this directory, OLDEST FIRST.
 
     lm-eval nests output as ``<output_path>/<sanitized_model_name>/results_<ts>.json``,
     and the sanitized name embeds the adapter path, so it is not predictable from
-    here -- hence the recursive glob. Newest wins, so re-running an eval supersedes
-    the earlier attempt rather than being ambiguous.
+    here -- hence the recursive glob.
     """
     hits = glob.glob(os.path.join(eval_subdir, "**", "results*.json"), recursive=True)
-    if not hits:
-        return None
-    return max(hits, key=os.path.getmtime)
+    return sorted(hits, key=os.path.getmtime)
+
+
+def _merged_scores(eval_subdir: str) -> dict[str, float]:
+    """All of this checkpoint's results files, merged, newer winning per task.
+
+    WHY MERGE RATHER THAN TAKE THE NEWEST FILE. A checkpoint accumulates one results
+    file per lm-eval invocation, and different invocations can cover DIFFERENT task
+    sets. Reading only the newest silently dropped every task the last run did not
+    cover: scoring `logicbench` on its own, after `logiglue` had already been scored,
+    produced a table with the logiglue columns gone -- as if they had never been run.
+
+    Merging makes a re-run ADDITIVE, which is what makes it affordable to fix one
+    broken benchmark. logiglue is ~40 min per checkpoint on an 8B model; re-running it
+    only to keep its columns in the table would have cost more GPU than the benchmark
+    being repaired.
+
+    Oldest first, so a genuine re-score of the SAME task still supersedes the older
+    number -- the previous "newest wins" behaviour, preserved per task key rather than
+    per file.
+    """
+    out: dict[str, float] = {}
+    for path in _results_jsons(eval_subdir):
+        out.update(_scores(path))
+    return out
 
 
 def _scores(path: str) -> dict[str, float]:
@@ -116,11 +137,11 @@ def main() -> None:
     rows: list[tuple[str, dict[str, float]]] = []
     missing: list[str] = []
     for name in names:
-        found = _newest_results_json(os.path.join(eval_dir, name))
-        if found is None:
+        scores = _merged_scores(os.path.join(eval_dir, name))
+        if not scores:
             missing.append(name)
             continue
-        rows.append((name, _scores(found)))
+        rows.append((name, scores))
 
     if not rows:
         print(f"[summary] found no results*.json under {eval_dir} -- nothing to summarize.")
