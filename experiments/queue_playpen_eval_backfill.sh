@@ -160,8 +160,41 @@ count_checkpoints() {
     printf '%d\n' "$n"
 }
 
+# COVERAGE, not existence. Prints what is missing; EMPTY means complete.
+#
+# The old test was `find -name results.csv -print -quit`, which is true as soon as ONE
+# row exists anywhere -- including the `base` row, which pp_eval_base_cached copies in
+# from $PPEVAL_CACHE without playing anything. That marked 7 runs holding nothing but a
+# cached baseline as finished, and 35 more that stopped part-way through their
+# checkpoints. All 42 were silently skipped by this backfill. Same bug, and same fix,
+# as eval_status in queue_eval_backfill.sh.
+pp_status() {
+    local exp="$1" ck n_ck=0 n_done=0 want
+    shopt -s nullglob
+    for ck in "$exp"/train/checkpoint-* "$exp"/train/*/checkpoint-*; do
+        [ -f "$ck/adapter_config.json" ] || continue
+        n_ck=$((n_ck + 1))
+        [ -n "$(find "$exp/playpen-eval/$(basename "$ck")" -name 'results.csv' -print -quit 2>/dev/null)" ] \
+            && n_done=$((n_done + 1))
+    done
+    shopt -u nullglob
+    [ "$n_ck" -eq 0 ] && { echo ""; return; }
+
+    # A run deliberately scored on a SUBSET (PPEVAL_CKPTS=last, or a specific list) is
+    # not incomplete -- and which subset it was is not reconstructible from the
+    # directory. Fall back to the old existence test for those rather than re-queueing
+    # hours of gameplay that was never meant to cover every checkpoint.
+    want="$(sed -n 's/^PPEVAL_CKPTS=//p' "$exp/experiment.env" 2>/dev/null | tr -d "\"'")"
+    if [ -n "$want" ]; then
+        [ "$n_done" -eq 0 ] && echo "subset '$want' unscored" || echo ""
+        return
+    fi
+
+    [ "$n_done" -lt "$n_ck" ] && echo "$n_done/$n_ck ckpt" || echo ""
+}
+
 has_playpen_results() {
-    [ -n "$(find "$1/playpen-eval" -name 'results.csv' -print -quit 2>/dev/null)" ]
+    [ -z "$(pp_status "$1")" ]
 }
 
 echo "runs    : $RUNS"
@@ -197,10 +230,11 @@ if [ "${#TODO[@]}" -eq 0 ]; then
     exit 0
 fi
 
-printf '%-58s %s\n' EXPERIMENT CKPTS
-printf '%-58s %s\n' "$(printf '%.0s-' {1..58})" -----
+printf '%-58s %5s  %s\n' EXPERIMENT CKPTS "what is missing"
+printf '%-58s %5s  %s\n' "$(printf '%.0s-' {1..58})" ----- ----------------
 for EXP in "${TODO[@]}"; do
-    printf '%-58s %s\n' "$(basename "$EXP")" "$(count_checkpoints "$EXP")"
+    printf '%-58s %5s  %s\n' "$(basename "$EXP")" "$(count_checkpoints "$EXP")" \
+        "$(_st="$(pp_status "$EXP")"; [ -n "$_st" ] && echo "$_st" || echo "complete (re-run)")"
 done
 echo
 echo "${#TODO[@]} experiment(s) to queue" \
