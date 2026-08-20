@@ -19,11 +19,20 @@
 # line), written by the submitter.
 #
 # --- Grid Engine options (overridable via BASE_EVAL_QSUB_OPTS) ----------------
+# H200 (141 GB) by default, unlike eval.sh which asks only for `gpu=1` and therefore
+# takes whatever is free -- that is how the 2026-08-17 batch ended up on A100 80 GB
+# cards. `-l h200=true` is the same request train.sh makes and is proven on this
+# cluster. For an A100 instead: BASE_EVAL_QSUB_OPTS='-l a100=true'.
+#
+# h_rt is 2 h, not eval.sh's 8 h, because this job scores ONE row. logicbench is
+# ~2,020 samples (logiglue is 86,333), so on an H200 it is minutes -- and a shorter
+# walltime also schedules sooner.
 #$ -N marshal_base_eval
 #$ -cwd
 #$ -q gpu
 #$ -l gpu=1
-#$ -l h_rt=08:00:00
+#$ -l h200=true
+#$ -l h_rt=02:00:00
 #$ -pe sharedmem 4
 #$ -l h_rss=12G
 
