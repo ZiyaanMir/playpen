@@ -218,8 +218,18 @@ count_checkpoints() {
 # that scored ZERO samples as absent. A group whose members all failed to register
 # emits {"alias":"logicbench","name":"logicbench","sample_len":0} -- no metrics at all
 # -- which is exactly the empty-group signature to catch generically.
+# Prints the queue-worthy status on stdout. A base-row gap goes to BASE_NOTE instead,
+# because it is fixed by run_base_eval.sh, not by re-scoring checkpoints.
 eval_status() {
+    BASE_NOTE=""
     [ -n "$PY" ] || { echo ""; return; }
+    local out
+    out="$(_eval_probe "$1")"
+    BASE_NOTE="$(printf '%s\n' "$out" | sed -n 's/^BASE://p')"
+    printf '%s\n' "$out" | sed '/^BASE:/d' | head -1
+}
+
+_eval_probe() {
     "$PY" - "$1" "${REQUIRE_TASK:-}" <<'PYEND'
 import glob, json, os, sys
 exp, require = sys.argv[1], sys.argv[2]
@@ -266,7 +276,18 @@ if require and not any(k.startswith(require) for k in allkeys):
 for g in sorted(allempty):
     if g not in allkeys:
         problems.append("%s EMPTY" % g)
-print("; ".join(problems))
+
+# The base row is reported SEPARATELY, on the second line, and never as a reason to
+# re-queue. A missing base row does not need the checkpoints re-scored: the row
+# depends only on (model, tasks, limit, extra), so run_base_eval.sh scores it once and
+# copies it into every experiment. Folding it into `problems` would spend ~130
+# checkpoint evaluations to obtain 13 copies of one row.
+basek, _ = scored_keys(os.path.join(exp, "eval", "base"))
+if require and not any(k.startswith(require) for k in basek):
+    print("; ".join(problems))
+    print("BASE:no %s* in base row" % require)
+else:
+    print("; ".join(problems))
 PYEND
 }
 
@@ -280,6 +301,7 @@ echo "cluster : $CLUSTER"
 echo
 
 TODO=()
+BASE_GAPS=()
 SKIP_DONE=0 SKIP_NOCK=0 SKIP_PAT=0 SKIP_NOTEXP=0 SKIP_LIVE=0
 LIVE_NAMES=()
 for EXP in "$RUNS"/*/; do
@@ -294,14 +316,36 @@ for EXP in "$RUNS"/*/; do
     if [ "$N_CK" -eq 0 ]; then
         SKIP_NOCK=$((SKIP_NOCK + 1)); continue
     fi
-    if [ "$FORCE" = 0 ] && has_eval_results "$EXP"; then
-        SKIP_DONE=$((SKIP_DONE + 1)); continue
+    # Probe ONCE, here in the current shell. eval_status() cannot be used for the base
+    # note: callers invoke it in a command substitution, which is a subshell, so any
+    # variable it sets is discarded. Parse both lines of the probe output instead.
+    _probe="$(_eval_probe "$EXP")"
+    _status="$(printf '%s\n' "$_probe" | sed '/^BASE:/d' | head -1)"
+    _basenote="$(printf '%s\n' "$_probe" | sed -n 's/^BASE://p')"
+    if [ "$FORCE" = 0 ] && [ -z "$_status" ]; then
+        SKIP_DONE=$((SKIP_DONE + 1))
+        # Complete on checkpoints, but the BASE row may still lack the benchmark.
+        [ -n "$_basenote" ] && BASE_GAPS+=("$NAME")
+        continue
     fi
     if has_live_job "$EXP"; then
         SKIP_LIVE=$((SKIP_LIVE + 1)); LIVE_NAMES+=("$NAME"); continue
     fi
     TODO+=("$EXP")
 done
+
+if [ "${#BASE_GAPS[@]}" -gt 0 ]; then
+    echo
+    echo "NOTE: ${#BASE_GAPS[@]} experiment(s) have every checkpoint scored but a BASE row"
+    echo "      missing '${REQUIRE_TASK}*'. Every delta in those tables is measured against"
+    echo "      a baseline that lacks the benchmark. They are NOT queued here -- re-scoring"
+    echo "      their checkpoints would not fix a base row. Fix it in one GPU job with:"
+    echo
+    echo "        EVAL_TASKS=<the missing benchmark> \\"
+    echo "          experiments/$CLUSTER/run_base_eval.sh ${BASE_GAPS[0]}"
+    echo
+    for n in "${BASE_GAPS[@]}"; do echo "      $n"; done
+fi
 
 if [ "${#TODO[@]}" -eq 0 ]; then
     echo "nothing to queue."

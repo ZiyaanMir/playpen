@@ -1,0 +1,55 @@
+{
+  "_README": [
+    "Task -> reasoning-type mapping. EDIT THIS FILE to change any assignment; the",
+    "scripts read it and never hard-code a category.",
+    "",
+    "logicbench is NOT listed here: its family is parsed mechanically from the task",
+    "name (bqa_/mcqa_ + first_order_logic / propositional_logic / non_monotonic_logic),",
+    "which is unambiguous and cannot drift.",
+    "",
+    "logiglue has no machine-readable category in the task YAMLs, so it is mapped by",
+    "hand below from the LogiGLUE benchmark's own taxonomy. Entries marked",
+    "confidence 'review' are the ones to check against the paper before publishing --",
+    "the scripts print them as a warning on every run.",
+    "",
+    "'mixed' = general multi-type logical-reasoning sets (exam-style MCQ, NLI) that",
+    "the deductive/inductive/abductive split does not cleanly describe. Keeping them",
+    "in their own bucket is deliberate: forcing them into one of the three would",
+    "invent a claim the benchmark does not make."
+  ],
+  "logiglue": {
+    "logiglue_bigbench_deduction":    {"group": "deductive",  "confidence": "high"},
+    "logiglue_folio":                 {"group": "deductive",  "confidence": "high"},
+    "logiglue_logicnli":              {"group": "deductive",  "confidence": "high"},
+    "logiglue_natlang":               {"group": "deductive",  "confidence": "high"},
+    "logiglue_prontoqa":              {"group": "deductive",  "confidence": "high"},
+    "logiglue_proofwriter":           {"group": "deductive",  "confidence": "high"},
+    "logiglue_rulebert":              {"group": "deductive",  "confidence": "high"},
+    "logiglue_rulebert_union_rules":  {"group": "deductive",  "confidence": "high"},
+    "logiglue_babi_task_15":          {"group": "deductive",  "confidence": "high",
+                                       "note": "bAbI task 15 is 'basic deduction'"},
+
+    "logiglue_cluttr":                {"group": "inductive",  "confidence": "high"},
+    "logiglue_cluttr_systematic":     {"group": "inductive",  "confidence": "high"},
+    "logiglue_babi_task_16":          {"group": "inductive",  "confidence": "high",
+                                       "note": "bAbI task 16 is 'basic induction'"},
+
+    "logiglue_alpha_nli":             {"group": "abductive",  "confidence": "high",
+                                       "note": "alphaNLI / ART -- the only abductive set, so this group is a single task"},
+
+    "logiglue_anli":                  {"group": "mixed", "confidence": "high",
+                                       "note": "Adversarial NLI -- NOT abductive; do not confuse with alpha_nli"},
+    "logiglue_bigbench_logical_args": {"group": "mixed", "confidence": "review"},
+    "logiglue_birdelectricity":       {"group": "mixed", "confidence": "review",
+                                       "note": "defeasible / non-monotonic; not cleanly one of the three"},
+    "logiglue_logiqa":                {"group": "mixed", "confidence": "high"},
+    "logiglue_logiqa2":               {"group": "mixed", "confidence": "high"},
+    "logiglue_reclor":                {"group": "mixed", "confidence": "high"},
+    "logiglue_wanli":                 {"group": "mixed", "confidence": "review"},
+    "logiglue_winologic":             {"group": "mixed", "confidence": "review"}
+  },
+  "group_order": {
+    "logiglue":   ["deductive", "inductive", "abductive", "mixed"],
+    "logicbench": ["first_order", "propositional", "non_monotonic"]
+  }
+}
