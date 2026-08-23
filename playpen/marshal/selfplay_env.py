@@ -136,19 +136,11 @@ class SelfPlayEnv:
     def reset(self, instance_idx: int, *, seed: int = 0) -> None:
         """Reset to the packaged instance at ``instance_idx`` (see ``list_instance_indices``).
 
-        The instance is handed down as a **deep copy**. Games are free to keep references
-        into it and mutate them, because a benchmark run plays each instance exactly once
-        -- codenames does exactly that: ``CodenamesBoard.__init__`` stores
-        ``game_instance["assignments"][...]`` lists by reference and ``reveal_word`` calls
-        ``self.hidden[assignment].remove(word)`` on them. A *training* loop replays one
-        instance thousands of times, so without the copy every episode permanently strips
-        words from the packaged board.
-
-        Measured before this copy existed: a codenames board starts at 25 words and fell
-        to ~7 by step 150 of a 500-step run, at which point the game is degenerate (it
-        ends on or right after the cluegiver's move, so the guesser seat never plays and
-        ~46% of every batch was a placeholder row). The better the policy got, the faster
-        the corruption ran, because a valid clue reveals more words per episode.
+        The instance is handed down as a **deep copy**. Games keep references into it
+        and mutate them -- a benchmark run plays each instance once, so that is safe
+        there, but a training loop replays one instance thousands of times. Without
+        the copy, codenames (whose ``reveal_word`` removes entries from the instance's
+        own lists) permanently strips words from the packaged board every episode.
         """
         instance_idx = int(instance_idx)
         if not 0 <= instance_idx < len(self._instance_rows):
@@ -248,13 +240,10 @@ class SelfPlayEnv:
         every entry is 0 until the terminal step, where each seat receives the shared
         outcome (SUCCESS ``+1``, FAILURE ``0``, ABORTED ``-1``), so the value read
         right after a step *is* the reward for that step. Delta arithmetic over this
-        property is therefore correct today -- but it would break the moment a custom
-        clemcore ``reward_func`` made rewards dense, because the reset discards what
-        accrued during the opponent's turns.
-
-        This is why playpen's dense per-turn rewards do not go through clemcore's
-        ``reward_func`` at all: ``playpen/marshal/turn_rewards.py`` runs as a second,
-        independent channel, leaving this one terminal-only and its arithmetic sound.
+        property would break the moment a custom clemcore ``reward_func`` made rewards
+        dense, since the reset discards what accrued during the opponent's turns --
+        which is why ``playpen/marshal/turn_rewards.py`` runs as a second, independent
+        channel instead of through that hook.
         """
         unwrapped = self._pz_env.unwrapped
         return [

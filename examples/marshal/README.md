@@ -55,11 +55,8 @@ Custom `rollout_func` generation requires vLLM (`use_vllm=True`).
 |---|---|
 | `enabled` | master switch. `false` ⇒ plain TRL GRPO (scalar terminal reward, TRL's own normalization). |
 | `agent_specific_normalization` | pool/normalize advantages per seat (MARSHAL's headline contribution). |
-| `turn_level_rewards` | keep per-turn rewards (`true`) vs. sum to one terminal scalar (`false`). |
 | `advantage_norm_mode` | `mean` (center) or `mean_std` (z-score). |
 | `gamma` | backward-return discount (MARSHAL uses `1.0`). |
-| `fidelity_mode` | `paper_correct` (default) vs. `marshal_exact` (bit-comparable reproduction of MARSHAL's *shipped* code, including two documented departures from its own paper). |
-| `marshal_exact_unique_pooling` | sub-flag for `marshal_exact`'s **second** departure only — the `torch.unique` distinct-value pooling. Default `true` (= `marshal_exact` unchanged); `false` keeps its pre-sum reward normalization but pools occurrence-weighted like `paper_correct`. **Inert under `paper_correct`**, which never uniques. |
 | `whiten_rewards` | z-score the token-level reward field batch-wide *before* the cumulative sum (mirrors ROLL's `whiten_rewards: true`, set in every shipped MARSHAL selfplay YAML; densifies sparse rewards with a length-dependent component). Default `false`. |
 | `whiten_advantages` | z-score the final advantages batch-wide *after* per-seat normalization (mirrors ROLL's `whiten_advantages: true`; scale stabilization). Default `false`. |
 | `dr_grpo` | run with the **Dr. GRPO** ([arXiv:2503.20783](https://arxiv.org/abs/2503.20783)) recipe: TRL `loss_type='dr_grpo'` (loss normalized by the constant `max_completion_length` ⇒ no length bias) + `scale_rewards='none'` (no std division ⇒ no difficulty bias). Default `false`. |
@@ -157,8 +154,7 @@ Two problems it addresses, both structural:
 
 1. **Turn-level credit has nothing to work with.** MARSHAL's turn-level estimator
    attributes reward at each turn boundary, but with a terminal-only reward every
-   turn of a row carries the same return — so `turn_level_rewards: true` currently
-   separates nothing.
+   turn of a row carries the same return, so there is nothing to separate.
 2. **Per-seat credit has nothing to work with either.** clembench gives *both* seats
    the same team outcome, so `agent_specific_normalization` mean-centers two
    identical distributions and both seats end up with identical advantages. A
@@ -218,10 +214,6 @@ one scalar per row) the episode total is added to the terminal reward. Either wa
 `marshal/turn_rewards/terminal_mean` logs the **unshaped** outcome, so a turn-rewards
 arm stays comparable with one that has the feature off.
 
-Prefer `fidelity_mode: paper_correct` here. Under `marshal_exact` the pre-sum pass
-subtracts a mean over all turn-boundary slots, which already biases by turn count; a
-denser reward field makes that term larger.
-
 ### Knobs
 
 | field | CLI | default | meaning |
@@ -263,9 +255,6 @@ python examples/marshal/train_selfplay.py \
 # MARSHAL off (plain GRPO baseline)
 python examples/marshal/train_selfplay.py --game taboo --no-marshal --max-steps 10
 
-# MARSHAL-exact reproduction (edit fidelity_mode: marshal_exact in the YAML)
-python examples/marshal/train_selfplay.py --game taboo --max-steps 10
-
 # MARSHAL + Dr. GRPO (unbiased loss/scaling; MARSHAL features preserved)
 python examples/marshal/train_selfplay.py --game taboo --dr-grpo --max-steps 10
 
@@ -295,7 +284,7 @@ python examples/marshal/train_selfplay.py --game taboo --max-steps 10 \
 ```
 
 Everything TRL and the trainer already log goes to W&B — reward, KL, loss, the
-`marshal/*` per-seat and length-penalty metrics, and the completions table
+`marshal/*` per-seat metrics, and the completions table
 (`log_completions` is on). What the flags add is the context that makes a *set* of
 runs comparable:
 
@@ -314,8 +303,8 @@ runs comparable:
 The run's config records the **resolved** MARSHAL config (YAML merged with CLI
 overrides), the LoRA/vLLM/GRPO settings and the output directory, and the run is
 auto-tagged with the switches that define the arm (`marshal`/`no-marshal`,
-`dr_grpo`, `length_penalty`, `paper_correct`/`marshal_exact`). So "which of these
-runs had per-seat normalization off" is a filter, not an archaeology exercise.
+`dr_grpo`, `grpo_loss`, `turn_rewards`, `no-seat-norm`). So "which of these runs had
+per-seat normalization off" is a filter, not an archaeology exercise.
 
 **`--wandb-mode auto` (the default) goes online only when a credential exists *and*
 the W&B API answers a connection; otherwise it records offline.** Both halves matter
@@ -392,13 +381,7 @@ models/marshal/{game}/{model}/20260721-142233/
   SFT first or rely on the KL term. When MARSHAL is *disabled*, the reward
   function applies the wordle-example abort-shaping (−1 → small random negative)
   to keep variance.
-- **`paper_correct` vs `marshal_exact`**: the port defaults to the algorithm the
-  paper *describes*. `marshal_exact` reintroduces two behaviors from MARSHAL's
-  shipped code that its own `PAPER_VS_CODE_DISCREPANCIES.md` flags as bugs (a
-  biasing pre-sum reward normalization, and distinct-value pooling that
-  equal-weights rare and common outcomes) — use it only to compare against
-  MARSHAL's own numbers. The two departures are separately switchable:
-  `marshal_exact_unique_pooling: false` (CLI `--no-marshal-exact-unique-pooling`)
-  keeps the first and drops the second, which is what isolates them in an
-  ablation. A run with it off is not a reproduction of MARSHAL's shipped
-  normalization and should not be reported as one.
+- **The algorithm the paper describes**: the port implements it, not MARSHAL's
+  shipped code. Two behaviors MARSHAL's own `PAPER_VS_CODE_DISCREPANCIES.md` flags
+  as bugs — a biasing pre-sum reward normalization, and distinct-value pooling that
+  equal-weights rare and common outcomes — are deliberately not reproduced.

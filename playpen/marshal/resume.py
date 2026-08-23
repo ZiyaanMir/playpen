@@ -8,31 +8,19 @@ jobs, each continuing the last:
 * :func:`stop_at_step_callback` ends a segment at a chosen global step, saving a
   checkpoint on the way out so the next segment has something to resume from.
 
-WHY THIS EXISTS. Both clusters cap a job's walltime -- 48 h on Eddie's gpu queue,
-24 h on Isambard's workq_qos -- and neither can be raised. A 1000-step guesswhat run
-on a long-episode game does not reliably fit, and until now a run killed at the
-walltime could only be REDONE, not continued (the comment at the top of
-``experiments/*/train.sh`` said exactly that). Everything below exists so those hours
-are recoverable.
+Both clusters cap a job's walltime (48 h on Eddie, 24 h on Isambard) and a long run
+does not reliably fit, so a chain lets those hours be recovered rather than redone.
 
-WHY ``--max-steps`` STAYS THE TOTAL, AND SEGMENTS STOP EARLY INSTEAD.
-The obvious design -- give segment *k* ``--max-steps k*S`` -- silently changes the
-learning rate schedule. HF builds the scheduler with ``num_training_steps=max_steps``
-and the default ``lr_scheduler_type='linear'`` decays to zero at that step;
-``scheduler.pt`` only restores ``last_epoch``, never the lambda, so a chain of
-segments with growing ``max_steps`` re-derives a DIFFERENT decay slope at every
-resume. The run would then not be the run it claims to be, and a 2-segment arm would
-not be comparable with a 1-segment arm of the same config -- which is fatal for an
-ablation.
+``--max-steps`` is always the TOTAL horizon for the whole chain, and ``--stop-at-step``
+ends a segment early. Giving segment *k* ``--max-steps k*S`` instead would silently
+change the learning-rate schedule: HF builds the scheduler with
+``num_training_steps=max_steps`` and ``scheduler.pt`` restores only ``last_epoch``,
+never the lambda, so a growing ``max_steps`` re-derives a different decay slope at
+every resume and a 2-segment arm stops being comparable with a 1-segment one.
 
-So instead: ``--max-steps`` is always the total horizon for the whole chain (the
-scheduler is therefore built once, identically, in every segment), and
-``--stop-at-step`` ends the segment early via a callback. The LR at step *n* is then
-the same number whether the run was done in one job or five.
-
-Deliberately stdlib-only at import time. The discovery half runs on a login node from
-``experiments/*/resume_experiment.sh`` (no torch, no GPU), and
-:func:`stop_at_step_callback` imports ``transformers`` lazily for that reason.
+Stdlib-only at import time. The discovery half runs on a login node from
+``experiments/*/resume_experiment.sh``, so :func:`stop_at_step_callback` imports
+``transformers`` lazily.
 """
 
 from __future__ import annotations
@@ -172,10 +160,9 @@ def resolve_resume(spec: Optional[str], output_dir: str) -> Tuple[Optional[str],
         checkpoint and continue it, and one code path covers both.
     ``"latest"``
         As ``auto``, but an empty ``output_dir`` is an ERROR. What
-        ``resume_experiment.sh`` passes, and what a segment >= 2 passes: there,
-        "nothing to resume from" means the previous job died before its first save,
-        and quietly starting over would spend a walltime on work that will be thrown
-        away when the operator notices.
+        ``resume_experiment.sh`` and any segment >= 2 passes: there, "nothing to
+        resume from" means the previous job died before its first save, and quietly
+        starting over would spend a walltime on work that will be thrown away.
     a path
         Either a ``checkpoint-<N>`` directory, or a directory CONTAINING them (its
         latest is taken -- so ``RESUME_FROM=$EXP_DIR/train`` does the obvious thing).
@@ -244,19 +231,17 @@ def _describe(path: str, prefix: str) -> str:
 def stop_at_step_callback(stop_at: int):
     """A ``TrainerCallback`` that ends training at ``stop_at`` and saves on the way out.
 
-    Mirrors what ``DefaultFlowCallback`` does at ``max_steps`` -- set BOTH
-    ``should_training_stop`` and ``should_save`` -- because only the second half
-    leaves the next segment something to resume from. Saving is not optional here:
-    the loop is exited immediately afterwards, and a segment that stopped without
-    saving has thrown away every step since its last ``save_steps`` boundary.
+    Mirrors what ``DefaultFlowCallback`` does at ``max_steps``: set both
+    ``should_training_stop`` and ``should_save``. Saving is not optional -- the loop
+    exits immediately afterwards, and a segment that stopped without saving has
+    thrown away every step since its last ``save_steps`` boundary.
 
-    Callbacks are called in registration order and each may only add flags to the
-    shared ``TrainerControl``, so this composes with the default flow rather than
-    racing it: when ``stop_at`` happens to be a multiple of ``save_steps`` both
-    callbacks set ``should_save`` and exactly one checkpoint is written.
+    Callbacks only add flags to the shared ``TrainerControl``, so this composes with
+    the default flow: when ``stop_at`` is a multiple of ``save_steps`` both set
+    ``should_save`` and exactly one checkpoint is written.
 
-    ``transformers`` is imported here rather than at module scope so the discovery
-    half of this module stays usable from a login node.
+    ``transformers`` is imported here so the discovery half of this module stays
+    usable from a login node.
     """
     from transformers import TrainerCallback
 
@@ -288,37 +273,21 @@ def ensure_peft_resume_compat() -> Optional[str]:
     Returns a description of the problem when a shim was installed, or None when the
     installed versions need no help. Safe to call more than once.
 
-    THE BUG THIS FIXES, seen on peft 0.19.1 + transformers 4.57.6 (the versions
-    `pip install 'playpen[marshal]'` resolves to today -- peft declares a bare
-    ``transformers`` dependency, so nothing stops that pairing):
-
-        trainer.train(resume_from_checkpoint=...)
-          -> Trainer._load_from_checkpoint
-          -> PeftModel.load_adapter
-          -> peft.utils.save_and_load.set_peft_model_state_dict
-          -> _maybe_shard_state_dict_for_tp
-        ImportError: cannot import name 'EmbeddingParallel' from
-                     'transformers.integrations.tensor_parallel'
-
-    peft imports four tensor-parallel classes at call time and this transformers
-    version only has three -- ``EmbeddingParallel`` does not exist anywhere in it. So
-    EVERY LoRA resume raises, after the model and vLLM have loaded, on a stack that
-    trains perfectly well.
+    The bug, seen on peft 0.19.1 + transformers 4.57.6:
+    ``peft.utils.save_and_load._maybe_shard_state_dict_for_tp`` imports four
+    tensor-parallel classes at call time and this transformers version only has
+    three, so ``ImportError: cannot import name 'EmbeddingParallel'`` fires on every
+    LoRA resume, after the model and vLLM have loaded.
 
     peft guards that call with ``torch.distributed.is_initialized()`` alone, which is
-    true for us: TRL's colocate vLLM mode initialises a single-rank process group.
-    But sharding a tensor across a one-rank mesh is the identity -- there is nothing
-    to shard -- so on ``world_size == 1`` the whole call is a no-op, and skipping it
-    is not a workaround so much as declining to do nothing slowly.
+    true here because TRL's colocate vLLM mode initialises a single-rank process
+    group. Sharding across a one-rank mesh is the identity, so at ``world_size == 1``
+    the call is a no-op and skipping it is safe.
 
-    Both halves of that reasoning are enforced rather than assumed:
-
-    * the shim is installed ONLY if the import genuinely fails, so on a healthy
-      pairing peft's own code runs untouched and this function disappears;
-    * it skips ONLY at ``world_size == 1``. Under real tensor parallelism it defers
-      to the original, which will raise the same ImportError -- correctly, because
-      there the sharding is load-bearing and silently skipping it would produce
-      wrong weights instead of an error.
+    Two conditions keep the shim narrow: it is installed only if the import genuinely
+    fails, and it skips only at ``world_size == 1``. Under real tensor parallelism it
+    defers to the original, which raises -- correctly, since there the sharding is
+    load-bearing.
     """
     try:
         from peft.utils import save_and_load

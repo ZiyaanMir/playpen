@@ -1,31 +1,27 @@
 """Per-seat rollout collection for MARSHAL-style self-play.
 
 One physical self-play episode is played through :class:`SelfPlayEnv`, and each
-seat's turn-alternating trajectory is accumulated into its own :class:`SeatRollout`
--- the seat-aware, turn-boundary-aware generalization of the single-seat
-``GrpoEpisodeRollout`` in ``examples/openenv/wordle-trl.ipynb``.
-
+seat's turn-alternating trajectory is accumulated into its own :class:`SeatRollout`.
 Each turn's observation comes from clemcore's own ``Player.perceive_context`` /
 ``perceive_response``, i.e. the exact context clemcore uses at inference time, so
 there is no train/eval prompt-format drift.
 
 The row a seat accumulates must be *the same token sequence the policy generated
-under* -- otherwise the log-probs the loss recomputes describe a context that never
-existed. Under ``row_context_mode="exact"`` (the default) that is guaranteed by
-construction: turn 1 renders the chat template, every later turn appends the template's
-own per-turn scaffolding to the row and generates from *that*, and the environment span
-is read back from the token ids the sampler reports. Re-rendering the message history
-each turn cannot achieve this -- templates render the same assistant message differently
-depending on its position (Qwen3 emits an empty ``<think>`` block only before the last
-one) -- which is why the legacy ``"spliced"`` mode is broken and kept only for replay.
+under*, or the log-probs the loss recomputes describe a context that never existed.
+Under ``row_context_mode="exact"`` (the default) that holds by construction: turn 1
+renders the chat template, every later turn appends the template's own per-turn
+scaffolding to the row and generates from *that*, and the environment span is read
+back from the token ids the sampler reports. Re-rendering the message history each
+turn cannot achieve this, because templates render the same assistant message
+differently depending on its position -- which is why the legacy ``"spliced"`` mode
+is kept only for replay.
 
 Reasoning ("thinking") models get one extra step: the ``<think>`` block is stripped
-from what the *game* and the *conversation history* see, while staying in the
-trained token sequence. See :func:`strip_reasoning`.
+from what the *game* and the *conversation history* see, while staying in the trained
+token sequence. See :func:`strip_reasoning`.
 
 ``trl`` is imported lazily (inside :func:`play_selfplay_episode`) so this module is
-importable without the training stack; ``transformers`` tokenizers are fine to
-type against but are only used at call time.
+importable without the training stack.
 """
 
 from __future__ import annotations
@@ -47,12 +43,10 @@ _THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 def strip_reasoning(text: str) -> str:
     """Remove a reasoning-model ``<think>`` block from a response, text-level.
 
-    Clembench parsers are strict about the *start* of an utterance -- guesswhat
-    aborts the episode unless it begins with ``QUESTION:``/``GUESS:``
-    (``clembench/guesswhat/master.py:161``) -- so a leaked ``<think>`` prefix aborts
-    every turn. Only the game and the conversation history are fed the stripped
-    text; the think tokens stay in ``completion_ids`` and therefore keep receiving
-    gradient, which is the point of training a reasoning policy.
+    Clembench parsers are strict about the *start* of an utterance, so a leaked
+    ``<think>`` prefix aborts every turn. Only the game and the conversation history
+    see the stripped text; the think tokens stay in ``completion_ids`` and keep
+    receiving gradient.
 
     Handles the three shapes that actually occur:
 
@@ -78,10 +72,9 @@ def _strip_reasoning_by_tokens(completion_ids: Sequence[int], tokenizer) -> Opti
     """Token-level strip: decode only what follows the last ``</think>`` token.
 
     Preferred over :func:`strip_reasoning` because TRL builds its ``text`` field with
-    ``skip_special_tokens=True`` (``trl/experimental/openenv/utils.py``). If a
-    tokenizer registers ``</think>`` as a *special* token, the tag is already gone
-    from that string and text-level stripping would silently leave the raw reasoning
-    prose in place. Slicing the ids sidesteps the question entirely.
+    ``skip_special_tokens=True``. If a tokenizer registers ``</think>`` as a *special*
+    token the tag is already gone from that string, and text-level stripping would
+    leave the raw reasoning prose in place. Slicing the ids sidesteps that.
 
     Returns ``None`` when the tokenizer has no ``</think>`` token or the completion
     contains none, so the caller can fall back to the text-level path.
@@ -128,15 +121,12 @@ def _with_no_think(messages) -> List[dict]:
 def render_prompt(tokenizer, messages) -> str:
     """Render the chat prompt with reasoning suppressed three ways over, every turn.
 
-    Clembench games want one short, strictly-formatted line per turn (``QUESTION: ``,
-    ``[Proposal: ...]``). Reasoning models spend the whole per-turn budget inside
-    ``<think>`` instead: observed on Qwen3-4B/dond, every turn hit
-    ``max_completion_length`` mid-thought, never closed the block, and so never
-    emitted an action -- every episode aborted, which is an all-equal advantage pool
-    and zero gradient. Disabling thinking is also what MARSHAL itself settled on for
-    clembench envs (``SESSION_2026-07-11_playpen_reward_bypass.md``).
+    Clembench games want one short, strictly-formatted line per turn. A reasoning
+    model instead spends the whole per-turn budget inside ``<think>``, hits
+    ``max_completion_length`` mid-thought and never emits an action, so every episode
+    aborts. MARSHAL disables thinking for clembench envs for the same reason.
 
-    ``enable_thinking=False`` alone was NOT sufficient in practice, so all three of
+    ``enable_thinking=False`` alone is not sufficient in practice, so all three of
     Qwen3's documented switches are applied together:
 
     1. ``enable_thinking=False`` -- the template kwarg. Templates that don't define
@@ -147,11 +137,9 @@ def render_prompt(tokenizer, messages) -> str:
        generation resumes *after* an already-closed block and the model cannot open
        another. This is the hard guarantee; 1 and 2 are hints the model may ignore.
 
-    The prefill is skipped when the template already emitted a think block of its own
-    (newer Qwen3 templates do this under ``enable_thinking=False``), which would
-    otherwise leave two stacked blocks. Only the *tail* is inspected, so a
-    ``</think>`` belonging to an earlier assistant turn in the history is not mistaken
-    for the template's own prefill.
+    The prefill is skipped when the template already emitted a think block of its own,
+    which would otherwise leave two stacked blocks. Only the *tail* is inspected, so a
+    ``</think>`` from an earlier assistant turn is not mistaken for it.
 
     The prefill lands in the prompt, never in ``completion_ids``, so it costs no
     trained tokens and does not disturb turn-boundary bookkeeping.
@@ -190,12 +178,11 @@ def render_turn_scaffold(tokenizer, obs_content: str) -> str:
     ``render_prompt`` means all three of Qwen3's reasoning switches land on the new user
     message exactly as they do on turn 1.
 
-    Exactly ONE render is taken, deliberately. Diffing two renders would be wrong for
-    templates that render the same assistant message differently depending on its
-    position -- Qwen3 is one: it emits an empty ``<think>`` block before the *last*
-    assistant message and omits it for earlier ones. That position-dependence is also
-    why a row can never be reconstructed by re-rendering history, and why ``"exact"``
-    mode extends the row instead.
+    Exactly one render is taken. Diffing two renders would be wrong for templates that
+    render the same assistant message differently depending on its position -- Qwen3
+    emits an empty ``<think>`` block before the *last* assistant message only. That
+    position-dependence is also why ``"exact"`` mode extends the row rather than
+    re-rendering history.
 
     Raises:
         ValueError: if the template mangles or duplicates the probe, so the caller gets
@@ -237,13 +224,11 @@ class SeatRollout:
     environment token); the name ``env_mask`` is what TRL expects as an extra
     field, ``owner_mask`` is what the advantage code reads.
 
-    ``drifted`` distinguishes the two reasons a row can arrive training-inert:
-    the seat never got a usable turn (the game ended first), or its row failed
-    :meth:`_SeatBuilder.sync_context` and was dropped. Both look identical
-    downstream -- ``owner_mask == [0]``, no gradient, excluded from the advantage
-    pools -- so without this flag a rising drift rate is indistinguishable from a
-    game that simply ends early, and censoring is silent. The trainer turns it
-    into the ``marshal/rows/drift_*`` metrics.
+    ``drifted`` distinguishes the two reasons a row can arrive training-inert: the
+    seat never got a usable turn (the game ended first), or its row failed
+    :meth:`_SeatBuilder.sync_context` and was dropped. Both look identical downstream,
+    so without this flag a rising drift rate is indistinguishable from a game that
+    ends early. The trainer turns it into the ``marshal/rows/drift_*`` metrics.
     """
 
     seat: int
@@ -365,10 +350,8 @@ class _SeatBuilder:
         """Fold a seat's per-turn shaping into its turn rewards; return the total.
 
         ``values`` is aligned with ``turn_end_positions`` (one entry per turn, in
-        order). Anything past this seat's recorded turns is dropped rather than
-        summed onto the last one -- a shaping value with no turn boundary to sit at
-        has no place in the return, and silently relocating it would put reward on a
-        turn that did not earn it.
+        order). Anything past this seat's recorded turns is dropped rather than summed
+        onto the last one, which would put reward on a turn that did not earn it.
         """
         total = 0.0
         for index, value in enumerate(values):
@@ -456,25 +439,22 @@ def play_selfplay_episode(
       the row splices in raw environment text. Reproduces pre-fix runs; the trained
       sequence does not match the generated one from turn 2 onward.
 
-    ``turn_reward_tracker`` (``None`` = off, the default, and byte-identical to
-    before this parameter existed) is a
+    ``turn_reward_tracker`` (``None`` = off, the default) is a
     ``playpen.marshal.turn_rewards.TurnRewardTracker``. When given, it is asked for a
     per-turn signal after every step, and at episode end its scaled, budget-capped
-    values are added to each seat's ``turn_rewards`` -- *on top of* the env's terminal
+    values are added to each seat's ``turn_rewards`` -- on top of the env's terminal
     reward, never instead of it. It reads the game's live state through
-    ``SelfPlayEnv.game_state``, so an env that does not expose one (a stubbed test
-    env) simply produces no shaping.
+    ``SelfPlayEnv.game_state``, so an env that does not expose one produces no
+    shaping.
 
     ``strip_think`` (default on, and a no-op for non-reasoning models) removes the
     ``<think>`` block from the utterance handed to the game and to clemcore's
     conversation memory, while leaving those tokens in ``completion_ids`` so they
     are still trained. Turn it off only to reproduce the un-stripped behavior.
 
-    Note the one behavioral consequence of ``"exact"``: later turns are conditioned on
-    the seat's *raw* generations, because the row is the context and the row is what we
-    train on. You cannot train on tokens X while conditioning the next turn on a
-    sanitized X' -- that mismatch is exactly the bug this mode fixes. The game and
-    clemcore's transcript still see the stripped utterance, unchanged.
+    One behavioral consequence of ``"exact"``: later turns are conditioned on the
+    seat's *raw* generations, because the row is the context and the row is what is
+    trained on. The game and clemcore's transcript still see the stripped utterance.
     """
     from trl.experimental.openenv import generate_rollout_completions
 
@@ -536,9 +516,8 @@ def play_selfplay_episode(
         response = outputs.get("text") or tokenizer.decode(
             outputs["completion_ids"], skip_special_tokens=True
         )
-        # The FULL generation (reasoning included) is what we train on: add_model_tokens
-        # gets the untouched completion_ids, so <think> tokens stay under the loss mask
-        # and inside this turn's advantage span.
+        # The full generation (reasoning included) is what is trained on, so <think>
+        # tokens stay under the loss mask and inside this turn's advantage span.
         builder.add_model_tokens(outputs["completion_ids"], outputs["logprobs"])
         if exact:
             builder.row_text = prompt_text + tokenizer.decode(
@@ -626,11 +605,8 @@ def play_selfplay_episode(
             # This seat has no trainable trajectory -- it never got a turn (the game
             # ended first), it generated nothing, or its row drifted. Emit a
             # training-inert placeholder rather than omitting it, so the seat still
-            # reports the episode's *actual* outcome. Reporting 0.0 here instead would
-            # be a fabricated FAILURE: on codenames, where ~48% of rows are seats that
-            # never moved because the game aborted first, that halved the logged abort
-            # rate (33.7% logged vs 64.3% among rows that actually played) and, on the
-            # plain-GRPO path, fed a fake reward straight into the group baseline.
+            # reports the episode's actual outcome; reporting 0.0 would be a
+            # fabricated FAILURE in the reward statistics.
             rollouts[seat] = SeatRollout(
                 seat=seat,
                 prompt_ids=[int(pad_id)],

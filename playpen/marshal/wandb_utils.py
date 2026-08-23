@@ -5,22 +5,19 @@ importable on a login node (to resolve settings and write a manifest) without
 torch, trl, vllm -- or even ``wandb`` itself. The only place ``wandb`` is imported
 is :meth:`WandbSettings.start`, which the training script calls once.
 
-Why start the run ourselves instead of just passing ``report_to="wandb"``?
-HuggingFace's ``WandbCallback.setup`` calls ``wandb.init(project=..., name=...)``
-**only when ``wandb.run is None``**, and it passes nothing else -- no entity, no
-group, no tags, no run id, no offline directory. Those are exactly the fields that
-make a set of ablation runs comparable in the UI. Because the callback reuses an
-already-open run (and then folds ``TrainingArguments`` into its config), calling
-``wandb.init`` first gives us every field *and* keeps HF's own logging intact.
+The run is opened here rather than by ``report_to="wandb"`` alone: HF's
+``WandbCallback.setup`` calls ``wandb.init(project=..., name=...)`` only when
+``wandb.run is None`` and passes nothing else -- no entity, group, tags, run id or
+offline directory, which are the fields that make a set of ablation arms comparable.
+Initializing first sets every field, and the callback reuses the open run.
 
-Cluster reality drives two design points:
+Two cluster-driven defaults:
 
 * ``mode="auto"`` resolves to **offline** when no API key is reachable, so a batch
-  job on a compute node with no outbound network still records everything to disk
-  and never blocks on a login prompt. ``wandb sync`` uploads it afterwards.
+  job on a compute node with no outbound network still records to disk and never
+  blocks on a login prompt. ``wandb sync`` uploads it afterwards.
 * the offline run directory defaults to the run's own output directory, so an
-  experiment folder stays self-contained (one thing to rsync home, one thing to
-  delete) -- the same principle ``experiments/lib/experiment.sh`` follows.
+  experiment folder stays self-contained.
 """
 
 from __future__ import annotations
@@ -149,12 +146,10 @@ class WandbSettings:
             with ``run_id`` to continue a run after a requeue.
         notes: Free text stored on the run.
         required: Whether the user asked for W&B *by name* (``--wandb`` /
-            ``--report-to wandb``) rather than implicitly (a ``WANDB_PROJECT`` left
-            in the environment). It decides only one thing -- what a missing
-            ``wandb`` package does -- and it decides it the way each case deserves:
-            an explicit request fails loudly at startup, an inherited environment
-            variable degrades to a warning rather than killing a training job that
-            never asked for W&B in the first place. See :meth:`start`.
+            ``--report-to wandb``) rather than implicitly (an inherited
+            ``WANDB_PROJECT``). It decides only what a missing ``wandb`` package
+            does: an explicit request fails at startup, an inherited variable
+            degrades to a warning. See :meth:`start`.
     """
 
     enabled: bool = False
@@ -388,12 +383,10 @@ class WandbSettings:
         ``TrainingArguments`` into the same config.
 
         A missing ``wandb`` package fails here, at startup, when the run was asked
-        for explicitly: someone who passed ``--wandb`` and got a silent no-op would
-        discover it only after the run finished, with nothing recorded. When W&B was
-        merely *implied* by a ``WANDB_PROJECT`` sitting in the environment it warns
-        and carries on instead, so a stale shell variable cannot kill a training job
-        that never asked for W&B. Everything *after* a successful init is
-        best-effort -- see :func:`log_config`.
+        for explicitly, so a silent no-op is not discovered only after the run
+        finished. When W&B was merely implied by an inherited ``WANDB_PROJECT`` it
+        warns and carries on. Everything after a successful init is best-effort --
+        see :func:`log_config`.
 
         Only rank 0 opens a run. On other ranks HF's callback is a no-op anyway
         (``state.is_world_process_zero``), and a second init would fragment one

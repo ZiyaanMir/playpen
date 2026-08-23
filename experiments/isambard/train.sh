@@ -120,21 +120,7 @@ ARGS+=( --resume-from-checkpoint "$SEGMENT_RESUME" )
 [ "${SEGMENT_STOP_AT:-0}" -lt "${MAX_STEPS:-0}" ] 2>/dev/null \
     && ARGS+=( --stop-at-step "$SEGMENT_STOP_AT" )
 [ "${GRAD_CKPT:-1}" = "1" ] && ARGS+=( --gradient-checkpointing )
-# Length penalty. Empty => don't pass the flag, so the YAML value stands.
-[ -n "${LP_PER_TOKEN:-}" ] && ARGS+=( --length-penalty-per-token "$LP_PER_TOKEN" )
-[ -n "${LP_BUDGET:-}"    ] && ARGS+=( --length-penalty-budget "$LP_BUDGET" )
-# DEPRECATED and inert (the penalty no longer has a threshold), still forwarded so an
-# existing preset or command line runs unchanged. train_selfplay.py warns that they
-# are ignored, and the manifest records them under legacy_fields_ignored.
-[ -n "${LP_MAX_LEN:-}" ] && ARGS+=( --length-penalty-max-len "$LP_MAX_LEN" )
-[ -n "${LP_COEF:-}"    ] && ARGS+=( --length-penalty-coef "$LP_COEF" )
-# marshal_exact's torch.unique distinct-value pooling. Tri-state like TR_ENABLE
-# below; only has an effect under fidelity_mode: marshal_exact.
-case "${UNIQUE_POOL:-}" in
-    1) ARGS+=( --marshal-exact-unique-pooling ) ;;
-    0) ARGS+=( --no-marshal-exact-unique-pooling ) ;;
-esac
-# TRL loss aggregation. Tri-state like UNIQUE_POOL: 1 = loss_type='grpo' (upstream
+# TRL loss aggregation. Tri-state like TR_ENABLE below: 1 = loss_type='grpo' (upstream
 # MARSHAL/ROLL's per-row mean), 0 = force TRL's default loss_type='dapo', empty = leave
 # the YAML alone. Dr. GRPO is the other arm of this axis and is passed the old way,
 # EXTRA_TRAIN_ARGS='--dr-grpo'; train_selfplay.py rejects both at once.
@@ -159,7 +145,7 @@ esac
 # normal case here -- experiments/lib/wandb_sync.sh uploads it from the login node.
 exp_wandb_args
 ARGS+=( "${WANDB_ARGS[@]}" )
-# Unquoted on purpose: a pre-split flag string (e.g. "--no-length-penalty").
+# Unquoted on purpose: a pre-split flag string (e.g. "--no-whiten-rewards").
 [ -n "${EXTRA_TRAIN_ARGS:-}" ] && ARGS+=( ${EXTRA_TRAIN_ARGS} )
 
 echo "[train] python -m examples.marshal.train_selfplay ${ARGS[*]}"

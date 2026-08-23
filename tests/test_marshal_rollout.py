@@ -529,7 +529,7 @@ class TestSeatThatNeverPlayedReportsTheRealOutcome(unittest.TestCase):
         idle = RowRollout(seat=1, completion_len=1, owner_mask=[0],
                           turn_end_positions=[], turn_rewards=[])
         adv = compute_marshal_advantages([real, idle], 4, agent_specific=True,
-                                         marshal_exact=False, norm_mode="mean")
+                                         norm_mode="mean")
         self.assertTrue(torch.equal(adv[1], torch.zeros(4)),
                         "placeholder row must carry no advantage anywhere")
 

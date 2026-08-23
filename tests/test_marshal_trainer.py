@@ -465,16 +465,8 @@ class TestPairedBatchWithPlaceholderEndToEnd(unittest.TestCase):
 class TestTurnCountDoesNotSetTheAdvantage(unittest.TestCase):
     """Regression guard for the turn-count bias (audit finding F1).
 
-    Measured in production: with ``fidelity_mode='marshal_exact'`` and
-    ``turn_level_rewards=True``, the within-step correlation between a winning row's
-    turn count and its advantage was -0.95, and a 2-turn win was worth 3.5x an 8-turn
-    win at identical reward. Under ``paper_correct`` + ``whiten_rewards=False`` the
-    same batch gives -0.15.
-
-    This test does NOT assert that the biased setting is forbidden -- it is a faithful
-    reproduction of MARSHAL's shipped code and stays available. It pins the *recommended*
-    setting so the bias cannot come back unnoticed there, and pins the biased one so
-    the reproduction stays honest about what it reproduces.
+    At a fixed terminal reward, a row's advantage must not depend on how many turns
+    it took.
     """
 
     @staticmethod
@@ -512,42 +504,16 @@ class TestTurnCountDoesNotSetTheAdvantage(unittest.TestCase):
     def _spread(values):
         return max(values) - min(values)
 
-    def test_recommended_setting_is_almost_turn_count_independent(self):
+    def test_shipped_setting_is_almost_turn_count_independent(self):
         vals = self._first_token_advantages(
-            self._rows(), turn_level=True, marshal_exact=False,
-            norm_mode="mean", whiten_rewards=False, whiten_advantages=True,
+            self._rows(), norm_mode="mean",
+            whiten_rewards=False, whiten_advantages=True,
         )
         self.assertLess(
             self._spread(vals), 0.30,
-            f"paper_correct + whiten_rewards=False should be near turn-count "
-            f"independent at fixed reward, got spread {self._spread(vals):.3f}: {vals}",
+            f"advantages should be near turn-count independent at fixed reward, "
+            f"got spread {self._spread(vals):.3f}: {vals}",
         )
-
-    def test_marshal_exact_with_turn_level_is_strongly_turn_count_dependent(self):
-        """Pins the known bias, so 'marshal_exact' cannot quietly stop reproducing it."""
-        vals = self._first_token_advantages(
-            self._rows(), turn_level=True, marshal_exact=True,
-            norm_mode="mean", whiten_rewards=True, whiten_advantages=True,
-        )
-        self.assertGreater(self._spread(vals), 1.0, f"expected the known bias, got {vals}")
-        # Monotone decreasing in turn count: more turns, less credit for the same win.
-        self.assertEqual(vals, sorted(vals, reverse=True), f"expected monotone decay, got {vals}")
-
-    def test_turning_off_whiten_rewards_alone_does_not_remove_the_bias(self):
-        """The documented trap: whiten_rewards is the wrong lever under marshal_exact."""
-        kw = dict(turn_level=True, marshal_exact=True, norm_mode="mean", whiten_advantages=True)
-        on = self._first_token_advantages(self._rows(), whiten_rewards=True, **kw)
-        off = self._first_token_advantages(self._rows(), whiten_rewards=False, **kw)
-        self.assertGreater(self._spread(off), 1.0)
-        for a, b in zip(on, off):
-            self.assertAlmostEqual(a, b, places=5)
-
-    def test_turn_level_false_removes_the_bias_under_marshal_exact(self):
-        vals = self._first_token_advantages(
-            self._rows(), turn_level=False, marshal_exact=True,
-            norm_mode="mean", whiten_rewards=True, whiten_advantages=True,
-        )
-        self.assertLess(self._spread(vals), 1e-6, f"expected no turn-count spread, got {vals}")
 
 
 def _stub_base_generate(output):
@@ -629,10 +595,7 @@ class TestGenerateAndScoreInstallsMarshalAdvantages(unittest.TestCase):
             rows,
             self.completion_ids.shape[1],
             gamma=config.gamma,
-            turn_level=config.turn_level_rewards,
             agent_specific=config.agent_specific_normalization,
-            marshal_exact=config.marshal_exact,
-            unique_pooling=config.unique_value_pooling,
             norm_mode=config.advantage_norm_mode,
             whiten_rewards=config.whiten_rewards,
             whiten_advantages=config.whiten_advantages,
@@ -716,11 +679,8 @@ class TestDegenerateBatchDoesNotProduceNaNLoss(unittest.TestCase):
 class TestRewardFuncIsUnshapedOnBothPaths(unittest.TestCase):
     """The reward must be the game outcome, identically on both arms.
 
-    ``--no-marshal`` used to replace an exact ``-1.0`` (ABORTED) with
-    ``-random.random()``. That gave eight identical outcomes eight different
-    advantages, moved the mean abort reward from -1.0 to -0.5, and inflated the
-    baseline arm's logged ``reward`` -- so the ablation compared two different
-    reward functions, not two advantage estimators. These pin the removal.
+    Any shaping applied on one arm only would make the ablation compare two reward
+    functions rather than two advantage estimators.
     """
 
     OUTCOMES = [-1.0, -1.0, 0.0, 1.0, -0.9999999, -1.0000001]

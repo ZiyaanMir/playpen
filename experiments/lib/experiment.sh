@@ -23,7 +23,7 @@
 #
 # EXP_ID is <game>_<model>_<tag>_<date-time>, e.g. dond_Qwen3-4B_lp384_20260723-142530.
 # The tag is what makes an ablation legible six weeks later -- always set EXP_TAG when
-# a run differs from the preset (EXP_TAG=lp_off, EXP_TAG=paper_correct, ...).
+# a run differs from the preset (EXP_TAG=no_whiten, EXP_TAG=drgrpo, ...).
 
 # --- refuse execution --------------------------------------------------------
 (return 0 2>/dev/null) || {
@@ -61,13 +61,13 @@ exp_load_preset() {
     # the preset's 200-step run. So we save what the caller set, source the preset,
     # then put the caller's values back on top.
     #
-    # `${!v+set}` tests for *set*, not non-empty, so an intentional `LP_PER_TOKEN=` (meaning
+    # `${!v+set}` tests for *set*, not non-empty, so an intentional `TR_SCALE=` (meaning
     # "leave this to the YAML") is preserved rather than treated as absent.
     local _override_names=() _override_vals=() _v _i
     for _v in MODEL MARSHAL_CONFIG \
               NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
               LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-              VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL GRPO_LOSS \
+              VLLM_UTIL VLLM_MAX_MODEL_LEN GRPO_LOSS \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
               EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
@@ -109,40 +109,17 @@ exp_load_preset() {
     VLLM_UTIL="${VLLM_UTIL:-0.30}"
     VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-8192}"
 
-    # Length penalty: a flat per-token cost, capped per episode. Empty
-    # LP_PER_TOKEN/LP_BUDGET => don't pass the flag, so the YAML value stands. No
-    # per-game calibration is needed any more (the cap makes the episode total
-    # game-independent), so presets set neither by default.
-    LP_PER_TOKEN="${LP_PER_TOKEN:-}"
-    LP_BUDGET="${LP_BUDGET:-}"
-
-    # DEPRECATED and inert: these configured the old threshold-based penalty. Still
-    # forwarded (so an existing preset or command line runs unchanged) and still
-    # recorded in the manifest, which flags them as ignored -- train_selfplay.py
-    # prints the same warning at startup.
-    LP_MAX_LEN="${LP_MAX_LEN:-}"
-    LP_COEF="${LP_COEF:-}"
-
-    # marshal_exact's distinct-value (torch.unique) pooling, as a tri-state like
-    # TR_ENABLE: 1 = force it on, 0 = force it off (keeping marshal_exact's pre-sum
-    # reward normalization but pooling occurrence-weighted), empty = leave the YAML
-    # alone. Only bites when fidelity_mode is marshal_exact -- paper_correct never
-    # uniques, so UNIQUE_POOL=0 is a no-op there and UNIQUE_POOL=1 cannot turn it on.
-    # fidelity_mode itself has no env var; set it in the YAML or via
-    # EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact'.
-    UNIQUE_POOL="${UNIQUE_POOL:-}"
-
-    # TRL loss aggregation, tri-state like UNIQUE_POOL: 1 = loss_type='grpo' (upstream
-    # MARSHAL/ROLL's per-row mean; short rows carry more gradient per token), 0 = force
-    # it off (TRL's default loss_type='dapo'), empty = leave the YAML alone. Applies on
-    # the MARSHAL path and the --no-marshal baseline alike. Dr. GRPO is the other arm of
-    # the same axis and has no env var -- pass EXTRA_TRAIN_ARGS='--dr-grpo' for it;
-    # setting both is rejected by MarshalConfig, not silently resolved.
+    # TRL loss aggregation, tri-state: 1 = loss_type='grpo' (upstream MARSHAL/ROLL's
+    # per-row mean; short rows carry more gradient per token), 0 = force TRL's default
+    # loss_type='dapo', empty = leave the YAML alone. Applies on the MARSHAL path and
+    # the --no-marshal baseline alike. Dr. GRPO is the other arm of the same axis and
+    # has no env var -- pass EXTRA_TRAIN_ARGS='--dr-grpo' for it; setting both is
+    # rejected by MarshalConfig.
     GRPO_LOSS="${GRPO_LOSS:-}"
 
-    # Dense per-turn rewards (playpen/marshal/turn_rewards.py). Same convention as
-    # LP_*: empty => don't pass the flag at all, so the YAML value stands. Set
-    # TR_ENABLE=1 to force them on for a run, TR_ENABLE=0 to force them off.
+    # Dense per-turn rewards (playpen/marshal/turn_rewards.py). Empty => don't pass
+    # the flag at all, so the YAML value stands. Set TR_ENABLE=1 to force them on for
+    # a run, TR_ENABLE=0 to force them off.
     # TR_SCALE/TR_BUDGET are the calibration knobs -- see the marshal_config.yaml
     # block and experiments/README.md.
     TR_ENABLE="${TR_ENABLE:-}"
@@ -256,7 +233,7 @@ exp_load_preset() {
     export GAME MODEL MARSHAL_CONFIG \
            NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
            LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-           VLLM_UTIL VLLM_MAX_MODEL_LEN LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL GRPO_LOSS \
+           VLLM_UTIL VLLM_MAX_MODEL_LEN GRPO_LOSS \
            TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
            TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
            EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA EVAL_SHARD_SIZE \
@@ -1057,8 +1034,6 @@ exp_banner() {
         echo "batch       = ${PER_DEVICE_BATCH:-?} x ${GRAD_ACCUM:-?} accum, "\
 "${NUM_GENERATIONS:-?} generations"
         echo "max_compl   = ${MAX_COMPLETION_LENGTH:-?} tokens/turn"
-        echo "len_penalty = per_token=${LP_PER_TOKEN:-<yaml>} budget=${LP_BUDGET:-<yaml>}"\
-"${LP_MAX_LEN:+  [LP_MAX_LEN=$LP_MAX_LEN IGNORED]}${LP_COEF:+  [LP_COEF=$LP_COEF IGNORED]}"
         echo "turn_rewards= ${TR_ENABLE:-<yaml>} scale=${TR_SCALE:-<yaml>} "\
 "budget=${TR_BUDGET:-<yaml>} source=${TR_SOURCE:-<yaml>}"
         # Which TRL loss the run will train under. <yaml> means GRPO_LOSS did not force

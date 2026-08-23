@@ -12,20 +12,15 @@ This script redoes only the cheap part, from the `interactions.json` files alrea
     python experiments/lib/rescore_playpen_eval.py <EXP_DIR> --row checkpoint-100
     python experiments/lib/rescore_playpen_eval.py --all $MARSHAL_RUNS
 
-WHY THIS EXISTS (the 2026-07-30 Isambard run). `clembench/privateshared/master.py`
-imports `sklearn`, which is not in the training venv. During gameplay clemcore catches
-that per game and carries on, so 13 of the 14 games played normally. During scoring,
-`clemcore.cli.score` collects exceptions and then calls **`sys.exit(1)`** — no
-traceback, no message, just a silent non-zero exit that killed `playpen eval` before
-`clemeval` ever ran. One missing package on one game therefore threw away the
-aggregation for all 14 games across 8 checkpoints: ~3.5 h of GH200 time that had
-already produced perfectly good interaction files.
+One game's scorer failing takes the whole aggregation down: `clemcore.cli.score`
+collects exceptions and then calls `sys.exit(1)` with no traceback, killing
+`playpen eval` before `clemeval` runs. A missing package on one game therefore throws
+away the aggregation for every game and every checkpoint.
 
-So the recovery is deliberately **per game and failure-tolerant**: a game whose scorer
-cannot even be imported is reported and skipped, and every other game is still scored
-and aggregated. A partial clemscore over 13 games, with the missing one visible as a
-gap in the per-game table, beats no result at all — and the fix (install the package)
-is then a one-line change with the evidence already in hand.
+So the recovery is **per game and failure-tolerant**: a game whose scorer cannot be
+imported is reported and skipped, and every other game is still scored and
+aggregated. A partial clemscore, with the missing game visible as a gap in the
+per-game table, beats no result at all.
 
 `SystemExit` is caught explicitly: `clem.score`'s failure mode is `sys.exit`, which
 is *not* an `Exception` subclass and sails straight through a bare `except Exception`.

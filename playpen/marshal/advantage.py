@@ -1,40 +1,22 @@
 """Turn-level returns and agent-specific (per-seat) advantage normalization.
 
-This module is a from-scratch, framework-light port of MARSHAL's advantage math
-(originally in ``MARSHAL/roll/utils/functionals.py``: ``compute_reinforce_return``
-and ``normalize_unique_values_by_player``). It depends only on ``torch`` so it is
-unit-testable with no model, GPU, trl, or vllm.
-
-The two supported behaviors mirror ``MarshalConfig.fidelity_mode``:
-
-* ``"paper_correct"`` -- the algorithm the paper *describes*: no biasing pre-sum
-  reward normalization, and occurrence-weighted (frequency-weighted) pooling over
-  trajectory returns.
-* ``"marshal_exact"`` -- MARSHAL's *shipped code*, including two documented
-  departures from its own paper: a pre-sum reward-normalization pass and
-  distinct-value ("unique") pooling that equal-weights rare and common outcomes.
-
-See ``PAPER_VS_CODE_DISCREPANCIES.md`` in the MARSHAL repo for the audit these
-two modes are derived from.
-
-Those two departures are separately switchable: ``marshal_exact`` selects both by
-default, and the ``unique_pooling`` argument threaded through this module can turn
-the second one off on its own (``MarshalConfig.marshal_exact_unique_pooling``),
-giving "MARSHAL's pre-sum pass with occurrence-weighted pooling". Leave it ``None``
-to follow ``marshal_exact``, which is the historical behavior.
+A framework-light port of MARSHAL's advantage math (``MARSHAL/roll/utils/
+functionals.py``: ``compute_reinforce_return`` and
+``normalize_unique_values_by_player``). Depends only on ``torch``, so it is
+unit-testable with no model, GPU, trl or vllm.
 
 Token/turn indexing convention
 ------------------------------
 All positions are indices into a single rollout row's *completion* token
-sequence (the tokens after the prompt), matching how TRL lays out the
-``(B, T)`` advantages tensor it consumes (completion tokens are right-padded, so
-completion position ``j`` maps to column ``j``).
+sequence (the tokens after the prompt), matching how TRL lays out the ``(B, T)``
+advantages tensor it consumes (completion tokens are right-padded, so completion
+position ``j`` maps to column ``j``).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Sequence
 
 import torch
 
@@ -46,8 +28,8 @@ _EPS = 1e-6
 class RowRollout:
     """The per-row information the advantage computation needs.
 
-    One ``RowRollout`` corresponds to one rollout "row" == one self-play seat's
-    trajectory within one episode (see ``playpen/marshal/selfplay_agent.py``).
+    One ``RowRollout`` is one self-play seat's trajectory within one episode
+    (see ``playpen/marshal/selfplay_agent.py``).
 
     Attributes:
         seat: 0 or 1 -- which self-play seat produced this row.
@@ -56,10 +38,9 @@ class RowRollout:
             and 0 for environment-feedback tokens. Gradient (and advantage) only
             applies where this is 1.
         turn_end_positions: completion indices at which each of this seat's turns
-            ends (i.e. the position of that turn's last generated token).
+            ends (the position of that turn's last generated token).
         turn_rewards: reward attributed to each of this seat's turns, aligned with
-            ``turn_end_positions``. For clembench's default sparse rewards these
-            are all 0 except the last (the terminal outcome).
+            ``turn_end_positions``.
     """
 
     seat: int
@@ -69,241 +50,36 @@ class RowRollout:
     turn_rewards: Sequence[float]
 
 
-@dataclass(frozen=True)
-class LengthPenaltySpec:
-    """A tiny, threshold-free per-token cost on generation length.
-
-    Every generated token costs ``per_token``, from the first one -- there is no
-    "free" length below a threshold and no bonus branch above one, so the penalty
-    for a turn is simply::
-
-        penalty(tokens) = -per_token * tokens        (0 for a turn that generated
-                                                      nothing)
-
-    and the whole term is ``<= 0`` by construction: it can only ever discourage
-    length, never pay for it.
-
-    WHY THIS CANNOT OVERWHELM THE TERMINAL REWARD
-    ---------------------------------------------
-    ``per_token`` alone is not a bound -- the penalty is charged *per turn* and the
-    backward cumulative return sums a seat's turns, so what actually competes with
-    the game outcome is the episode total, which grows with turn count. ``budget``
-    bounds exactly that: :func:`row_length_penalties` rescales a row's per-turn
-    penalties proportionally whenever their sum exceeds it, so
-
-        ``|sum of one seat's length penalty over one episode| <= budget``
-
-    holds whatever the game, the turn count or the turn lengths turn out to be. The
-    rescale is proportional, so relative credit between turns survives (a long turn
-    is still charged more than a short one) and no sign is flipped.
-
-    With ``budget`` below 1.0 the penalty can therefore never reorder two episodes
-    that ended differently: the smallest gap between two distinct clembench outcomes
-    (SUCCESS ``+1`` / FAILURE ``0`` / ABORTED ``-1``) is 1.0, and the most the
-    penalty can move an episode's return is ``budget``. It ranks episodes *within*
-    an outcome class -- shorter is better, all else equal -- and the terminal reward
-    keeps deciding everything else. The shipped ``0.1`` leaves that guarantee intact
-    with room to spare, including alongside the dense ``turn_rewards`` channel
-    (whose own worst-case swing is ``2 * turn_reward_budget``; see
-    ``MarshalConfig.length_penalty_budget``).
-
-    The defaults are deliberately far below the bound: at ``2e-5`` per token a
-    500-token turn costs ``-0.01`` and a 10-turn episode of them ``-0.10``, i.e. a
-    tenth of the gap between winning and losing. ``budget`` is a safety net, not the
-    operating point -- tune ``per_token`` so a typical episode lands under it, and
-    watch ``marshal/length_penalty/budget_clip_rate`` (a rate near 1.0 means the cap
-    binds every episode, so only the *shape* of the term survives and its magnitude
-    is being set by ``budget`` rather than by ``per_token``).
-
-    HISTORY -- this replaces the direct port of MARSHAL's Kimi-1.5-style
-    ``compute_length_penalty`` (``roll/agentic/rollout/env_manager.py:276-294``), a
-    hinge that scored exactly 0 below ``max_len`` and fell linearly beyond it. That
-    shape needed per-game calibration of the threshold against the generation cap
-    (get it wrong in either direction and the term was either numerically inert or
-    strong enough to make silence beat winning), and it charged nothing at all for
-    the ordinary-length turns that make up most of a run. A flat per-token cost
-    needs no threshold and no per-game tuning. The old ``length_penalty_coef`` /
-    ``_bonus`` / ``_min_len`` / ``_max_len`` / ``_offset`` config fields are still
-    accepted so existing YAMLs, pinned resume configs and cluster presets keep
-    loading, but they are inert -- see ``MarshalConfig``.
-
-    IMPORTANT -- enabling this at all is a deliberate divergence from MARSHAL's
-    shipped behavior for this class of environment. MARSHAL applies its penalty only
-    to its board-game envs: ``env_manager.py:470-480`` guards the call behind
-    ``if not isinstance(env, BaseLanguageBasedEnv)`` with the comment "No
-    MARSHAL-imposed reward shaping for free-text envs (e.g. Playpen/clembench)".
-    Turning it on here shapes a reward MARSHAL leaves unshaped, so a run using it is
-    not a MARSHAL reproduction and should say so.
-
-    Attributes:
-        per_token: reward charged for each generated token. Non-negative; the sign
-            is applied here, so ``2e-5`` means ``-2e-5`` per token.
-        budget: cap on ``|sum of one seat's length penalty over one episode|``.
-            ``0`` disables the cap, which also gives up the guarantee above.
-    """
-
-    per_token: float = 2e-5
-    budget: float = 0.1
-
-    def penalty_for(self, token_length: int) -> float:
-        """The (negative) length reward for one turn of ``token_length`` tokens.
-
-        This is the *uncapped* per-turn term; the episode-level ``budget`` is
-        applied across a whole row by :func:`row_length_penalties`.
-
-        Returns 0.0 for a turn that generated nothing -- there is no response to
-        charge for, and the ``-1`` end position an empty generation records would
-        otherwise be treated as a real turn.
-        """
-        if token_length <= 0:
-            return 0.0
-        return -float(self.per_token) * float(token_length)
-
-
-def turn_token_lengths(
-    owner_mask: Sequence[int], turn_end_positions: Sequence[int]
-) -> List[int]:
-    """Model-generated token count for each turn, derived from the owner mask.
-
-    A turn's generation is the maximal run of ``owner_mask == 1`` ending at that
-    turn's end position: ``_SeatBuilder.add_model_tokens`` appends each turn's
-    tokens as one contiguous block of 1s and records the end position at the last
-    of them, and consecutive turns are always separated by at least one
-    environment token from ``add_env_tokens`` (``selfplay_agent.py:154-166``). So
-    the run is exactly that turn's completion, and no extra plumbing through TRL's
-    rollout contract is needed to recover it.
-
-    Out-of-range end positions yield 0 -- notably the ``-1`` that an empty
-    generation records, which has no tokens to charge for.
-    """
-    lengths: List[int] = []
-    for pos in turn_end_positions:
-        if not 0 <= pos < len(owner_mask):
-            lengths.append(0)
-            continue
-        count = 0
-        idx = pos
-        while idx >= 0 and owner_mask[idx] == 1:
-            count += 1
-            idx -= 1
-        lengths.append(count)
-    return lengths
-
-
-def row_length_penalties(
-    owner_mask: Sequence[int],
-    turn_end_positions: Sequence[int],
-    spec: LengthPenaltySpec,
-) -> tuple[List[float], bool]:
-    """One row's per-turn length penalties, after the episode budget cap.
-
-    A row is one seat's trajectory within one episode, which is the unit the cap is
-    defined over: the backward cumulative return sums a seat's turns, so the row
-    total is what competes with the terminal reward.
-
-    Returns ``(penalties, clipped)`` -- ``penalties`` aligned with
-    ``turn_end_positions``, and ``clipped`` saying whether the budget actually bound
-    this row (the trainer logs it as ``budget_clip_rate``; a rate near 1.0 means
-    ``per_token`` is set too high and only the shape of the term is surviving).
-
-    The cap is a *proportional* rescale of the whole row rather than a per-turn
-    clip, so the relative charge between turns is preserved and no sign flips --
-    same rule as ``turn_rewards.TurnRewardTracker.finalize``.
-    """
-    penalties = [
-        spec.penalty_for(length)
-        for length in turn_token_lengths(owner_mask, turn_end_positions)
-    ]
-    magnitude = abs(sum(penalties))
-    clipped = spec.budget > 0.0 and magnitude > spec.budget
-    if clipped:
-        factor = spec.budget / magnitude
-        penalties = [p * factor for p in penalties]
-    return penalties, clipped
-
-
-def apply_length_penalty(
-    turn_rewards: Sequence[float],
-    owner_mask: Sequence[int],
-    turn_end_positions: Sequence[int],
-    spec: LengthPenaltySpec,
-) -> List[float]:
-    """Add the per-turn length penalty to each of a row's turn rewards.
-
-    Mirrors MARSHAL's ``num_actions_info['reward'] += format_reward +
-    length_penalty`` (``env_manager.py:770-771``): the penalty is folded into the
-    *raw* turn reward, so everything downstream (the ``marshal_exact`` pre-sum
-    normalization, ``whiten_rewards``, the backward cumulative sum and the per-seat
-    pooling) sees it, exactly as in MARSHAL.
-    """
-    penalties, _ = row_length_penalties(owner_mask, turn_end_positions, spec)
-    return [
-        float(reward) + penalty
-        for reward, penalty in zip(turn_rewards, penalties)
-    ]
-
-
 def build_reward_tensor(
     turn_end_positions: Sequence[int],
     turn_rewards: Sequence[float],
     seq_len: int,
     *,
-    turn_level: bool = True,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Scatter per-turn rewards onto a length-``seq_len`` completion reward vector.
+    """Scatter a row's rewards onto a length-``seq_len`` completion reward vector.
 
-    Args:
-        turn_end_positions: completion indices where each turn ends.
-        turn_rewards: reward for each turn, aligned with ``turn_end_positions``.
-        seq_len: length of the completion reward vector to build.
-        turn_level: if True, each turn reward is placed at its own turn-end
-            position (turn-level estimator). If False, all turn rewards are summed
-            into a single scalar placed at the *last* turn-end position (mirrors
-            MARSHAL ``use_turn_scores=False``).
+    A seat's turn rewards are summed into a single scalar placed at the *last*
+    turn-end position (MARSHAL's ``use_turn_scores=False``).
 
     Returns:
-        A ``(seq_len,)`` tensor, zero everywhere except at turn boundaries.
+        A ``(seq_len,)`` tensor, zero everywhere except at that position.
     """
     rewards = torch.zeros(seq_len, device=device, dtype=dtype)
     if not turn_end_positions:
         return rewards
-    positions = list(turn_end_positions)
-    values = list(turn_rewards)
-    if not turn_level:
-        # Collapse to a single terminal scalar at the last turn boundary.
-        positions = [positions[-1]]
-        values = [float(sum(values))]
-    for pos, val in zip(positions, values):
-        if 0 <= pos < seq_len:
-            rewards[pos] += float(val)
+    pos = list(turn_end_positions)[-1]
+    if 0 <= pos < seq_len:
+        rewards[pos] += float(sum(turn_rewards))
     return rewards
-
-
-def reward_slot_positions(
-    turn_end_positions: Sequence[int], seq_len: int, *, turn_level: bool = True
-) -> List[int]:
-    """The positions that hold a reward *slot* (turn boundaries), matching :func:`build_reward_tensor`.
-
-    These are the positions MARSHAL's pre-sum normalization averages over -- crucially
-    *including* zero-reward boundaries (a lost/failed game is a genuine 0 in the mean),
-    mirroring ``score_normalize``'s ``mask=turn_end_positions``. Must stay in lockstep
-    with :func:`build_reward_tensor`'s position selection.
-    """
-    if not turn_end_positions:
-        return []
-    positions = list(turn_end_positions)
-    if not turn_level:
-        positions = [positions[-1]]
-    return [p for p in positions if 0 <= p < seq_len]
 
 
 def reinforce_returns(reward_tensor: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
     """Backward discounted cumulative sum: ``R_t = sum_{t'>=t} gamma^(t'-t) r_t'``.
 
-    This is the token-level Monte-Carlo return MARSHAL uses as its "advantage"
-    before normalization (``compute_reinforce_return`` with ``advantages == returns``).
+    The token-level Monte-Carlo return MARSHAL uses as its "advantage" before
+    normalization (``compute_reinforce_return`` with ``advantages == returns``).
     Operates on the last dimension, so it accepts either ``(T,)`` or ``(B, T)``.
     """
     returns = torch.zeros_like(reward_tensor)
@@ -319,12 +95,9 @@ def _row_trajectory_return(returns_row: torch.Tensor, owner_mask_row: torch.Tens
     """A single representative scalar per row: the return at its first model token.
 
     With a backward cumulative sum this equals the trajectory's total discounted
-    return. Pooling one scalar per row (rather than per token) makes the
-    normalization frequency-weighted by *trajectory* -- the natural unit for the
-    paper's per-player normalization -- and free of token-count bias.
-    Rows with no model tokens return 0 here, but are excluded from pool
-    statistics by :func:`normalize_returns_by_seat` (they are placeholder rows
-    for seats that produced no trajectory; MARSHAL never emits such rows).
+    return, so pooling it makes the normalization frequency-weighted by
+    *trajectory* and free of token-count bias. Rows with no model tokens return 0
+    here but are excluded from pool statistics by :func:`normalize_returns_by_seat`.
     """
     idx = torch.nonzero(owner_mask_row > 0, as_tuple=False)
     if idx.numel() == 0:
@@ -335,38 +108,32 @@ def _row_trajectory_return(returns_row: torch.Tensor, owner_mask_row: torch.Tens
 def _pool_offset_scale(
     row_scalars: torch.Tensor,
     *,
-    unique_pooling: bool,
     norm_mode: str,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compute the (mean, scale) to apply to a pool of trajectory-return scalars.
+    """The (mean, scale) to apply to a pool of trajectory-return scalars.
+
+    Pooling is occurrence-weighted: every row counts once.
 
     Args:
         row_scalars: 1-D tensor of one scalar per row in the pool.
-        unique_pooling: if True, pool over the *set of distinct values* (MARSHAL's
-            ``normalize_unique_values`` behavior -- equal-weights rare and common
-            outcomes). If False, occurrence-weighted mean/std over all rows.
         norm_mode: ``"mean"`` -> scale is 1 (mean-center only);
             ``"mean_std"`` -> scale is ``std + eps`` (z-score).
 
     Returns:
-        ``(mean, scale)`` scalar tensors. Degenerate pools (all-equal values, or a
-        single unique value) yield ``mean == that value`` and ``scale == 1`` so
-        that ``(x - mean) / scale`` collapses to 0 -- matching MARSHAL's guard of
-        returning zeros when there is nothing to normalize against.
+        ``(mean, scale)`` scalar tensors. Degenerate pools (all-equal values) yield
+        ``mean == that value`` and ``scale == 1``, so ``(x - mean) / scale``
+        collapses to 0 -- matching MARSHAL's guard of returning zeros when there is
+        nothing to normalize against.
     """
-    values = torch.unique(row_scalars) if unique_pooling else row_scalars
     one = row_scalars.new_ones(())
-
-    if values.numel() <= 1:
-        # Nothing to normalize against: subtract the value itself -> zeros.
-        mean = values.reshape(-1)[0] if values.numel() == 1 else row_scalars.new_zeros(())
+    if row_scalars.numel() <= 1:
+        mean = row_scalars.reshape(-1)[0] if row_scalars.numel() == 1 else row_scalars.new_zeros(())
         return mean, one
 
-    mean = values.mean()
+    mean = row_scalars.mean()
     if norm_mode == "mean":
         return mean, one
-    # norm_mode == "mean_std"
-    std = values.std(unbiased=False)
+    std = row_scalars.std(unbiased=False)
     if std <= _EPS:
         return mean, one
     return mean, std + _EPS
@@ -378,9 +145,7 @@ def normalize_returns_by_seat(
     seats: torch.Tensor,
     *,
     agent_specific: bool,
-    marshal_exact: bool,
     norm_mode: str,
-    unique_pooling: Optional[bool] = None,
 ) -> torch.Tensor:
     """Apply MARSHAL's (per-seat) advantage normalization to a ``(B, T)`` returns.
 
@@ -389,18 +154,11 @@ def normalize_returns_by_seat(
         owner_mask: ``(B, T)`` 1 for model tokens, 0 elsewhere.
         seats: ``(B,)`` long tensor of seat ids (0/1).
         agent_specific: if True, pool each seat separately; else one batch-wide pool.
-        marshal_exact: default for ``unique_pooling`` (this stage is the only place
-            ``marshal_exact`` acts here; the pre-sum pass lives in
-            :func:`compute_marshal_advantages`).
         norm_mode: ``"mean"`` or ``"mean_std"``.
-        unique_pooling: override for the distinct-value pooling rule, see
-            ``_pool_offset_scale``. ``None`` (the default) follows ``marshal_exact``.
 
     Returns:
         ``(B, T)`` normalized advantages, zeroed at non-model-token positions.
     """
-    if unique_pooling is None:
-        unique_pooling = marshal_exact
     row_scalars = torch.stack(
         [_row_trajectory_return(returns[i], owner_mask[i]) for i in range(returns.shape[0])]
     )
@@ -408,14 +166,11 @@ def normalize_returns_by_seat(
     means = torch.zeros_like(row_scalars)
     scales = torch.ones_like(row_scalars)
 
-    if agent_specific:
-        pool_ids = seats
-    else:
-        pool_ids = torch.zeros_like(seats)
+    pool_ids = seats if agent_specific else torch.zeros_like(seats)
 
     # Placeholder rows (no model tokens) must not contribute their artificial 0
-    # scalar to the pool statistics; their advantages are zeroed by the
-    # owner_mask multiply below regardless of what mean/scale they get.
+    # scalar to the pool statistics; their advantages are zeroed by the owner_mask
+    # multiply below regardless of what mean/scale they get.
     has_model_tokens = (owner_mask > 0).any(dim=1)
 
     for pool in torch.unique(pool_ids):
@@ -423,9 +178,7 @@ def normalize_returns_by_seat(
         stat_member = member & has_model_tokens
         if not stat_member.any():
             continue  # pool holds only placeholders; leave mean 0 / scale 1
-        mean, scale = _pool_offset_scale(
-            row_scalars[stat_member], unique_pooling=unique_pooling, norm_mode=norm_mode
-        )
+        mean, scale = _pool_offset_scale(row_scalars[stat_member], norm_mode=norm_mode)
         means[member] = mean
         scales[member] = scale
 
@@ -440,11 +193,10 @@ def masked_whiten(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     Mirrors MARSHAL's ``masked_whiten`` (``roll/utils/functionals.py``): mean and
     Bessel-corrected variance are computed over masked positions only, but the
     shift/scale is applied to *every* position -- callers must re-zero unmasked
-    positions afterwards, exactly like MARSHAL's trailing ``* response_mask``.
+    positions afterwards, like MARSHAL's trailing ``* response_mask``.
 
-    One deliberate departure: MARSHAL raises when the mask selects fewer than two
-    positions; here the input is returned unchanged instead, because a degenerate
-    batch (e.g. all placeholder rows) must not crash training.
+    Where MARSHAL raises if the mask selects fewer than two positions, this returns
+    the input unchanged, so a degenerate batch cannot crash training.
     """
     mask = (mask > 0).to(values.dtype)
     denom = mask.sum()
@@ -470,44 +222,24 @@ def compute_marshal_advantages(
     seq_len: int,
     *,
     gamma: float = 1.0,
-    turn_level: bool = True,
     agent_specific: bool = True,
-    marshal_exact: bool = False,
-    unique_pooling: Optional[bool] = None,
     norm_mode: str = "mean",
     whiten_rewards: bool = False,
     whiten_advantages: bool = False,
-    length_penalty: Optional[LengthPenaltySpec] = None,
     device: torch.device | str = "cpu",
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     """End-to-end: rows -> ``(B, T)`` MARSHAL advantages tensor.
 
-    Steps, per row: (optionally) add the per-turn length penalty to the turn
-    rewards, build the sparse turn reward vector, (optionally, in ``marshal_exact``
-    mode) apply a biasing pre-sum reward normalization, (optionally) whiten the
-    reward field, take the backward cumulative return. Then normalize the ``(B, T)``
-    returns per seat and (optionally) whiten the result.
+    Per row: build the sparse reward vector, (optionally) whiten the reward field,
+    take the backward cumulative return. Then normalize the ``(B, T)`` returns per
+    seat and (optionally) whiten the result.
 
-    ``marshal_exact`` selects *both* of MARSHAL's shipped departures: the pre-sum
-    reward normalization and the distinct-value ("unique") pooling of trajectory
-    returns. ``unique_pooling`` splits the second one out -- ``None`` (the default)
-    follows ``marshal_exact``, ``False`` keeps the pre-sum pass but pools
-    occurrence-weighted like ``paper_correct``, ``True`` forces distinct-value
-    pooling. Only the pooling rule changes; nothing else about the mode moves.
-
-    ``length_penalty`` (``None`` = off, the default) is a :class:`LengthPenaltySpec`
-    applied to each turn's reward before anything else, matching where MARSHAL adds
-    it (``env_manager.py:770-771``). It is a small per-token cost with no threshold,
-    capped per row so the episode total can never outweigh the terminal reward. See
-    that class for the formula and for why enabling it on a clembench game is a
-    deliberate divergence from MARSHAL.
-
-    ``whiten_rewards`` / ``whiten_advantages`` mirror the same-named ROLL flags
-    that every shipped MARSHAL ``*_selfplay.yaml`` sets to true (they are framework
-    config, not part of the paper's algorithm, hence off by default here). Both
-    operate batch-wide over model-token positions -- NOT per seat -- matching
-    MARSHAL's ``compute_advantage``, which runs on the concatenated batch:
+    ``whiten_rewards`` / ``whiten_advantages`` mirror the same-named ROLL flags that
+    every shipped MARSHAL ``*_selfplay.yaml`` sets to true (framework config, not
+    part of the paper's algorithm, hence off by default here). Both operate
+    batch-wide over model-token positions -- NOT per seat -- matching MARSHAL's
+    ``compute_advantage``, which runs on the concatenated batch:
 
     * ``whiten_rewards`` z-scores the token-level reward field *before* the
       cumulative sum. Because most model-token positions carry reward 0, this
@@ -519,52 +251,29 @@ def compute_marshal_advantages(
     ``T`` is ``seq_len`` (TRL's padded completion length); rows shorter than that
     are zero-padded on the right, matching TRL's right-padding of completions.
 
-    Wrapped in ``@torch.no_grad()`` (mirroring MARSHAL's advantage functions):
-    advantages are a fixed target for the policy loss and must never carry
-    gradient. Today every tensor here is built from plain Python lists so no graph
-    would form anyway, but the decorator makes the invariant explicit and safe if a
-    grad-carrying input is ever threaded in.
+    ``@torch.no_grad()`` mirrors MARSHAL's advantage functions: advantages are a
+    fixed target for the policy loss and must never carry gradient.
     """
     batch = len(rows)
     reward_rows = torch.zeros(batch, seq_len, device=device, dtype=dtype)
-    slot_mask = torch.zeros(batch, seq_len, device=device, dtype=torch.bool)
     owner_mask = torch.zeros(batch, seq_len, device=device, dtype=dtype)
     seats = torch.zeros(batch, dtype=torch.long, device=device)
 
     for i, row in enumerate(rows):
-        turn_rewards = list(row.turn_rewards)
-        if length_penalty is not None:
-            turn_rewards = apply_length_penalty(
-                turn_rewards, row.owner_mask, row.turn_end_positions, length_penalty
-            )
         reward_rows[i] = build_reward_tensor(
             row.turn_end_positions,
-            turn_rewards,
+            list(row.turn_rewards),
             seq_len,
-            turn_level=turn_level,
             device=device,
             dtype=dtype,
         )
-        for pos in reward_slot_positions(row.turn_end_positions, seq_len, turn_level=turn_level):
-            slot_mask[i, pos] = True
         owner_mask[i] = _pad_row(row.owner_mask, seq_len, device, dtype)
         seats[i] = int(row.seat)
 
-    if marshal_exact:
-        # Faithful reproduction of MARSHAL's pre-sum reward normalization
-        # (score_normalize with method="mean"), which the paper's own audit flags
-        # as introducing a length-dependent bias. In self-play MARSHAL runs this is
-        # per-seat: separate_norm_for_selfplay=true is set in every shipped
-        # *_selfplay.yaml, routing through reward_normalize_by_player which
-        # mean-centers each seat's reward entries separately.
-        reward_rows = _marshal_pre_sum_normalize(
-            reward_rows, slot_mask, seats, agent_specific=agent_specific
-        )
-
     if whiten_rewards:
-        # MARSHAL order: whitening runs after the (marshal_exact-only) pre-sum
-        # normalization and before the cumulative sum, over the batch-wide model
-        # token mask (MARSHAL's response_mask analog), then re-masked.
+        # MARSHAL order: whitening runs before the cumulative sum, over the
+        # batch-wide model token mask (MARSHAL's response_mask analog), then
+        # re-masked.
         reward_rows = masked_whiten(reward_rows, owner_mask) * owner_mask
 
     returns = reinforce_returns(reward_rows, gamma=gamma)
@@ -573,55 +282,9 @@ def compute_marshal_advantages(
         owner_mask,
         seats,
         agent_specific=agent_specific,
-        marshal_exact=marshal_exact,
         norm_mode=norm_mode,
-        unique_pooling=unique_pooling,
     )
 
     if whiten_advantages:
         advantages = masked_whiten(advantages, owner_mask) * owner_mask
     return advantages
-
-
-def _marshal_pre_sum_normalize(
-    reward_rows: torch.Tensor,
-    slot_mask: torch.Tensor,
-    seats: torch.Tensor,
-    *,
-    agent_specific: bool,
-) -> torch.Tensor:
-    """MARSHAL's pre-sum reward mean-centering (``score_normalize(method="mean")``).
-
-    Mirrors MARSHAL's ``reward_postprocess_agentic`` step 1: when
-    ``separate_norm_for_selfplay`` is true (the value in every shipped
-    ``*_selfplay.yaml``) it routes through ``reward_normalize_by_player``, which
-    partitions rows by seat and subtracts each seat's own reward mean from that
-    seat's entries. We reproduce that per-seat structure here, mirroring the
-    ``pool_ids = seats if agent_specific else zeros`` pooling used by
-    :func:`normalize_returns_by_seat` so the seat-separation switch is consistent
-    across both normalization stages. Deliberately *not* run in ``paper_correct``.
-
-    The mean is taken over the seat's *turn-boundary* slots (``slot_mask``),
-    exactly like MARSHAL's ``masked_mean(x, mask=turn_end_positions)`` -- which
-    counts a zero-reward outcome (a lost/failed game) as a genuine ``0`` in the
-    mean. Averaging over "non-zero reward entries" instead would silently drop
-    every failure and, because clembench SUCCESS is always exactly ``+1``, collapse
-    a no-abort batch to all-equal values whose centered advantage is ``0`` (i.e.
-    no learning signal). Only positions in ``slot_mask`` are recentered; every
-    other (non-boundary) position stays ``0``, matching ``score_normalize``'s
-    trailing ``x_norm * mask``.
-    """
-    pool_ids = seats if agent_specific else torch.zeros_like(seats)
-    slot_mask = slot_mask.bool()
-    normalized = reward_rows.clone()
-    for pool in torch.unique(pool_ids):
-        member = pool_ids == pool
-        block = reward_rows[member]
-        block_slots = slot_mask[member]
-        if block_slots.sum() == 0:
-            continue
-        mean = block[block_slots].mean()
-        block_norm = block.clone()
-        block_norm[block_slots] = block[block_slots] - mean
-        normalized[member] = block_norm
-    return normalized

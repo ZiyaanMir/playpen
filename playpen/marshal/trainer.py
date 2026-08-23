@@ -27,13 +27,7 @@ from typing import Any, Callable, Dict, List, Optional
 import torch
 import trl
 
-from playpen.marshal.advantage import (
-    LengthPenaltySpec,
-    RowRollout,
-    compute_marshal_advantages,
-    row_length_penalties,
-    turn_token_lengths,
-)
+from playpen.marshal.advantage import RowRollout, compute_marshal_advantages
 from playpen.marshal.config import MarshalConfig
 from playpen.marshal.selfplay_agent import play_selfplay_episode
 from playpen.marshal.selfplay_env import SelfPlayEnv, list_instance_indices
@@ -71,10 +65,9 @@ def build_selfplay_dataset(
     """Build a HuggingFace dataset of self-play prompts.
 
     Self-contained: instance indices come from the game's packaged ``instances.json``
-    (the same indices ``SelfPlayEnv.reset`` looks up), so there is no dependency on the
-    ``colab-potsdam/playpen-data`` HF hub dataset and no risk of an id mismatch. Indices
-    are used instead of clembench game_ids because game_ids are only unique *within* an
-    experiment (a bare game_id lookup would silently collapse onto the first experiment).
+    (the same indices ``SelfPlayEnv.reset`` looks up), so there is no dependency on an
+    HF hub dataset. Indices rather than clembench game_ids, because game_ids are only
+    unique *within* an experiment.
 
     ``episode_pairing`` selects the key shape, and must match what is passed to
     :func:`build_selfplay_rollout_func`:
@@ -111,13 +104,10 @@ def build_selfplay_dataset(
 def _paired_slot_start(prompts: List[str], index: int, num_players: int) -> Optional[int]:
     """Start of the run of ``num_players`` identical prompts containing ``index``.
 
-    Returns ``None`` when ``index`` is not part of a complete, aligned run -- the run
-    would overflow the batch, or the entries are not all the same prompt. That happens
-    when ``num_generations`` is not a multiple of ``num_players``, or when a
-    multi-process split lands a prompt's copies on different ranks (TRL slices the
-    global generation batch contiguously, so a run can straddle the boundary). Callers
-    fall back to one-episode-per-prompt for such indices rather than pairing rows that
-    do not belong to the same game.
+    Returns ``None`` when ``index`` is not part of a complete, aligned run: either
+    ``num_generations`` is not a multiple of ``num_players``, or a multi-process split
+    landed a prompt's copies on different ranks. Callers then fall back to
+    one-episode-per-prompt rather than pairing rows from different games.
     """
     if num_players < 2:
         return None
@@ -135,30 +125,13 @@ def build_reward_func(config: MarshalConfig) -> Callable[..., List[float]]:
 
     Terminal rewards from clembench: SUCCESS +1, FAILURE 0, ABORTED -1. With
     ``turn_rewards`` on, the row's bounded per-episode shaping total is already
-    included in the ``rewards`` value the rollout emits (see
-    :func:`build_selfplay_rollout_func`); this function just passes through whatever
-    it is handed.
+    included in the ``rewards`` value the rollout emits; this function passes through
+    whatever it is handed.
 
-    The reward is passed through **unshaped on both paths**, so the only thing that
-    differs between a ``--marshal`` run and a ``--no-marshal`` run is the advantage
-    estimator -- which is what the ablation is supposed to isolate.
-
-    This used to replace an exact ``-1.0`` abort with ``-random.random()`` when
-    MARSHAL was disabled, borrowed from the Wordle example as a way to give an
-    all-abort group non-zero advantage variance. It was removed because it made the
-    baseline arm a different *experiment*, not just a different estimator:
-
-    * an all-abort group got eight different advantages for eight identical
-      outcomes, i.e. the policy was reinforced toward whichever abort drew the
-      higher random number -- noise, not signal;
-    * it moved the mean abort reward from ``-1.0`` to ``-0.5``, shrinking the
-      SUCCESS-vs-ABORT gap from 2.0 to ~1.5 on the baseline arm only;
-    * TRL logs the value this function returns as ``reward``, so the baseline arm's
-      reported mean reward was inflated relative to the MARSHAL arm's.
-
-    A group with no reward variance now yields zero advantage on both paths, which
-    is the honest representation of a batch that contains no information. TRL
-    already reports how often that happens, as ``frac_reward_zero_std``.
+    The reward is unshaped on both paths, so the only thing that differs between a
+    ``--marshal`` run and a ``--no-marshal`` run is the advantage estimator. A group
+    with no reward variance yields zero advantage on both; TRL reports how often that
+    happens as ``frac_reward_zero_std``.
     """
 
     def reward_func(completions: List[str], **kwargs: Any) -> List[float]:
@@ -194,21 +167,19 @@ def build_selfplay_rollout_func(
 
     The returned dict carries, in addition to TRL's required keys, the extra fields
     the advantage override needs: ``env_mask`` (consumed by TRL as the gradient
-    mask), ``owner_mask`` (a copy that survives into ``inputs`` for our use),
+    mask), ``owner_mask`` (a copy that survives into ``inputs``),
     ``turn_end_positions``, ``turn_rewards``, ``seat`` and the scalar ``rewards``.
 
     ``config.row_context_mode``, ``config.episode_pairing`` and ``config.turn_rewards``
-    are all read here (not behind ``config.enabled``) because rollout collection is
-    shared by the MARSHAL path and the plain-GRPO baseline alike.
+    are read here (not behind ``config.enabled``) because rollout collection is shared
+    by the MARSHAL path and the plain-GRPO baseline alike.
 
     With ``turn_rewards`` on, each episode gets a fresh
     :class:`~playpen.marshal.turn_rewards.TurnRewardTracker`, its bounded per-turn
-    shaping is folded into ``turn_rewards`` (where the MARSHAL path gives it
-    turn-level credit), and the episode total is *also* added to the scalar
-    ``rewards`` -- because that scalar is the only thing the plain-GRPO path
-    consumes, and a feature that silently does nothing on one of the two arms is
-    worse than no feature. ``terminal_reward`` keeps the unshaped outcome so both
-    arms can still be compared on game outcome alone.
+    shaping is folded into ``turn_rewards``, and the episode total is also added to
+    the scalar ``rewards`` -- the only thing the plain-GRPO path consumes.
+    ``terminal_reward`` keeps the unshaped outcome so both arms stay comparable on
+    game outcome alone.
     """
     paired = config.episode_pairing == "shared"
     num_players = int(env.num_players)
@@ -316,12 +287,10 @@ def _empty_row(seat: int, pad_token_id: int = 0):
     """A minimal, non-crashing row for a seat that produced no usable trajectory.
 
     TRL's rollout contract requires one row per prompt with non-empty tensors, so
-    we emit a single pad token -- but marked as an *environment* token
-    (``owner_mask=[0]``) with no turns: the loss mask zeroes it out, and
-    ``normalize_returns_by_seat`` excludes rows without model tokens from the
-    seat pools, so the placeholder carries no gradient and no statistics.
-    (Previously this used ``owner_mask=[1]``, which trained a fabricated token
-    with a nonzero advantage and diluted the seat pool mean.)
+    we emit a single pad token marked as an *environment* token (``owner_mask=[0]``)
+    with no turns: the loss mask zeroes it out and ``normalize_returns_by_seat``
+    excludes rows without model tokens from the seat pools, so the placeholder
+    carries no gradient and no statistics.
     """
     from playpen.marshal.selfplay_agent import SeatRollout
 
@@ -372,41 +341,33 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         output["advantages"] = self._compute_marshal_advantages(inputs, output)
         return output
 
-    # Warn once per process, not once per step: at 700 steps a per-step warning is
-    # noise that gets scrolled past, which is how the original failure survived a
-    # 500-step run.
+    # Warn once per process, not once per step: a per-step warning is noise that
+    # gets scrolled past.
     _WARNED_IS_COLLAPSE = False
     _WARNED_DRIFT = False
     _WARNED_ADV_FALLBACK = False
 
-    # Below this mean vLLM importance-sampling ratio, the loss is being scaled down
-    # by more than 10x and the run is not really training. Chosen well under the
-    # healthy range measured on working runs (0.59-0.96) and well above the broken
-    # one (5e-8), so it fires on the failure and never on a good run.
+    # Below this mean vLLM importance-sampling ratio the loss is scaled down by more
+    # than 10x and the run is not really training. Well under the healthy range
+    # observed on working runs (0.59-0.96) and well above a broken one (5e-8).
     IS_RATIO_WARN_THRESHOLD = 0.1
 
     def _log_rollout_health(self, inputs, output) -> None:
-        """Log row-censoring and importance-sampling health, and shout when either fails.
+        """Log row-censoring and importance-sampling health, and warn when either fails.
 
-        Two *different* ways a step can produce no useful gradient, which look the
-        same from the outside (flat reward, tiny grad_norm) and so must be
-        distinguished at the source:
+        Two different ways a step produces no useful gradient, which look the same
+        from the outside (flat reward, tiny grad_norm):
 
         * **Row censoring** -- ``_SeatBuilder.sync_context`` could not prove a row's
-          owner mask, so the row was dropped and replaced by an inert placeholder
-          (``selfplay_agent.SeatRollout.drifted``). Gradient is lost for those rows
-          only, and silently: they still occupy a slot in the batch.
-        * **Importance-sampling collapse** -- the row survived intact, but the token
-          sequence the loss scores is not the one vLLM sampled, so TRL's correction
-          multiplies the whole row's loss by ``exp(sum of the per-token log-prob
-          divergence)``. Every row is scaled down at once, including uncensored ones.
+          owner mask, so the row was dropped for an inert placeholder. Gradient is
+          lost for those rows only, and they still occupy a slot in the batch.
+        * **Importance-sampling collapse** -- the row survived, but the sequence the
+          loss scores is not the one vLLM sampled, so TRL's correction scales the
+          whole row's loss by ``exp(sum of the per-token log-prob divergence)``.
 
-        The second is NOT detected by the drift counter and cannot be: drift is about
-        whether the mask is *provable*, IS collapse is about whether the context is
-        *identical*, and a row can be perfectly provable and still wrong (that is
-        exactly what ``row_context_mode="spliced"`` produced). TRL already computes
-        the ratio; what it does not do is complain, so we read its tensor back out of
-        ``output`` and threshold it.
+        The drift counter cannot detect the second: drift is about whether the mask is
+        provable, IS collapse about whether the context is identical. TRL computes the
+        ratio but does not complain about it, so read it back out of ``output``.
         """
         try:
             metrics = self._metrics["train"]
@@ -468,20 +429,15 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
     def _log_turn_reward_stats(self, inputs) -> None:
         """Log the dense per-turn reward channel: magnitude, saturation, components.
 
-        Nothing is logged when the feature is off, so a run without it keeps exactly
-        the metric set it had before.
-
-        The three that matter for calibration:
+        Nothing is logged when the feature is off. The three that matter for
+        calibration:
 
         * ``turn_rewards/sum_mean`` / ``sum_abs_mean`` -- how much shaping an episode
-          actually accumulates, against a ``+-1`` outcome. If this is ~0 the signal is
-          inert for this game (which is a real finding for e.g. taboo, whose only
-          per-turn signal is compliance), not necessarily a wiring bug -- the
-          component columns tell the two apart.
+          accumulates, against a ``+-1`` outcome. ~0 means the signal is inert for
+          this game; the component columns say whether that is the game or a bug.
         * ``turn_rewards/budget_clip_rate`` -- how often the per-episode budget had to
-          rescale. Near 1.0 means ``turn_reward_scale`` is too large for this game's
-          turn count and the budget, not the game, is setting the magnitude.
-        * ``turn_rewards/terminal_mean`` -- the UNSHAPED outcome. TRL's own ``reward``
+          rescale. Near 1.0 means the budget, not the game, sets the magnitude.
+        * ``turn_rewards/terminal_mean`` -- the unshaped outcome. TRL's ``reward``
           metric includes the shaping once this is on, so this is the column that
           stays comparable with a turn-rewards-off arm.
         """
@@ -525,12 +481,9 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         # fails to hold (e.g. an unexpected multi-process gather), fall back to
         # TRL's scalar advantages rather than misalign the tensor.
         #
-        # This fallback silently turns a MARSHAL run into a plain-GRPO run, so it
-        # must never be quiet: a run that hits it every step would train, log and
-        # checkpoint exactly like a healthy MARSHAL run while implementing a
-        # different algorithm. Both a once-per-process warning and a per-step
-        # metric, because the warning can scroll past a 700-step log and the metric
-        # cannot.
+        # The fallback silently turns a MARSHAL run into a plain-GRPO run, so it is
+        # reported twice: a once-per-process warning and a per-step metric (the
+        # warning can scroll past a long log, the metric cannot).
         if len(inputs) != batch_size:
             self._log_advantage_fallback(len(inputs), batch_size)
             return base_adv
@@ -548,21 +501,14 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
                 )
             )
 
-        lp_kwargs = cfg.length_penalty_kwargs()
-        length_penalty = LengthPenaltySpec(**lp_kwargs) if lp_kwargs is not None else None
-
         advantages = compute_marshal_advantages(
             rows,
             seq_len,
             gamma=cfg.gamma,
-            turn_level=cfg.turn_level_rewards,
             agent_specific=cfg.agent_specific_normalization,
-            marshal_exact=cfg.marshal_exact,
-            unique_pooling=cfg.unique_value_pooling,
             norm_mode=cfg.advantage_norm_mode,
             whiten_rewards=cfg.whiten_rewards,
             whiten_advantages=cfg.whiten_advantages,
-            length_penalty=length_penalty,
             device=device,
             dtype=base_adv.dtype,
         )
@@ -570,24 +516,19 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
         # Log per-seat pool stats so a run can confirm the seat split is live and
         # the two seats' advantage distributions actually differ.
         self._log_seat_stats(rows, advantages)
-        if length_penalty is not None:
-            self._log_length_penalty_stats(rows, length_penalty)
         self._relog_advantages(advantages)
         return advantages
 
     def _log_advantage_fallback(self, n_inputs: int, batch_size: int, *, fired: bool = True) -> None:
         """Record whether the MARSHAL advantage override ran or fell back to TRL's.
 
-        ``marshal/advantage/fallback_rate`` is appended on **every** step -- 0.0 when
-        the override ran, 1.0 when it did not -- so the metric distinguishes "never
-        fell back" from "the metric was never emitted". A rate that is anything but
-        0.0 means those steps trained on TRL's scalar group-relative advantages, i.e.
-        plain GRPO, regardless of what the run is labelled.
+        ``marshal/advantage/fallback_rate`` is appended on every step -- 0.0 when the
+        override ran, 1.0 when it did not -- so the metric distinguishes "never fell
+        back" from "never emitted". Anything but 0.0 means those steps trained on
+        TRL's scalar group-relative advantages, i.e. plain GRPO.
 
-        The warning is emitted outside the try/except on purpose. Every other logging
-        helper here swallows its exceptions because a broken metric must not kill a
-        run; this one reports that the run is *not doing what it says*, which is worth
-        more than the metric it sits beside.
+        The warning is outside the try/except on purpose: it reports that the run is
+        not doing what it says, which matters more than the metric beside it.
         """
         if fired and not MarshalGRPOTrainer._WARNED_ADV_FALLBACK:
             MarshalGRPOTrainer._WARNED_ADV_FALLBACK = True
@@ -609,18 +550,15 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
             pass
 
     def _relog_advantages(self, advantages: torch.Tensor) -> None:
-        """Point the logged ``advantage`` column at the advantages we actually train on.
+        """Point the logged ``advantage`` column at the advantages we train on.
 
         The base class snapshots its own scalar group-relative advantages into
-        ``self._logs["advantages"]`` *before* returning, i.e. before this subclass
-        replaces them. Left alone, every ``completions_*.parquet`` would record
-        ``(reward - group_mean) / (group_std + 1e-4)`` -- a number the model never sees
-        -- so offline analysis of a MARSHAL run would be analysing plain GRPO.
+        ``self._logs["advantages"]`` before this subclass replaces them, so left alone
+        every ``completions_*.parquet`` would record a number the model never sees.
 
-        Each row is summarized by the mean advantage over its model tokens (the value is
-        constant across them whenever rewards are terminal-only, and a token-weighted
-        mean otherwise). Skipped under multi-process training, where ``_logs`` holds the
-        gathered advantages of every rank but ``advantages`` is only this rank's slice.
+        Each row is summarized by the mean advantage over its model tokens. Skipped
+        under multi-process training, where ``_logs`` holds every rank's gathered
+        advantages but ``advantages`` is only this rank's slice.
         """
         try:
             if self.accelerator.num_processes != 1:
@@ -634,60 +572,6 @@ class MarshalGRPOTrainer(trl.GRPOTrainer):
             per_row = ((advantages * mask).sum(dim=1) / denom).tolist()
             for offset, value in enumerate(per_row):
                 logged[len(logged) - rows + offset] = value
-        except Exception:
-            # Metrics logging must never break training.
-            pass
-
-    def _log_length_penalty_stats(
-        self, rows: List[RowRollout], spec: LengthPenaltySpec
-    ) -> None:
-        """Log turn lengths and the penalty they incur.
-
-        Worth having because the penalty is deliberately tiny, so it is easy to
-        confuse "correctly small" with "not wired up". The number to read is
-        ``episode_total_mean``: the per-turn charge is not what competes with the
-        ``+-1`` outcome, the row total is (the backward cumulative return sums a
-        seat's turns). ``budget_clip_rate`` is the other end of the same question --
-        near 1.0 means ``per_token`` is high enough that the cap, not the game, is
-        setting the magnitude.
-
-        Penalties are read back through :func:`row_length_penalties` rather than
-        recomputed from :meth:`LengthPenaltySpec.penalty_for`, so what is logged is
-        what was actually added to the rewards, budget rescale included.
-        """
-        try:
-            lengths: List[int] = []
-            penalties: List[float] = []
-            episode_totals: List[float] = []
-            clips: List[float] = []
-            for row in rows:
-                row_penalties, clipped = row_length_penalties(
-                    row.owner_mask, row.turn_end_positions, spec
-                )
-                turn_lengths = turn_token_lengths(row.owner_mask, row.turn_end_positions)
-                episode_totals.append(sum(row_penalties))
-                clips.append(1.0 if clipped else 0.0)
-                for length, penalty in zip(turn_lengths, row_penalties):
-                    if length <= 0:
-                        continue  # a turn that generated nothing is not a data point
-                    lengths.append(length)
-                    penalties.append(penalty)
-            if not lengths:
-                return
-            mode = "train"
-            metrics = self._metrics[mode]
-            metrics["marshal/length_penalty/mean"].append(sum(penalties) / len(penalties))
-            metrics["marshal/length_penalty/min"].append(min(penalties))
-            metrics["marshal/turn_tokens/mean"].append(sum(lengths) / len(lengths))
-            metrics["marshal/turn_tokens/max"].append(max(lengths))
-            # What the outcome actually competes with, per seat per episode.
-            metrics["marshal/length_penalty/episode_total_mean"].append(
-                sum(episode_totals) / len(episode_totals)
-            )
-            metrics["marshal/length_penalty/episode_total_min"].append(min(episode_totals))
-            metrics["marshal/length_penalty/budget_clip_rate"].append(
-                sum(clips) / len(clips)
-            )
         except Exception:
             # Metrics logging must never break training.
             pass

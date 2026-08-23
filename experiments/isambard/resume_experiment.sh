@@ -77,9 +77,9 @@ fi
 # The file is written as bare `NAME=value` assignments. train.sh reads them as shell
 # variables, so it never noticed -- but check_resume_config.py below is a SUBPROCESS,
 # and a subprocess sees only exported names. Without this it resolves the config with
-# LP_PER_TOKEN, EXTRA_TRAIN_ARGS, TR_* and the rest all missing, reports five fields of
-# "drift" that are really its own blindness, and teaches you to reach for
-# RESUME_FORCE=1 -- which would defeat the whole check.
+# EXTRA_TRAIN_ARGS, TR_* and the rest all missing, reports "drift" that is really its
+# own blindness, and teaches you to reach for RESUME_FORCE=1 -- which would defeat the
+# whole check.
 set -a
 # shellcheck disable=SC1090
 source "$ENV_FILE"
@@ -143,10 +143,6 @@ exp_wandb_chain_setup force
 # through it silently hands the remaining segments whatever the YAML happens to say
 # today.
 #
-# Not hypothetical: taboo_Qwen3-4B_turnrew_20260730-231934 resumed against the current
-# shared YAML would flip turn_level_rewards true->false and whiten_rewards true->false,
-# half way through the run, with nothing on disk recording it.
-#
 # write_manifest.py froze a copy inside the experiment at submit time for exactly this
 # reason. Point at that instead.
 if [ -f "$EXP_DIR/marshal_config.yaml" ]; then
@@ -187,7 +183,7 @@ cp "$ENV_FILE" "$RESUME_ENV_FILE"
     echo ""
     echo "# --- resume overrides, $(date --iso-8601=seconds) ---"
     for _v in TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM MARSHAL_CONFIG \
-              LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF UNIQUE_POOL EXTRA_TRAIN_ARGS \
+              EXTRA_TRAIN_ARGS \
               TR_ENABLE TR_SOURCE TR_SCALE TR_BUDGET TR_COMPONENTS \
               EVAL_SHARD_SIZE WB_ID WB_RESUME \
               EVAL_BASE PPEVAL_ENABLE PPEVAL_SUITE PPEVAL_GAMES PPEVAL_BASE \

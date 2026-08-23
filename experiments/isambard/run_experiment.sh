@@ -5,7 +5,7 @@
 #   module load brics/userenv      # gives $PROJECTDIR
 #   cd <repo root>
 #   experiments/isambard/run_experiment.sh dond
-#   EXP_TAG=lp_off EXTRA_TRAIN_ARGS=--no-length-penalty \
+#   EXP_TAG=no_whiten EXTRA_TRAIN_ARGS=--no-whiten-rewards \
 #     experiments/isambard/run_experiment.sh dond
 #
 # Queues:
@@ -106,8 +106,7 @@ ENV_FILE="$EXP_DIR/experiment.env"
                MODEL GAME MARSHAL_CONFIG \
                NUM_GENERATIONS PER_DEVICE_BATCH GRAD_ACCUM MAX_STEPS SAVE_STEPS \
                LEARNING_RATE KL_BETA MAX_COMPLETION_LENGTH MAX_TURNS GRAD_CKPT \
-               VLLM_UTIL VLLM_MAX_MODEL_LEN UNIQUE_POOL GRPO_LOSS EXTRA_TRAIN_ARGS \
-               LP_PER_TOKEN LP_BUDGET LP_MAX_LEN LP_COEF \
+               VLLM_UTIL VLLM_MAX_MODEL_LEN GRPO_LOSS EXTRA_TRAIN_ARGS \
                TRAIN_SEGMENTS SEGMENT_STEPS RESUME_FROM \
                WB_ENABLE WB_PROJECT WB_ENTITY WB_GROUP WB_TAGS WB_MODE WB_ID WB_RESUME \
                EVAL_TASKS EVAL_BATCH EVAL_BASE EVAL_LIMIT EVAL_EXTRA BASE_EVAL_CACHE VENV_LMEVAL \

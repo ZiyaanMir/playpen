@@ -96,9 +96,9 @@ experiments/status.sh -v
 experiment                                   state                  score
 -------------------------------------------  ---------------------  -----
 dond_Qwen3-4B_20260723-152753                3 ckpt, scored         acc=0.4460 (+0.0340 vs base)
-                                               model=Qwen3-4B game=dond steps=200 len_penalty=-0.51/ep fidelity=marshal_exact
-guesswhat_Qwen3-0.6B_lp_off_20260723-152920  1 ckpt, not evaluated
-                                               model=Qwen3-0.6B game=guesswhat steps=200 len_penalty=-0.42/ep fidelity=paper_correct
+                                               model=Qwen3-4B game=dond steps=200 loss=dapo
+guesswhat_Qwen3-0.6B_nowhiten_20260723-152920  1 ckpt, not evaluated
+                                               model=Qwen3-0.6B game=guesswhat steps=200 loss=dapo
 ```
 
 Works on a login node or on your laptop after an `rsync` — it only reads files.
@@ -544,8 +544,8 @@ when a run differs from the preset** — it goes into the directory name and is 
 the run legible weeks later.
 
 ```bash
-# ablation arm: length penalty off
-EXP_TAG=lp_off EXTRA_TRAIN_ARGS=--no-length-penalty \
+# ablation arm: reward whitening off
+EXP_TAG=no_whiten EXTRA_TRAIN_ARGS=--no-whiten-rewards \
   experiments/eddie/run_experiment.sh dond
 
 # plain-GRPO baseline
@@ -562,7 +562,7 @@ EVAL_TASKS=logiglue,logicbench EVAL_BATCH=32 \
 ```
 
 `EXTRA_TRAIN_ARGS` on/off flags are parsed into the manifest, so an arm launched with
-`--no-length-penalty` **records `length_penalty: false`** rather than parroting the YAML.
+`--no-whiten-rewards` **records `whiten_rewards: false`** rather than parroting the YAML.
 
 Scheduler options pass through too:
 `TRAIN_QSUB_OPTS='-l a100=true'` (Eddie), `TRAIN_SBATCH_OPTS='--time=08:00:00'` (Isambard).
@@ -576,7 +576,6 @@ Scheduler options pass through too:
 | `TRAIN_SEGMENTS` | `1` | chained training jobs, each resuming the last (see [Long runs](#long-runs-segments-and-resuming)) |
 | `SEGMENT_STEPS` | — | steps per segment, instead of `TRAIN_SEGMENTS` |
 | `RESUME_FROM` | — | `auto` \| `latest` \| a checkpoint path, for the first segment |
-| `UNIQUE_POOL` | — | tri-state `1`/`0`/empty for `marshal_exact`'s `torch.unique` pooling (see [below](#marshal_exacts-unique-pooling-unique_pool)) |
 | `GRPO_LOSS` | — | tri-state `1`/`0`/empty for TRL's `loss_type` (see [below](#trl-loss-aggregation-grpo_loss)) |
 | `EVAL_TASKS` | `logiglue,logicbench` | lm-eval tasks (comma-separated) |
 | `EVAL_BASE` | `1` | also score the untrained model |
@@ -597,8 +596,8 @@ Everything else lives in `presets/<game>.env` — that file is the per-game sour
 
 On by default. The run is **named after the experiment** (`EXP_ID`), grouped by
 `{game}_{model}`, and tagged with the switches that define the arm (`marshal` /
-`no-marshal`, `dr_grpo`, `grpo_loss`, `length_penalty`, `paper_correct` / `marshal_exact`,
-`no-unique-pool`, the cluster, your `EXP_TAG`). Its config carries the *resolved* MARSHAL config plus every training
+`no-marshal`, `dr_grpo`, `grpo_loss`, `turn_rewards`, `no-seat-norm`, the cluster, your
+`EXP_TAG`). Its config carries the *resolved* MARSHAL config plus every training
 hyperparameter, so two arms can be diffed in the UI without opening a manifest.
 
 `WB_MODE=auto` is what makes this safe to leave on: it uploads live only when a credential
@@ -631,102 +630,12 @@ variables still works — `train_selfplay.py` falls back to them.
 
 ---
 
-## The presets, and the length penalty
+## The presets
 
 There is a preset for **every text-only clembench game** — one `presets/<game>.env` per
 entry in a `clemgame.json` with `image: "none"`. Each holds that game's memory sizing.
 See [Which games have presets](#which-games-have-presets) for the full list and for the
 three that carry warnings.
-
-### The length penalty
-
-**No per-game calibration.** The presets used to carry `LP_MAX_LEN` / `LP_COEF` tuned per
-game; they no longer do, and those two variables are inert. The penalty is now a flat
-per-token cost with **no threshold**:
-
-```
-penalty(turn) = -length_penalty_per_token × generated_tokens        (LP_PER_TOKEN)
-```
-
-capped per seat per episode:
-
-```
-|Σ over one seat's turns| ≤ length_penalty_budget                   (LP_BUDGET)
-```
-
-applied as a proportional rescale of that episode's per-turn penalties, so relative
-charge between turns survives and no sign flips.
-
-Shipped defaults: `2e-5` per token (= −0.02 per 1000 tokens) and a `0.1` budget.
-
-**Why the terminal reward still wins.** The penalty is charged per turn and the backward
-cumulative return sums a seat's turns, so what competes with the ±1 outcome is the
-*episode* total — which is exactly what the budget bounds. The smallest gap between two
-distinct clembench outcomes is 1.0 (SUCCESS +1 / FAILURE 0 / ABORTED −1) and the penalty
-is one-sided (always ≤ 0), so any budget below 1.0 means **the penalty can never reorder
-two episodes that ended differently**. It ranks episodes *within* an outcome class —
-shorter is better, all else equal — and nothing more. This is the same guarantee, and the
-same mechanism, as `turn_reward_budget`; if both channels are on, keep
-`LP_BUDGET + 2 × TR_BUDGET < 1.0`.
-
-That bound holds whatever the game and whatever the turn count, which is why there is
-nothing left to calibrate per game: a 3-turn taboo episode and a 50-turn adventuregame
-episode are bounded identically.
-
-**Turning it on:**
-
-```bash
-EXP_TAG=lp EXTRA_TRAIN_ARGS=--length-penalty \
-    experiments/<cluster>/run_experiment.sh guesswhat
-
-# a heavier hand, still safely bounded
-EXP_TAG=lp_strong LP_PER_TOKEN=1e-4 LP_BUDGET=0.2 \
-    EXTRA_TRAIN_ARGS=--length-penalty \
-    experiments/<cluster>/run_experiment.sh guesswhat
-```
-
-**What to watch.** `marshal/length_penalty/episode_total_mean` — the per-turn mean is not
-the number that competes with the outcome. Alongside it,
-`marshal/length_penalty/budget_clip_rate`: a rate near 1.0 means the cap binds every
-episode, so only the *shape* of the term survives and `LP_BUDGET`, not the game, is
-setting its magnitude — lower `LP_PER_TOKEN` until it comes off the ceiling.
-`manifest.txt` prints both the per-turn charge at the generation cap and the episode
-bound at submit time.
-
-**Deprecated:** `LP_MAX_LEN` and `LP_COEF` (and the YAML's `length_penalty_coef`,
-`_bonus`, `_min_len`, `_max_len`, `_offset`) parameterized the previous threshold-based
-penalty — a port of MARSHAL's Kimi-1.5-style `compute_length_penalty`, which scored
-exactly 0 below `max_len` and fell linearly beyond it. That shape needed the threshold
-tuned against the generation cap for every game, and got it wrong in both directions:
-`max_len 500 / coef 0.1` was numerically inert on guesswhat (largest reachable penalty
-−0.0025 per turn against a ±1 outcome), while `coef 0.4 / max_len 400` was −1.89 per
-episode on dond, strong enough for staying silent to beat winning. It also charged
-nothing at all for the ordinary-length turns that make up most of a run.
-
-Those names are still **accepted** — existing YAMLs, pinned resume configs, cluster
-presets and old manifests all keep loading — but they have **no effect**.
-`train_selfplay.py` warns at startup if any of them is set, `manifest.json` records them
-under `length_penalty_effect.legacy_fields_ignored`, and `status.sh` marks the run
-`[legacy fields ignored]`.
-
-> **Resuming a pre-rewrite run.** `check_resume_config.py` refuses to resume an
-> experiment whose manifest has `length_penalty: true` but no
-> `length_penalty_per_token` — no field *drifted*, but the formula reading those fields
-> changed, so the second half of the run would train under a different reward from the
-> first. Prefer a fresh run; `RESUME_FORCE=1` overrides.
-
-> **Reporting caveat.** `length_penalty: true` and `fidelity_mode: marshal_exact`
-> interact: the penalty makes every trajectory return distinct, which collapses
-> `marshal_exact`'s distinct-value pooling into ordinary occurrence-weighted pooling.
-> With no threshold this now happens on *every* game, not just the ones whose turns ran
-> long. Both are defensible algorithms and the gradient direction is unchanged, but an
-> on/off length-penalty ablation at `marshal_exact` also silently switches pooling rule —
-> pin `fidelity_mode` consistently across arms, and don't describe such a run as
-> reproducing MARSHAL's shipped normalization.
->
-> `UNIQUE_POOL=0` makes that switch *explicit* instead of incidental: both arms then pool
-> occurrence-weighted by construction, so the length penalty is the only thing varying.
-> See [`marshal_exact`'s unique pooling](#marshal_exacts-unique-pooling-unique_pool).
 
 ---
 
@@ -804,47 +713,6 @@ advantage pool is identical across every game.
 
 ---
 
-## `marshal_exact`'s unique pooling (`UNIQUE_POOL`)
-
-`fidelity_mode: marshal_exact` bundles **two** departures from the MARSHAL paper: (a) a
-pre-sum reward normalization, and (b) `torch.unique` distinct-value pooling of trajectory
-returns, which equal-weights rare and common outcomes. `UNIQUE_POOL` splits (b) out so an
-ablation can attribute a result to one of them rather than to both at once.
-
-```bash
-# marshal_exact as shipped (both departures) -- the default, no var needed
-EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact' EXP_TAG=exact ./run_experiment.sh guesswhat
-# its pre-sum pass, but occurrence-weighted pooling
-EXTRA_TRAIN_ARGS='--fidelity-mode marshal_exact' UNIQUE_POOL=0 EXP_TAG=exact_nounique \
-    ./run_experiment.sh guesswhat
-```
-
-| var | flag | meaning |
-|---|---|---|
-| `UNIQUE_POOL` | `--marshal-exact-unique-pooling` / `--no-...` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `TR_*` / `LP_*`) |
-
-**It only bites under `marshal_exact`.** `paper_correct` never pools over distinct values,
-so `UNIQUE_POOL=0` is a no-op there and `UNIQUE_POOL=1` cannot switch unique pooling on.
-`fidelity_mode` itself has no env var — set it in the YAML or via `EXTRA_TRAIN_ARGS`, as
-above. The resolved value is recorded in `manifest.json`, W&B tags a run that turned it
-off with `no-unique-pool`, and `status.sh -v` renders it as
-`fidelity=marshal_exact(no-unique-pool)`.
-
-Why it matters on clembench: returns only ever take the values `{-1, 0, +1}`, so uniquing
-makes the baseline the *midpoint of whichever outcomes occur* rather than the empirical
-mean — 9 wins and 1 loss give a baseline of `0.0` uniqued against `0.8`
-occurrence-weighted, i.e. the loss is charged 9× harder relative to the wins. Note that
-`length_penalty` or `TR_*` make returns near-continuous, at which point unique pooling
-already degenerates into occurrence-weighted pooling by itself and this var changes little
-— and with the length penalty now charging every turn, that happens on every game rather
-than only where turns ran long (see the reporting caveat under
-[The length penalty](#the-length-penalty)).
-
-**Reporting.** A run with `UNIQUE_POOL=0` is not a reproduction of MARSHAL's shipped
-normalization; describe it as `marshal_exact` minus distinct-value pooling.
-
----
-
 ## TRL loss aggregation (`GRPO_LOSS`)
 
 Which of TRL's `loss_type`s the run trains under. This is a different axis from the
@@ -866,7 +734,7 @@ GRPO_LOSS=0 EXP_TAG=dapo ./run_experiment.sh guesswhat
 
 | var | flag | meaning |
 |---|---|---|
-| `GRPO_LOSS` | `--grpo-loss` / `--no-grpo-loss` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `TR_*` / `LP_*` / `UNIQUE_POOL`) |
+| `GRPO_LOSS` | `--grpo-loss` / `--no-grpo-loss` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `TR_*`) |
 
 **Why you would want `grpo`.** Upstream MARSHAL is a ROLL fork, and its shipped playpen
 selfplay YAMLs leave `loss_agg_mode` unset — so they run ROLL's `seq-mean-token-sum`
@@ -878,7 +746,6 @@ aggregating the way MARSHAL does; `GRPO_LOSS=1` closes that gap.
 **What it costs.** Rows get equal weight regardless of length, so a token in a 12-token
 turn carries many times the gradient of one in a 300-token turn — the response-level
 length bias that DAPO and Dr. GRPO were both written to remove. If you are also running
-`LP_*`, note that the two now push on the same quantity from opposite directions.
 
 One further mismatch with ROLL, and it is **not** small on every game: TRL divides by the
 **full** row count while ROLL divides by its **valid**-row count, so a placeholder row (an
@@ -912,13 +779,13 @@ TR_ENABLE=0 EXP_TAG=no_turnrew ./run_experiment.sh wordle        # force off ove
 
 | var | flag | meaning |
 |---|---|---|
-| `TR_ENABLE` | `--turn-rewards` / `--no-turn-rewards` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** (same convention as `LP_*`) |
+| `TR_ENABLE` | `--turn-rewards` / `--no-turn-rewards` | tri-state: `1` on, `0` off, **empty = leave the YAML alone** |
 | `TR_SOURCE` | `--turn-reward-source` | `auto` (default) / `game` / `generic` |
 | `TR_SCALE` | `--turn-reward-scale` | most a single turn can contribute (default `0.05`) |
 | `TR_BUDGET` | `--turn-reward-budget` | cap on an episode's shaping total (default `0.3`) |
 | `TR_COMPONENTS` | `--turn-reward-components` | allowlist, e.g. `closeness` |
 
-**No per-game calibration is needed** (same story as the length penalty): extractors
+**No per-game calibration is needed**: extractors
 normalize every component to `[-1, 1]`, so a turn is worth at most `TR_SCALE` and an
 episode at most `TR_BUDGET` whatever the game's turn count. Keeping `TR_BUDGET` under `0.5` is
 what guarantees shaping cannot reorder two different clembench outcomes (the worst-case

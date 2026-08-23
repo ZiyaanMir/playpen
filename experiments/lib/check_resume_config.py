@@ -4,29 +4,23 @@ Called by ``experiments/*/resume_experiment.sh`` before it submits anything. Exi
 when the config the resumed segments will use matches the one ``manifest.json``
 recorded at first submission, and 1 (listing the differing fields) when it does not.
 
-WHY THIS EXISTS. Resuming re-derives the config from the environment, and two things
-make that environment different months later:
+Resuming re-derives the config from the environment, and two things make that
+environment different months later:
 
 * **The shared YAML is edited between runs.** ``experiment.env`` stores MARSHAL_CONFIG
-  as a *path* (``examples/marshal/marshal_config.yaml``), not as content. Measured on a
-  real run: resuming ``taboo_Qwen3-4B_turnrew_20260730-231934`` against today's shared
-  YAML would flip ``turn_level_rewards`` true->false and ``whiten_rewards`` true->false.
-  ``resume_experiment.sh`` now points at the frozen per-run copy, which fixes this --
-  and this check is what proves it worked rather than assuming it.
+  as a *path*, not as content. ``resume_experiment.sh`` points at the frozen per-run
+  copy instead, and this check is what proves that worked.
 * **A setting reached the original job by a route the resume does not have.** On
-  Isambard ``sbatch --export=ALL`` carries the submitter's whole environment, so
-  ``TR_ENABLE=1`` reached the job without ever being written to ``experiment.env``.
-  Nothing carries it on a resume, so the remaining segments would train with turn
-  rewards off. No amount of care in the resume script can fix that one; the variable
-  has to be in the env-file whitelist. This check turns it from silent into loud.
+  Isambard ``sbatch --export=ALL`` carries the submitter's whole environment, so a
+  variable can reach the job without ever being written to ``experiment.env``. Nothing
+  carries it on a resume, so it has to be in the env-file whitelist; this check turns
+  that from silent into loud.
 
-Either way the failure mode is the same and it is the bad kind: the run keeps going,
-the checkpoints look fine, and half of it trained under a different algorithm than the
-other half with nothing on disk saying so.
+Either way the run keeps going, the checkpoints look fine, and half of it trained
+under a different algorithm than the other half with nothing on disk saying so.
 
-Deliberately importable without torch: it reuses ``write_manifest.resolve_config`` --
-the same resolution the manifest itself was written with, so the two answers cannot
-drift apart the way two reimplementations would.
+Importable without torch: it reuses ``write_manifest.resolve_config``, the same
+resolution the manifest was written with, so the two answers cannot drift apart.
 """
 
 from __future__ import annotations
@@ -40,10 +34,21 @@ sys.path.insert(0, _HERE)
 
 from write_manifest import resolve_config  # noqa: E402
 
-# Fields whose value legitimately depends on the machine rather than the experiment.
-# None today; kept as the place to put one, so a future exemption arrives with a
-# reason next to it instead of as a silent hole in the comparison.
-IGNORED_FIELDS: frozenset = frozenset()
+# Fields excluded from the comparison. These configured features that no longer
+# exist, so an old manifest recording them is not config drift.
+IGNORED_FIELDS: frozenset = frozenset({
+    "turn_level_rewards",
+    "fidelity_mode",
+    "marshal_exact_unique_pooling",
+    "length_penalty",
+    "length_penalty_per_token",
+    "length_penalty_budget",
+    "length_penalty_coef",
+    "length_penalty_bonus",
+    "length_penalty_min_len",
+    "length_penalty_max_len",
+    "length_penalty_offset",
+})
 
 
 def compare(recorded: dict, current: dict) -> tuple[list, list]:
@@ -51,13 +56,11 @@ def compare(recorded: dict, current: dict) -> tuple[list, list]:
 
     The two are separated because only one of them is a problem.
 
-    A field in ``current`` but not in ``recorded`` is a field that did not EXIST when
-    the run was submitted -- ``MarshalConfig`` gains fields over time, and
-    ``marshal_exact_unique_pooling`` is one that post-dates runs still on disk. There
-    is no old value for it to have drifted from, and the new default is by
-    construction the behaviour the old code had. Refusing on those would fire on every
-    older experiment and teach the operator to reach for RESUME_FORCE=1, which is
-    exactly the habit this check exists to avoid. They are reported as a note instead.
+    A field in ``current`` but not in ``recorded`` did not exist when the run was
+    submitted -- ``MarshalConfig`` gains fields over time. There is no old value for it
+    to have drifted from, and the new default is by construction the behaviour the old
+    code had, so it is reported as a note. Refusing on those would fire on every older
+    experiment and teach the operator to reach for RESUME_FORCE=1.
 
     A field in ``recorded`` but not in ``current`` is the opposite case and IS a
     problem: the run was configured with something this code no longer has.
@@ -71,25 +74,6 @@ def compare(recorded: dict, current: dict) -> tuple[list, list]:
         elif recorded[key] != current.get(key, "<absent>"):
             drifted.append((key, recorded[key], current.get(key, "<absent>")))
     return drifted, added
-
-
-def length_penalty_reshaped(recorded: dict) -> bool:
-    """Whether resuming would change the *shape* of this run's length penalty.
-
-    The one case ``compare`` cannot see. A run submitted before the penalty was
-    rewritten recorded ``length_penalty: true`` plus the threshold fields
-    (``length_penalty_max_len`` etc.), and none of those values changed -- so no field
-    drifts. What changed is the formula they feed: a hinge that charged nothing below
-    ``max_len`` became a flat per-token cost that charges every turn. The new
-    ``length_penalty_per_token``/``_budget`` fields show up only as "added", i.e. a
-    soft note, which is far too quiet for "the second half of this run is trained
-    under a different reward".
-
-    Detected by their absence from the recorded config, which dates the manifest to
-    before the rewrite. A run that had the penalty *off* is unaffected -- nothing was
-    being shaped either way.
-    """
-    return bool(recorded.get("length_penalty")) and "length_penalty_per_token" not in recorded
 
 
 def main() -> None:
@@ -123,32 +107,6 @@ def main() -> None:
     for field, value in added:
         print(f"[config-check] note: '{field}' did not exist when this run was "
               f"submitted; it defaults to {value}.")
-
-    if length_penalty_reshaped(recorded):
-        print("", file=sys.stderr)
-        print("[config-check] REFUSING TO RESUME -- the length penalty was rewritten "
-              "since this run started.", file=sys.stderr)
-        print("", file=sys.stderr)
-        print("  This run was submitted with length_penalty: true under the old "
-              "threshold-based", file=sys.stderr)
-        print("  penalty: exactly 0 below length_penalty_max_len "
-              f"({recorded.get('length_penalty_max_len')}), linear beyond it.",
-              file=sys.stderr)
-        print("  It is now a flat per-token cost with no threshold "
-              f"({current.get('length_penalty_per_token')} per token, capped at "
-              f"{current.get('length_penalty_budget')} per episode),", file=sys.stderr)
-        print("  so every turn is charged and the old calibration is inert. No field "
-              "'drifted' --", file=sys.stderr)
-        print("  the values are the same, the formula reading them is not.",
-              file=sys.stderr)
-        print("", file=sys.stderr)
-        print("  Resuming would train the rest of this run under a different reward "
-              "than its first", file=sys.stderr)
-        print("  half. Prefer starting a fresh run. If you accept a run trained two "
-              "ways:", file=sys.stderr)
-        print("  RESUME_FORCE=1 to proceed anyway.", file=sys.stderr)
-        print("", file=sys.stderr)
-        raise SystemExit(1)
 
     if not diffs:
         print(f"[config-check] OK: all {len(recorded)} MARSHAL settings match the ones "

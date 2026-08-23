@@ -36,11 +36,10 @@ clemeval's two aggregates are means over *different* sets of games:
 
 That is a sound definition for describing one model. It is **not** sound for
 subtracting two models. The set of quality-contributing games changes from
-checkpoint to checkpoint: a checkpoint that starts to play a game it used to abort
-adds that game to its own denominator, usually at a low score, so *improving* can
-lower the reported quality. Measured across the runs in this repo, correcting for
-it moves the reported quality delta by up to ~18 points and flips its sign on many
-checkpoints.
+checkpoint to checkpoint: a checkpoint that starts to play a game it previously
+aborted adds that game to its own denominator, usually at a low score, so *improving*
+can lower the reported quality. Correcting for it can move a quality delta by tens of
+points and flip its sign.
 
 So this file reports both, and only ever subtracts the comparable one:
 

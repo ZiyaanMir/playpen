@@ -93,17 +93,6 @@ def best_metric(exp):
         parts.append(piece)
     return "  ".join(parts)
 
-def _fidelity(cfg):
-    """fidelity_mode, flagged when marshal_exact ran without its unique pooling.
-
-    Defaults to True for a manifest written before the sub-flag existed, so an old
-    experiment still renders as a plain 'marshal_exact'.
-    """
-    mode = cfg.get("fidelity_mode", "?")
-    if mode == "marshal_exact" and not cfg.get("marshal_exact_unique_pooling", True):
-        return mode + "(no-unique-pool)"
-    return mode
-
 def _loss_type(cfg):
     """The TRL loss_type the run trained under.
 
@@ -144,33 +133,11 @@ for exp in sorted(glob.glob(os.path.join(runs, "*"))):
     else:
         state = f"{n_ck} ckpt, eval partial"
 
-    lp = man.get("length_penalty_effect", {})
-    lp_s = "off"
-    if lp.get("enabled"):
-        # The cap, not the estimate: it is the number that bounds what the penalty
-        # can be worth against the outcome, and it is exact rather than per-game.
-        cap = lp.get("max_per_episode")
-        total = lp.get("est_per_episode_total")
-        if isinstance(cap, (int, float)):
-            lp_s = f"<={-cap:+.2f}/ep"
-        elif isinstance(total, (int, float)):
-            lp_s = f"{total:+.2f}/ep"
-        else:
-            lp_s = "on"
-        # Deliberately small is the design; "would be zero even for the longest
-        # possible turns" is the failure this flags.
-        if isinstance(total, (int, float)) and abs(total) < 0.002:
-            lp_s += " INERT"
-    if lp.get("legacy_fields_ignored"):
-        lp_s += " [legacy fields ignored]"
-
     rows.append({
         "id": os.path.basename(exp),
         "game": train.get("game", "?"),
         "model": os.path.basename(str(train.get("model", "?"))),
         "steps": train.get("max_steps", "?"),
-        "lp": lp_s,
-        "fidelity": _fidelity(man.get("marshal_config", {})),
         "loss": _loss_type(man.get("marshal_config", {})),
         "state": state,
         "score": best_metric(exp),
@@ -190,7 +157,7 @@ for r in rows:
     print(f"{r['id'].ljust(w_id)}  {r['state'].ljust(w_state)}  {r['score']}")
     if verbose:
         print(f"{' ' * w_id}    model={r['model']} game={r['game']} steps={r['steps']} "
-              f"len_penalty={r['lp']} fidelity={r['fidelity']} loss={r['loss']}"
+              f"loss={r['loss']}"
               + ("  [dirty tree]" if r["dirty"] else ""))
 
 print()

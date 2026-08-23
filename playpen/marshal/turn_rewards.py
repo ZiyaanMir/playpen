@@ -4,33 +4,24 @@ Playpen's rollout collection is *terminal-only* by default: clemcore's PettingZo
 env scores an episode with ``_default_reward`` (SUCCESS ``+1`` / FAILURE ``0`` /
 ABORTED ``-1``, and ``0`` at every non-terminal step), and that single team scalar
 is what every seat's last turn receives. This module is the opt-in second reward
-channel: a small, bounded, per-turn signal derived from what the game already
-knows at each step.
+channel: a small, bounded, per-turn signal derived from what the game already knows
+at each step.
 
-WHY THIS EXISTS (two independent reasons)
------------------------------------------
-1. **Credit assignment across turns.** MARSHAL's turn-level estimator
-   (``advantage.reinforce_returns``) is built to attribute reward at each turn
-   boundary, but with a terminal-only reward every turn of a row carries the same
-   return, so the estimator has nothing to separate. A dense signal is what makes
-   ``turn_level_rewards: true`` mean anything.
-2. **Credit assignment across seats.** clembench hands both self-play seats the
-   *same* team outcome, so per-seat advantage pooling
-   (``agent_specific_normalization``) currently mean-centers two identical
-   distributions -- both seats end up with identical advantages and the seat split
-   is a metric artifact. A per-turn reward is attributed to *the seat that acted*,
-   which is the only thing in this pipeline that can make the two seats' advantages
-   genuinely differ.
+WHY THIS EXISTS
+---------------
+clembench hands both self-play seats the *same* team outcome, so per-seat advantage
+pooling (``agent_specific_normalization``) mean-centers two identical distributions
+and both seats end up with identical advantages. A per-turn reward is attributed to
+*the seat that acted*, which is the only thing in this pipeline that can make the
+two seats' advantages genuinely differ.
 
 WHERE THE SIGNAL COMES FROM
 ---------------------------
-clemcore exposes a ``reward_func(observation, action, state, info) -> float`` hook
-on its PettingZoo env, and its docstring points at exactly this: "Game-specific
-rewards can be implemented by subclassing GameState to carry additional fields
-(e.g. letter matches in Wordle) and reading them in a custom reward_func." No
-shipped clembench game supplies one (and none populate ``info``), but most of them
-*do* subclass ``GameState`` with the per-turn fields their own offline scorers use.
-So the extractors below read that live state after each step.
+clemcore exposes a ``reward_func(observation, action, state, info) -> float`` hook on
+its PettingZoo env, and its docstring points at exactly this use. No shipped
+clembench game supplies one (and none populate ``info``), but most of them *do*
+subclass ``GameState`` with the per-turn fields their own offline scorers use, so the
+extractors below read that live state after each step.
 
 We deliberately do NOT install a clemcore ``reward_func``. That hook is a single
 channel: on the terminal step clemcore calls it again for *every* agent and
@@ -52,17 +43,15 @@ episode:
 
 The invariant after step 3 is ``|sum of an episode's shaping for one seat| <=
 budget``. Because the MARSHAL return is a backward cumulative *sum*, that episode
-total is precisely what competes with the ``+1/0/-1`` outcome. With
-``budget < 0.5`` the worst-case swing between two episodes is ``2 * budget < 1.0``,
-which is smaller than the gap between any two distinct clembench outcomes
-(SUCCESS-FAILURE = 1, FAILURE-ABORTED = 1). **Shaping can therefore never reorder
-two episodes that ended differently** -- it only ranks episodes *within* an outcome
-class. ``MarshalConfig`` warns when ``turn_reward_budget >= 0.5``, where that
-guarantee stops holding.
+total is precisely what competes with the ``+1/0/-1`` outcome. With ``budget < 0.5``
+the worst-case swing between two episodes is ``2 * budget < 1.0``, smaller than the
+gap between any two distinct clembench outcomes, so shaping can never reorder two
+episodes that ended differently -- it only ranks episodes *within* an outcome class.
+``MarshalConfig`` warns when ``turn_reward_budget >= 0.5``.
 
 The budget is a safety cap, not the operating point: pick ``scale`` so the typical
 episode lands under it, and watch ``marshal/turn_rewards/budget_clip_rate`` (a rate
-near 1.0 means ``scale`` is too large and only the *shape* of your signal survives).
+near 1.0 means ``scale`` is too large and only the *shape* of the signal survives).
 
 Depends only on the standard library -- no torch, no trl, no clemcore -- so it is
 unit-testable in isolation, and every read of game state is defensive: a clembench
@@ -405,26 +394,18 @@ class CodenamesTurnRewards(TurnRewardExtractor):
     across the episode, which is the scale the other extractors work on.
 
     It reads ``board.revealed["team"]`` rather than the drop in ``board.hidden``,
-    and that distinction is the whole correctness of this component: codenames
-    simulates the *opposing* team between rounds (``_on_before_round`` ->
-    ``_opponent_turn``), which reveals opponent cards and shrinks ``hidden`` without
-    our policy having done anything. Diffing ``hidden`` therefore charged the policy
-    for the simulated opponent's moves -- measured on the packaged instances, the
-    mock guesser's ``+1`` team word and the opponent's ``-1`` card cancelled exactly,
-    so the component read a flat 0.0 every single turn and looked simply unwired.
-    ``revealed[by=TEAM]`` only ever grows through ``reveal_word(word, TEAM)``, i.e.
-    our own guesser.
+    which is what makes the component correct: codenames simulates the *opposing*
+    team between rounds (``_on_before_round`` -> ``_opponent_turn``), revealing
+    opponent cards and shrinking ``hidden`` with no move by our policy.
+    ``revealed[by=TEAM]`` only grows through ``reveal_word(word, TEAM)``, i.e. our
+    own guesser.
 
-    The reward is attributed to whichever seat acted, which is the guesser -- the
-    cluegiver is rewarded indirectly, through the guesser's success on its clue,
-    exactly as the team outcome already does it. Measured on the packaged instances
-    with clembench's own mock players, that means the cluegiver seat receives only
-    the ``format`` component (the guesser collected ``+0.89`` of board over an
-    episode; the cluegiver, ``0``). A direct cluegiver signal is available if that
-    asymmetry matters for a result -- ``ClueGiver.targets`` with
-    ``board.get_word_assignment`` gives the fraction of a clue's targets that are
-    actually team words -- but it lives on the *player*, not the game state, so it is
-    deliberately left out here rather than widening what an extractor may reach into.
+    The reward is attributed to whichever seat acted, which is the guesser; the
+    cluegiver is rewarded indirectly through the guesser's success on its clue, as
+    the team outcome already does. So the cluegiver seat receives only the ``format``
+    component. A direct cluegiver signal exists (``ClueGiver.targets`` with
+    ``board.get_word_assignment``) but lives on the *player*, not the game state, so
+    it is left out rather than widening what an extractor may reach into.
 
     ``format`` reads ``state.invalid_response`` as a *level*: codenames clears it
     at the top of every validation, so its value after a step describes that step.
